@@ -1,6 +1,8 @@
 const std = @import("std");
 const net = std.net;
 
+const READ_BUFFER_SIZE = 1024;
+
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -18,10 +20,16 @@ pub fn main() !void {
 
     while (true) {
         const connection = try listener.accept();
+        try stdout.print("accepted new connection\n", .{});
 
-        _ = try connection.stream.write("+PONG\r\n");
+        var buffer = std.mem.zeroes([READ_BUFFER_SIZE]u8);
+        _ = try connection.stream.read(&buffer);
 
-        try stdout.print("accepted new connection", .{});
+        var commmands_iterator = std.mem.splitSequence(u8, &buffer, "\n");
+        while (commmands_iterator.next()) |_| {
+            _ = try connection.stream.write("+PONG\r\n");
+        }
+
         connection.stream.close();
     }
 }
