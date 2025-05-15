@@ -2,6 +2,50 @@ const std = @import("std");
 const net = std.net;
 
 const READ_BUFFER_SIZE = 1024;
+const MAX_DECIMAL_LEN = 10;
+
+fn parse_decimal(bytes: []u8) !struct { u64, usize } {
+    var i: usize = 0;
+    var return_value: u64 = 0;
+    while ('0' <= bytes[i] and bytes[i] <= '9' and i < MAX_DECIMAL_LEN) : (i += 1) {
+        return_value = return_value * 10 + bytes[i] - '0';
+    }
+
+    return .{ return_value, i };
+}
+
+fn parse_bulk_string(bytes: []u8, allocator: std.mem.Allocator) !struct { []u8, usize } {
+    if (bytes[0] != '$') return error.InvalidRESPBulkString;
+    var i: usize = 1;
+    const string_length, const bytes_parsed = try parse_decimal(bytes[i..]);
+    i += bytes_parsed;
+
+    if (!std.mem.eql(u8, bytes[i .. i + 2], "\r\n")) return error.InvalidRESPBulkString;
+    i += 2;
+    const return_value = try allocator.alloc(u8, string_length);
+    std.mem.copyBackwards(u8, return_value, bytes[i .. i + string_length]);
+    i += string_length;
+    if (!std.mem.eql(u8, bytes[i .. i + 2], "\r\n")) return error.InvalidRESPBulkString;
+    i += 2;
+    return .{ return_value, i };
+}
+
+fn parse_array(bytes: []u8, allocator: std.mem.Allocator) !struct { [][]u8, usize } {
+    if (bytes[0] != '*') return error.InvalidRESPArray;
+    var i: usize = 1;
+    const n_elem, const bytes_parsed = try parse_decimal(bytes[i..]);
+    i += bytes_parsed;
+    if (!std.mem.eql(u8, bytes[i .. i + 2], "\r\n")) return error.InvalidRESPArray;
+    i += 2;
+    var elements = try allocator.alloc([]u8, n_elem);
+
+    for (0..n_elem) |n| {
+        const element, const parsed_bytes = try parse_bulk_string(bytes[i..], allocator);
+        elements[n] = element;
+        i += parsed_bytes;
+    }
+    return .{ elements, i };
+}
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -22,12 +66,12 @@ pub fn main() !void {
         const connection = try listener.accept();
         try stdout.print("accepted new connection\n", .{});
 
+        // TODO: proper memory freeing
         var buffer = std.mem.zeroes([READ_BUFFER_SIZE]u8);
-        _ = try connection.stream.read(&buffer);
-
-        var commmands_iterator = std.mem.splitSequence(u8, &buffer, "\n");
-        while (commmands_iterator.next()) |_| {
+        while (try connection.stream.read(&buffer) > 0) {
+            _ = try parse_array(&buffer, std.heap.page_allocator);
             _ = try connection.stream.write("+PONG\r\n");
+            @memset(&buffer, 0);
         }
 
         connection.stream.close();
