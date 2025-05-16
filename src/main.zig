@@ -1,7 +1,12 @@
 const std = @import("std");
 const net = std.net;
+const posix = std.posix;
+const epoll_event = std.posix.system.epoll_event;
+const epoll_data = std.posix.system.epoll_data;
+const linux = std.os.linux;
+const stdout = std.io.getStdOut().writer();
 
-const READ_BUFFER_SIZE = 1024;
+const READ_BUFFER_SIZE = 256;
 const MAX_DECIMAL_LEN = 10;
 
 fn parse_decimal(bytes: []u8) !struct { u64, usize } {
@@ -47,11 +52,22 @@ fn parse_array(bytes: []u8, allocator: std.mem.Allocator) !struct { [][]u8, usiz
     return .{ elements, i };
 }
 
+pub const EVENT_TYPE = enum {
+    CONNECTION,
+    RECEIVED_COMMAND,
+    SENT_RESPONSE,
+};
+
+pub const Event = struct {
+    ty: EVENT_TYPE = EVENT_TYPE.CONNECTION,
+    fd: posix.socket_t,
+    buffer: ?[]u8 = null,
+};
+
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
-    try stdout.print("Logs from your program will appear here!", .{});
+    try stdout.print("Logs from your program will appear here!\n", .{});
 
     // Uncomment this block to pass the first stage
 
@@ -59,21 +75,113 @@ pub fn main() !void {
 
     var listener = try address.listen(.{
         .reuse_address = true,
+        .force_nonblocking = true,
     });
     defer listener.deinit();
 
+    // TODO: error handling?
+    // TODO: freeing memory up?
+    const connection_event_data = Event{
+        .ty = EVENT_TYPE.CONNECTION,
+        .fd = listener.stream.handle,
+    };
+
+    const epoll_fd = try posix.epoll_create1(0);
+    try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, listener.stream.handle, @constCast(&epoll_event{
+        .events = posix.POLL.IN,
+        .data = epoll_data{ .ptr = @intFromPtr(&connection_event_data) },
+    }));
+
+    var allocator = std.heap.page_allocator;
+
+    const events = try allocator.alloc(epoll_event, 10);
+    defer allocator.free(events);
     while (true) {
-        const connection = try listener.accept();
-        try stdout.print("accepted new connection\n", .{});
+        try stdout.print("Waiting for something to come through\n", .{});
+        const ready_fds = posix.epoll_wait(epoll_fd, events, -1);
+        for (0..ready_fds) |i| {
+            const event_data: *Event = @ptrFromInt(events[i].data.ptr);
+            try stdout.print("Event fd/type/ptr: {} {} {*}\n", .{ event_data.fd, event_data.ty, @as(*Event, @ptrFromInt(events[i].data.ptr)) });
+            switch (event_data.ty) {
+                EVENT_TYPE.CONNECTION => {
+                    const connection_socket = try posix.accept(event_data.fd, null, null, posix.SOCK.NONBLOCK);
+                    //try stdout.print("{}\n", .{ret});
+                    try stdout.print("accepted new connection\n", .{});
+                    var buffer = std.mem.zeroes([READ_BUFFER_SIZE]u8);
+                    _ = posix.read(connection_socket, &buffer) catch |err| {
+                        switch (err) {
+                            posix.ReadError.WouldBlock => {
+                                try stdout.print("Would block on read\n", .{});
+                                var client_event_data = try allocator.create(Event);
+                                client_event_data.ty = EVENT_TYPE.RECEIVED_COMMAND;
+                                client_event_data.fd = connection_socket;
+                                try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, connection_socket, @constCast(&epoll_event{
+                                    .events = posix.POLL.IN,
+                                    .data = epoll_data{ .ptr = @intFromPtr(&client_event_data) },
+                                }));
+                                continue;
+                            },
+                            else => {},
+                        }
+                    };
 
-        // TODO: proper memory freeing
-        var buffer = std.mem.zeroes([READ_BUFFER_SIZE]u8);
-        while (try connection.stream.read(&buffer) > 0) {
-            _ = try parse_array(&buffer, std.heap.page_allocator);
-            _ = try connection.stream.write("+PONG\r\n");
-            @memset(&buffer, 0);
+                    _ = try parse_array(&buffer, std.heap.page_allocator);
+                    _ = posix.write(connection_socket, "+PONG\r\n"[0..]) catch |err| {
+                        switch (err) {
+                            posix.WriteError.WouldBlock => {
+                                try stdout.print("Would block on write\n", .{});
+                                var client_event_data = try allocator.create(Event);
+                                client_event_data.ty = EVENT_TYPE.SENT_RESPONSE;
+                                client_event_data.fd = connection_socket;
+                                client_event_data.buffer = &buffer;
+                                try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, connection_socket, @constCast(&epoll_event{
+                                    .events = posix.POLL.OUT,
+                                    .data = epoll_data{ .ptr = @intFromPtr(&client_event_data) },
+                                }));
+                                continue;
+                            },
+                            else => {},
+                        }
+                    };
+
+                    var client_event_data = try allocator.create(Event);
+                    client_event_data.ty = EVENT_TYPE.RECEIVED_COMMAND;
+                    client_event_data.fd = connection_socket;
+                    try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, connection_socket, @constCast(&epoll_event{
+                        .events = posix.POLL.IN,
+                        .data = epoll_data{ .ptr = @intFromPtr(client_event_data) },
+                    }));
+                },
+                EVENT_TYPE.RECEIVED_COMMAND => {
+                    var buffer = std.mem.zeroes([READ_BUFFER_SIZE]u8);
+                    const n = try posix.read(event_data.fd, &buffer);
+                    if (n == 0) {
+                        try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, event_data.fd, null);
+                        continue;
+                    }
+                    _ = try parse_array(&buffer, std.heap.page_allocator);
+                    var reply_buffer = std.mem.zeroes([8]u8);
+                    @memcpy(reply_buffer[0..].ptr, "+PONG\r\n"[0..]);
+                    _ = posix.write(event_data.fd, &reply_buffer) catch |err| {
+                        switch (err) {
+                            posix.WriteError.WouldBlock => {
+                                var client_event_data = try allocator.create(Event);
+                                client_event_data.ty = EVENT_TYPE.SENT_RESPONSE;
+                                client_event_data.fd = event_data.fd;
+                                client_event_data.buffer = &reply_buffer;
+                                try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, event_data.fd, @constCast(&epoll_event{
+                                    .events = posix.POLL.OUT,
+                                    .data = epoll_data{ .ptr = @intFromPtr(&client_event_data) },
+                                }));
+                            },
+                            else => {},
+                        }
+                    };
+                },
+                EVENT_TYPE.SENT_RESPONSE => {
+                    _ = try posix.write(event_data.fd, event_data.buffer orelse unreachable);
+                },
+            }
         }
-
-        connection.stream.close();
     }
 }
