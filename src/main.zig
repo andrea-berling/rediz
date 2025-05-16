@@ -160,7 +160,7 @@ pub fn main() !void {
                         continue;
                     }
                     _ = try parse_array(&buffer, std.heap.page_allocator);
-                    var reply_buffer = std.mem.zeroes([8]u8);
+                    var reply_buffer = std.mem.zeroes([7]u8);
                     @memcpy(reply_buffer[0..].ptr, "+PONG\r\n"[0..]);
                     _ = posix.write(event_data.fd, &reply_buffer) catch |err| {
                         switch (err) {
