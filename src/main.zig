@@ -117,7 +117,7 @@ pub fn main() !void {
                                 client_event_data.fd = connection_socket;
                                 try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, connection_socket, @constCast(&epoll_event{
                                     .events = posix.POLL.IN,
-                                    .data = epoll_data{ .ptr = @intFromPtr(&client_event_data) },
+                                    .data = epoll_data{ .ptr = @intFromPtr(client_event_data) },
                                 }));
                                 continue;
                             },
@@ -136,7 +136,7 @@ pub fn main() !void {
                                 client_event_data.buffer = &buffer;
                                 try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, connection_socket, @constCast(&epoll_event{
                                     .events = posix.POLL.OUT,
-                                    .data = epoll_data{ .ptr = @intFromPtr(&client_event_data) },
+                                    .data = epoll_data{ .ptr = @intFromPtr(client_event_data) },
                                 }));
                                 continue;
                             },
@@ -171,7 +171,7 @@ pub fn main() !void {
                                 client_event_data.buffer = &reply_buffer;
                                 try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, event_data.fd, @constCast(&epoll_event{
                                     .events = posix.POLL.OUT,
-                                    .data = epoll_data{ .ptr = @intFromPtr(&client_event_data) },
+                                    .data = epoll_data{ .ptr = @intFromPtr(client_event_data) },
                                 }));
                             },
                             else => {},
