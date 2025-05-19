@@ -12,7 +12,8 @@ const MAX_DECIMAL_LEN = 10;
 fn parse_decimal(bytes: []u8) !struct { u64, usize } {
     var i: usize = 0;
     var return_value: u64 = 0;
-    while ('0' <= bytes[i] and bytes[i] <= '9' and i < MAX_DECIMAL_LEN) : (i += 1) {
+
+    while (std.ascii.isDigit(bytes[i]) and i < MAX_DECIMAL_LEN) : (i += 1) {
         return_value = return_value * 10 + bytes[i] - '0';
     }
 
@@ -81,7 +82,7 @@ pub fn main() !void {
 
     // TODO: error handling?
     // TODO: freeing memory up?
-    const connection_event_data = Event{
+    const connection_event_data: Event = .{
         .ty = EVENT_TYPE.CONNECTION,
         .fd = listener.stream.handle,
     };
@@ -105,9 +106,8 @@ pub fn main() !void {
             switch (event_data.ty) {
                 EVENT_TYPE.CONNECTION => {
                     const connection_socket = try posix.accept(event_data.fd, null, null, posix.SOCK.NONBLOCK);
-                    //try stdout.print("{}\n", .{ret});
                     try stdout.print("accepted new connection\n", .{});
-                    var buffer = std.mem.zeroes([READ_BUFFER_SIZE]u8);
+                    var buffer = [_]u8{0} ** READ_BUFFER_SIZE;
                     _ = posix.read(connection_socket, &buffer) catch |err| {
                         switch (err) {
                             posix.ReadError.WouldBlock => {
@@ -153,15 +153,17 @@ pub fn main() !void {
                     }));
                 },
                 EVENT_TYPE.RECEIVED_COMMAND => {
-                    var buffer = std.mem.zeroes([READ_BUFFER_SIZE]u8);
+                    var buffer = [_]u8{0} ** READ_BUFFER_SIZE;
                     const n = try posix.read(event_data.fd, &buffer);
                     if (n == 0) {
                         try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, event_data.fd, null);
+                        posix.close(event_data.fd);
                         continue;
                     }
                     _ = try parse_array(&buffer, std.heap.page_allocator);
-                    var reply_buffer = std.mem.zeroes([7]u8);
-                    @memcpy(reply_buffer[0..].ptr, "+PONG\r\n"[0..]);
+                    const reply = "+PONG\r\n";
+                    var reply_buffer = [_]u8{0}**reply.len;
+                    @memcpy(&reply_buffer,reply);
                     _ = posix.write(event_data.fd, &reply_buffer) catch |err| {
                         switch (err) {
                             posix.WriteError.WouldBlock => {
@@ -179,7 +181,7 @@ pub fn main() !void {
                     };
                 },
                 EVENT_TYPE.SENT_RESPONSE => {
-                    _ = try posix.write(event_data.fd, event_data.buffer orelse unreachable);
+                    _ = try posix.write(event_data.fd, event_data.buffer.?);
                 },
             }
         }

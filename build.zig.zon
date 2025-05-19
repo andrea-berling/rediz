@@ -1,5 +1,5 @@
 .{
-    .name = .codecrafters_redis,
+    .name = "codecrafters_redis",
     .fingerprint = 0xf806bb97907ce4a5,
 
     // This is a [Semantic Version](https://semver.org/).
