@@ -2,6 +2,7 @@ const std = @import("std");
 const net = std.net;
 const eq = @import("event_queue.zig");
 const resp = @import("resp.zig");
+const command = @import("command.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 const stdout = std.io.getStdOut().writer();
@@ -74,14 +75,13 @@ pub fn main() !void {
                     }
                     continue;
                 }
-                _ = try resp.parse_array(buffer, std.heap.page_allocator);
+                const request, _ = try resp.parse_array(buffer, &allocator);
                 allocator.free(buffer);
-                const reply = "+PONG\r\n";
-                const reply_buffer = try allocator.alloc(u8, reply.len);
-                @memcpy(reply_buffer,reply);
-                try add_send_response_event(&allocator, event.fd, reply_buffer, &event_queue);
+                const reply = try command.execute(&allocator, request);
+                try add_send_response_event(&allocator, event.fd, reply, &event_queue);
             },
             eq.EVENT_TYPE.SENT_RESPONSE => {
+                allocator.free(event.buffer.?);
                 const buffer = try allocator.alloc(u8, READ_BUFFER_SIZE);
                 try add_receive_command_event(&allocator, event.fd, buffer, &event_queue);
             },
