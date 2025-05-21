@@ -2,10 +2,16 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 
+fn handle_error(errno: i64) !void {
+    var error_string = std.ArrayList(u8).init(std.heap.page_allocator);
+    try std.fmt.format(error_string.writer(), "Errno: {d}. Error: {any}", .{errno, linux.E.init(@bitCast(errno))});
+    @panic(try error_string.toOwnedSlice());
+}
+
 fn io_uring_setup(entries: u32, p: *linux.io_uring_params) !linux.fd_t {
     const fd: i64 = @bitCast(linux.io_uring_setup(entries,p));
     if ( fd < 0 ) {
-        unreachable; //return @as(linux.E,@enumFromInt(-fd));
+        try handle_error(fd);
     }
     return @truncate(fd);
 }
@@ -13,8 +19,8 @@ fn io_uring_setup(entries: u32, p: *linux.io_uring_params) !linux.fd_t {
 fn io_uring_enter(fd: i32, to_submit: u32, min_complete: u32, flags: u32, sig: ?*linux.sigset_t) !usize {
     const consumed_io_ops: i64 = @bitCast(linux.io_uring_enter(fd, to_submit, min_complete, flags, sig));
 
-    if ( consumed_io_ops < 0 ) {
-        unreachable;//return @as(linux.E,@enumFromInt(-fd));
+    if (consumed_io_ops < 0) {
+        try handle_error(fd);
     }
     return @bitCast(consumed_io_ops);
 }
@@ -33,19 +39,19 @@ pub const Event = struct {
 };
 
 const SQRing = struct {
-    array: [*]c_uint,
+    array: []c_uint,
     head: *c_uint,
     tail: *c_uint,
     dropped: *c_uint,
     ring_mask: *c_uint,
-    sqes: [*]linux.io_uring_sqe,
+    sqes: []linux.io_uring_sqe,
 };
 
 const CQRing = struct {
     head: *c_uint,
     tail: *c_uint,
     ring_mask: *c_uint,
-    cqes: [*]linux.io_uring_cqe,
+    cqes: []linux.io_uring_cqe,
 };
 
 pub const EventQueue = struct {
@@ -73,12 +79,12 @@ pub const EventQueue = struct {
                             io_uring_fd, linux.IORING_OFF_SQES);
 
         const sqring: SQRing = .{
-            .array = @alignCast(@ptrCast(sqring_ptr.ptr + params.sq_off.array)),
-            .head = @alignCast(@ptrCast(sqring_ptr.ptr + params.sq_off.head)),
-            .tail = @alignCast(@ptrCast(sqring_ptr.ptr + params.sq_off.tail)),
-            .dropped = @alignCast(@ptrCast(sqring_ptr.ptr + params.sq_off.dropped)),
-            .sqes = @ptrCast(sqes),
-            .ring_mask = @alignCast(@ptrCast(sqring_ptr.ptr + params.sq_off.ring_mask)),
+            .array = @as([*]c_uint,@alignCast(@ptrCast(&sqring_ptr[params.sq_off.array])))[0..params.sq_entries],
+            .head = @alignCast(@ptrCast(&sqring_ptr.ptr[params.sq_off.head])),
+            .tail = @alignCast(@ptrCast(&sqring_ptr.ptr[params.sq_off.tail])),
+            .dropped = @alignCast(@ptrCast(&sqring_ptr.ptr[params.sq_off.dropped])),
+            .sqes = @as([*]linux.io_uring_sqe,@alignCast(@ptrCast(sqes)))[0..params.sq_entries],
+            .ring_mask = @alignCast(@ptrCast(&sqring_ptr.ptr[params.sq_off.ring_mask])),
         };
 
         const cqring_ptr = try posix.mmap(null, params.cq_off.cqes + params.cq_entries * @sizeOf(linux.io_uring_cqe),
@@ -86,10 +92,10 @@ pub const EventQueue = struct {
                            linux.IORING_OFF_CQ_RING);
 
         const cqring: CQRing = .{
-            .head = @alignCast(@ptrCast(cqring_ptr.ptr + params.cq_off.head)),
-            .tail = @alignCast(@ptrCast(cqring_ptr.ptr + params.cq_off.tail)),
-            .ring_mask = @alignCast(@ptrCast(cqring_ptr.ptr + params.cq_off.ring_mask)),
-            .cqes = @alignCast(@ptrCast(cqring_ptr.ptr + params.cq_off.cqes)),
+            .head = @alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.head])),
+            .tail = @alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.tail])),
+            .ring_mask = @alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.ring_mask])),
+            .cqes = @as([*]linux.io_uring_cqe,@alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.cqes])))[0..params.cq_entries],
         };
 
         return .{

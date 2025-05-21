@@ -46,12 +46,18 @@ pub fn parse_array(bytes: []u8, allocator: *std.mem.Allocator) !struct { [][]u8,
     return .{ elements, i };
 }
 
-pub fn encode_bulk_string(s: []const u8, allocator: *std.mem.Allocator) ![]u8 {
+pub fn encode_bulk_string(maybe_s: ?[]const u8, allocator: *std.mem.Allocator) ![]u8 {
     var response = std.ArrayList(u8).init(allocator.*);
-    try std.fmt.format(response.writer(), "${d}\r\n", .{s.len});
-    _ = try response.writer().write(s);
-    _ = try response.writer().write("\r\n");
-    return response.toOwnedSlice();
+    if (maybe_s) |s| {
+        try std.fmt.format(response.writer(), "${d}\r\n", .{s.len});
+        _ = try response.writer().write(s);
+        _ = try response.writer().write("\r\n");
+        return response.toOwnedSlice();
+    }
+    else {
+        _ = try response.writer().write( "$-1\r\n");
+        return response.toOwnedSlice();
+    }
 }
 
 pub fn encode_simple_string(s: []const u8, allocator: *std.mem.Allocator) ![]u8 {

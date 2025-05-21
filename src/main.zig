@@ -2,7 +2,7 @@ const std = @import("std");
 const net = std.net;
 const eq = @import("event_queue.zig");
 const resp = @import("resp.zig");
-const command = @import("command.zig");
+const db = @import("db.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 const stdout = std.io.getStdOut().writer();
@@ -38,7 +38,6 @@ pub fn main() !void {
 
     var listener = try address.listen(.{
         .reuse_address = true,
-        .force_nonblocking = true,
     });
     defer listener.deinit();
 
@@ -54,6 +53,8 @@ pub fn main() !void {
     var event_queue = try eq.EventQueue.init(&allocator, IO_URING_ENTRIES);
     defer event_queue.destroy(&allocator) catch {unreachable;};
     try event_queue.add_async_event(&connection_event);
+    var instance = db.Instance.init(&allocator);
+    defer instance.destroy();
     while (true) {
         try stdout.print("Waiting for something to come through\n", .{});
         const event = try event_queue.next();
@@ -75,9 +76,21 @@ pub fn main() !void {
                     }
                     continue;
                 }
-                const request, _ = try resp.parse_array(buffer, &allocator);
+                if (event.async_result.? < 0) {
+                    std.debug.print("Error: {} {d}\n", .{linux.E.init(@intCast(@as(u32,@bitCast(event.async_result.?)))), event.async_result.?});
+                    posix.close(event.fd);
+                    allocator.free(buffer);
+                    continue;
+                }
+                const request, _ = resp.parse_array(buffer, &allocator) catch |err| {
+                    std.debug.print("Error: {}\n", .{err});
+                    std.debug.print("Got: {any} (return value: {d})\n",.{ buffer, event.async_result.? });
+                    posix.close(event.fd);
+                    allocator.free(buffer);
+                    continue;
+                };
                 allocator.free(buffer);
-                const reply = try command.execute(&allocator, request);
+                const reply = instance.execute_command(request) catch { continue; };
                 try add_send_response_event(&allocator, event.fd, reply, &event_queue);
             },
             eq.EVENT_TYPE.SENT_RESPONSE => {
