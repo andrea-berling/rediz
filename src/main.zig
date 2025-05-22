@@ -30,7 +30,9 @@ inline fn add_send_response_event(allocator: *std.mem.Allocator, fd: linux.socke
 pub fn main() !void {
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
+
     try stdout.print("Logs from your program will appear here!\n", .{});
+    std.debug.print("My PID is {}\n", .{ linux.getpid() });
 
     // Uncomment this block to pass the first stage
 
@@ -43,31 +45,47 @@ pub fn main() !void {
 
     // TODO: error handling?
     // TODO: freeing memory up?
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    var allocator = gpa.allocator();
+
+    var event_queue = try eq.EventQueue.init(&allocator, IO_URING_ENTRIES);
+    defer event_queue.destroy(&allocator) catch {@panic("Failed destroying the event queue");};
+
+    var sigset = posix.empty_sigset;
+    linux.sigaddset(&sigset, posix.SIG.TERM);
+    linux.sigaddset(&sigset, posix.SIG.INT);
+    posix.sigprocmask(posix.SIG.BLOCK, &sigset, null);
+    const sfd = try posix.signalfd(-1, &sigset, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
+    defer posix.close(sfd);
+    const termination_event: eq.Event = .{
+        .ty = eq.EVENT_TYPE.SIGTERM,
+        .fd = sfd,
+    };
+    try event_queue.add_async_event(&termination_event);
+
     const connection_event: eq.Event = .{
         .ty = eq.EVENT_TYPE.CONNECTION,
         .fd = listener.stream.handle,
     };
-
-    var allocator = std.heap.page_allocator;
-
-    var event_queue = try eq.EventQueue.init(&allocator, IO_URING_ENTRIES);
-    defer event_queue.destroy(&allocator) catch {unreachable;};
     try event_queue.add_async_event(&connection_event);
+
     var instance = db.Instance.init(&allocator);
     defer instance.destroy();
+
     while (true) {
         try stdout.print("Waiting for something to come through\n", .{});
         const event = try event_queue.next();
         try stdout.print("Event fd/type/ptr: {} {} {*}\n", .{ event.fd, event.ty, event });
         switch (event.ty) {
-            eq.EVENT_TYPE.CONNECTION => {
+            .CONNECTION => {
                 const connection_socket = event.async_result.?;
                 try stdout.print("accepted new connection\n", .{});
                 const buffer = try allocator.alloc(u8, READ_BUFFER_SIZE);
                 try add_receive_command_event(&allocator, connection_socket, buffer, &event_queue);
                 try event_queue.add_async_event(&connection_event);
             },
-            eq.EVENT_TYPE.RECEIVE_COMMAND => {
+            .RECEIVE_COMMAND => {
                 const buffer = event.buffer.?;
                 if (event.async_result.? == 0) {
                     posix.close(event.fd);
@@ -93,11 +111,15 @@ pub fn main() !void {
                 const reply = instance.execute_command(request) catch { continue; };
                 try add_send_response_event(&allocator, event.fd, reply, &event_queue);
             },
-            eq.EVENT_TYPE.SENT_RESPONSE => {
+            .SENT_RESPONSE => {
                 allocator.free(event.buffer.?);
                 const buffer = try allocator.alloc(u8, READ_BUFFER_SIZE);
                 try add_receive_command_event(&allocator, event.fd, buffer, &event_queue);
             },
+            .SIGTERM => {
+                std.debug.print("Gracefully shutting down...\n",.{});
+                break;
+            }
         }
     }
 }

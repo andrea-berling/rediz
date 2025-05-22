@@ -29,6 +29,7 @@ pub const EVENT_TYPE = enum {
     CONNECTION,
     RECEIVE_COMMAND,
     SENT_RESPONSE,
+    SIGTERM
 };
 
 pub const Event = struct {
@@ -111,20 +112,33 @@ pub const EventQueue = struct {
         const index = tail & (self.sqring.ring_mask.*);
         const sqe = &self.sqring.sqes[index];
         switch (event.ty) {
-            EVENT_TYPE.CONNECTION => {
+            .CONNECTION => {
                 sqe.prep_accept(event.fd, null, null, 0);
             },
-            EVENT_TYPE.RECEIVE_COMMAND => {
+            .RECEIVE_COMMAND => {
                 sqe.prep_recv(event.fd, event.buffer.?, 0);
             },
-            EVENT_TYPE.SENT_RESPONSE => {
+            .SENT_RESPONSE => {
                 sqe.prep_send(event.fd, event.buffer.?, 0);
+            },
+            .SIGTERM => {
+                sqe.prep_poll_add(event.fd, posix.POLL.IN);
             }
         }
         sqe.user_data = @intFromPtr(event);
         self.sqring.array[index] = @intCast(index);
         @atomicStore(c_uint, self.sqring.tail, tail + 1, std.builtin.AtomicOrder.release);
         _ = try io_uring_enter(self.io_uring_fd, 1, 0, 0, null);
+    }
+
+    pub fn cancel_all_pending_ops(self: *Self) !void {
+        const tail = self.sqring.tail.*;
+        const index = tail & (self.sqring.ring_mask.*);
+        const sqe = &self.sqring.sqes[index];
+        sqe.prep_cancel(0, linux.IORING_ASYNC_CANCEL_ANY);
+        self.sqring.array[index] = @intCast(index);
+        @atomicStore(c_uint, self.sqring.tail, tail + 1, std.builtin.AtomicOrder.release);
+        _ = try io_uring_enter(self.io_uring_fd, 1, 1, linux.IORING_ENTER_GETEVENTS, null);
     }
 
 
@@ -143,6 +157,7 @@ pub const EventQueue = struct {
     }
 
     pub fn destroy(self: *Self, allocator: *std.mem.Allocator) !void {
+        try self.cancel_all_pending_ops();
         allocator.destroy(self.params);
         posix.close(self.io_uring_fd);
     }
