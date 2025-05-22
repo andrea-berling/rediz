@@ -1,16 +1,20 @@
 const std = @import("std");
-const net = std.net;
 const eq = @import("event_queue.zig");
 const resp = @import("resp.zig");
 const db = @import("db.zig");
+const clap = @import("clap");
+
+const net = std.net;
 const posix = std.posix;
 const linux = std.os.linux;
+const Allocator = std.mem.Allocator;
+
 const stdout = std.io.getStdOut().writer();
 
 const READ_BUFFER_SIZE = 256;
 const IO_URING_ENTRIES = 100;
 
-inline fn add_receive_command_event(allocator: *std.mem.Allocator, fd: linux.socket_t, buffer: []u8, event_queue: *eq.EventQueue) !void {
+inline fn add_receive_command_event(fd: linux.socket_t, buffer: []u8, event_queue: *eq.EventQueue, allocator: Allocator) !void {
     var receive_command_event = try allocator.create(eq.Event);
     @memset(buffer, 0);
     receive_command_event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
@@ -19,7 +23,7 @@ inline fn add_receive_command_event(allocator: *std.mem.Allocator, fd: linux.soc
     try event_queue.add_async_event(receive_command_event);
 }
 
-inline fn add_send_response_event(allocator: *std.mem.Allocator, fd: linux.socket_t, buffer: []u8, event_queue: *eq.EventQueue) !void {
+inline fn add_send_response_event(fd: linux.socket_t, buffer: []u8, event_queue: *eq.EventQueue, allocator: Allocator) !void {
     var send_response_event = try allocator.create(eq.Event);
     send_response_event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
     send_response_event.fd = fd;
@@ -47,10 +51,12 @@ pub fn main() !void {
     // TODO: freeing memory up?
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    // TODO: fix memory leaks?
+    // defer _ = gpa.deinit();
     var allocator = gpa.allocator();
 
-    var event_queue = try eq.EventQueue.init(&allocator, IO_URING_ENTRIES);
-    defer event_queue.destroy(&allocator) catch {@panic("Failed destroying the event queue");};
+    var event_queue = try eq.EventQueue.init(allocator, IO_URING_ENTRIES);
+    defer event_queue.destroy() catch {@panic("Failed destroying the event queue");};
 
     var sigset = posix.empty_sigset;
     linux.sigaddset(&sigset, posix.SIG.TERM);
@@ -70,8 +76,51 @@ pub fn main() !void {
     };
     try event_queue.add_async_event(&connection_event);
 
-    var instance = db.Instance.init(&allocator);
-    defer instance.destroy();
+    var config = std.ArrayList(struct{[]const u8,[]const u8}).init(allocator);
+
+    // TODO: I don't need a full data model for my options, a list of string pairs
+    //  will suffice. I can take the parser out of clap and just use that part
+    // First we specify what parameters our program can take.
+    // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`.
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help             Display this help and exit.
+        \\--dir <str>   An option parameter, which takes a value.
+        \\--dbfilename <str>  An option parameter which can be specified multiple times.
+        \\
+    );
+
+    // Initialize our diagnostics, which can be used for reporting useful errors.
+    // This is optional. You can also pass `.{}` to `clap.parse` if you don't
+    // care about the extra information `Diagnostics` provides.
+    var diag = clap.Diagnostic{};
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
+        .diagnostic = &diag,
+        .allocator = gpa.allocator(),
+    }) catch |err| {
+        // Report useful error and exit.
+        diag.report(std.io.getStdErr().writer(), err) catch {};
+        return err;
+    };
+    defer res.deinit();
+
+    if (res.args.dir) |dir| {
+        try config.append(.{
+            "dir",dir
+        });
+    }
+
+    if (res.args.dbfilename) |dbfilename| {
+        try config.append(.{
+            "dbfilename",dbfilename
+        });
+    }
+
+    try config.append(.{
+        "END",""
+    });
+
+    var instance = try db.Instance.init(allocator,config.allocatedSlice());
+    defer instance.destroy(allocator);
 
     while (true) {
         try stdout.print("Waiting for something to come through\n", .{});
@@ -82,7 +131,7 @@ pub fn main() !void {
                 const connection_socket = event.async_result.?;
                 try stdout.print("accepted new connection\n", .{});
                 const buffer = try allocator.alloc(u8, READ_BUFFER_SIZE);
-                try add_receive_command_event(&allocator, connection_socket, buffer, &event_queue);
+                try add_receive_command_event(connection_socket, buffer, &event_queue, allocator);
                 try event_queue.add_async_event(&connection_event);
             },
             .RECEIVE_COMMAND => {
@@ -100,7 +149,7 @@ pub fn main() !void {
                     allocator.free(buffer);
                     continue;
                 }
-                const request, _ = resp.parse_array(buffer, &allocator) catch |err| {
+                const request, _ = resp.parse_array(allocator, buffer) catch |err| {
                     std.debug.print("Error: {}\n", .{err});
                     std.debug.print("Got: {any} (return value: {d})\n",.{ buffer, event.async_result.? });
                     posix.close(event.fd);
@@ -108,13 +157,13 @@ pub fn main() !void {
                     continue;
                 };
                 allocator.free(buffer);
-                const reply = instance.execute_command(request) catch { continue; };
-                try add_send_response_event(&allocator, event.fd, reply, &event_queue);
+                const reply = try std.mem.Allocator.dupe(allocator, u8, instance.execute_command(allocator,request) catch { continue; });
+                try add_send_response_event(event.fd, reply, &event_queue, allocator);
             },
             .SENT_RESPONSE => {
                 allocator.free(event.buffer.?);
                 const buffer = try allocator.alloc(u8, READ_BUFFER_SIZE);
-                try add_receive_command_event(&allocator, event.fd, buffer, &event_queue);
+                try add_receive_command_event(event.fd, buffer, &event_queue, allocator);
             },
             .SIGTERM => {
                 std.debug.print("Gracefully shutting down...\n",.{});

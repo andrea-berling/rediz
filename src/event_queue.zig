@@ -56,6 +56,7 @@ const CQRing = struct {
 };
 
 pub const EventQueue = struct {
+    allocator: std.mem.Allocator,
     io_uring_fd : linux.fd_t,
     params: *linux.io_uring_params,
     sqring : SQRing,
@@ -63,7 +64,7 @@ pub const EventQueue = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: *std.mem.Allocator, entries: u32) !EventQueue {
+    pub fn init(allocator: std.mem.Allocator, entries: u32) !EventQueue {
 
         var params = try allocator.create(linux.io_uring_params);
         params.flags = linux.IORING_SETUP_SINGLE_ISSUER;
@@ -100,6 +101,7 @@ pub const EventQueue = struct {
         };
 
         return .{
+            .allocator = allocator,
             .io_uring_fd = io_uring_fd,
             .params = params,
             .sqring = sqring,
@@ -156,9 +158,9 @@ pub const EventQueue = struct {
         return event;
     }
 
-    pub fn destroy(self: *Self, allocator: *std.mem.Allocator) !void {
+    pub fn destroy(self: *Self) !void {
         try self.cancel_all_pending_ops();
-        allocator.destroy(self.params);
+        self.allocator.destroy(self.params);
         posix.close(self.io_uring_fd);
     }
 };

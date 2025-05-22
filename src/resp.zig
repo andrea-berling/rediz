@@ -13,7 +13,7 @@ pub fn parse_decimal(bytes: []u8) !struct { u64, usize } {
     return .{ return_value, i };
 }
 
-pub fn parse_bulk_string(bytes: []u8, allocator: *std.mem.Allocator) !struct { []u8, usize } {
+pub fn parse_bulk_string(allocator: std.mem.Allocator, bytes: []u8) !struct { []u8, usize } {
     if (bytes[0] != '$') return error.InvalidRESPBulkString;
     var i: usize = 1;
     const string_length, const bytes_parsed = try parse_decimal(bytes[i..]);
@@ -29,7 +29,7 @@ pub fn parse_bulk_string(bytes: []u8, allocator: *std.mem.Allocator) !struct { [
     return .{ return_value, i };
 }
 
-pub fn parse_array(bytes: []u8, allocator: *std.mem.Allocator) !struct { [][]u8, usize } {
+pub fn parse_array(allocator: std.mem.Allocator, bytes: []u8) !struct { [][]u8, usize } {
     if (bytes[0] != '*') return error.InvalidRESPArray;
     var i: usize = 1;
     const n_elem, const bytes_parsed = try parse_decimal(bytes[i..]);
@@ -39,15 +39,15 @@ pub fn parse_array(bytes: []u8, allocator: *std.mem.Allocator) !struct { [][]u8,
     var elements = try allocator.alloc([]u8, n_elem);
 
     for (0..n_elem) |n| {
-        const element, const parsed_bytes = try parse_bulk_string(bytes[i..], allocator);
+        const element, const parsed_bytes = try parse_bulk_string(allocator, bytes[i..]);
         elements[n] = element;
         i += parsed_bytes;
     }
     return .{ elements, i };
 }
 
-pub fn encode_bulk_string(maybe_s: ?[]const u8, allocator: *std.mem.Allocator) ![]u8 {
-    var response = std.ArrayList(u8).init(allocator.*);
+pub fn encode_bulk_string(allocator: std.mem.Allocator,maybe_s: ?[]const u8) ![]u8 {
+    var response = std.ArrayList(u8).init(allocator);
     if (maybe_s) |s| {
         try std.fmt.format(response.writer(), "${d}\r\n", .{s.len});
         _ = try response.writer().write(s);
@@ -60,8 +60,17 @@ pub fn encode_bulk_string(maybe_s: ?[]const u8, allocator: *std.mem.Allocator) !
     }
 }
 
-pub fn encode_simple_string(s: []const u8, allocator: *std.mem.Allocator) ![]u8 {
-    var response = std.ArrayList(u8).init(allocator.*);
+pub fn encode_simple_string(allocator: std.mem.Allocator ,s: []const u8) ![]u8 {
+    var response = std.ArrayList(u8).init(allocator);
     try std.fmt.format(response.writer(), "+{s}\r\n", .{s});
+    return response.toOwnedSlice();
+}
+
+pub fn encode_array(allocator: std.mem.Allocator, array: []const []const u8) ![]u8 {
+    var response = std.ArrayList(u8).init(allocator);
+    try std.fmt.format(response.writer(), "*{d}\r\n", .{array.len});
+    for (array) |string| {
+        _ = try response.writer().write(try encode_bulk_string(allocator, string));
+    }
     return response.toOwnedSlice();
 }
