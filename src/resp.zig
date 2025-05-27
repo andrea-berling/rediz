@@ -46,6 +46,13 @@ pub fn parse_array(allocator: std.mem.Allocator, bytes: []u8) !struct { [][]u8, 
     return .{ elements, i };
 }
 
+pub fn destroy_array(allocator: std.mem.Allocator, array: [][]u8) void {
+    for (array) |element| {
+        allocator.free(element);
+    }
+    allocator.free(array);
+}
+
 pub fn encode_bulk_string(allocator: std.mem.Allocator,maybe_s: ?[]const u8) ![]u8 {
     var response = std.ArrayList(u8).init(allocator);
     if (maybe_s) |s| {
@@ -70,7 +77,9 @@ pub fn encode_array(allocator: std.mem.Allocator, array: []const []const u8) ![]
     var response = std.ArrayList(u8).init(allocator);
     try std.fmt.format(response.writer(), "*{d}\r\n", .{array.len});
     for (array) |string| {
-        _ = try response.writer().write(try encode_bulk_string(allocator, string));
+        const element = try encode_bulk_string(allocator, string);
+        defer allocator.free(element);
+        _ = try response.writer().write(element);
     }
     return response.toOwnedSlice();
 }

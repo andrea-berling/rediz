@@ -20,6 +20,10 @@ pub const Instance = struct {
     data: std.StringHashMap(Datum),
     config: std.StringHashMap([]u8),
 
+    inline fn copy(self: *Instance, bytes: []const u8) ![]u8 {
+        return try std.mem.Allocator.dupe(self.allocator.allocator(), u8, bytes);
+    }
+
     pub fn init(allocator: std.mem.Allocator, config: ?[]struct{[]const u8,[]const u8}) !Instance {
 
         var instance: Instance = undefined;
@@ -35,8 +39,8 @@ pub const Instance = struct {
 
         for (config_defaults) |config_pair| {
             try instance.config.put(
-                try std.mem.Allocator.dupe(instance.allocator.allocator(), u8, config_pair[0]),
-                try std.mem.Allocator.dupe(instance.allocator.allocator(), u8, config_pair[1])
+                try instance.copy(config_pair[0]),
+                try instance.copy(config_pair[1]),
             );
         }
 
@@ -44,8 +48,8 @@ pub const Instance = struct {
             for (pairs) |config_pair| {
                 if (std.mem.eql(u8, config_pair[0], "END")) break;
                 try instance.config.put(
-                    try std.mem.Allocator.dupe(instance.allocator.allocator(), u8, config_pair[0]),
-                    try std.mem.Allocator.dupe(instance.allocator.allocator(), u8, config_pair[1])
+                    try instance.copy(config_pair[0]),
+                    try instance.copy(config_pair[1]),
                 );
             }
         }
@@ -68,11 +72,11 @@ pub const Instance = struct {
             return response;
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "SET")) {
-            try self.data.put(command[1], .{
+            try self.data.put(try self.copy(command[1]), .{
                 .created_at_ms = std.time.milliTimestamp(),
                 .ttl_ms = if (command.len > 3 and std.ascii.eqlIgnoreCase(command[3], "PX")) try std.fmt.parseInt(u64, command[4], 10) else null,
                 .value = .{
-                    .string = try std.mem.Allocator.dupe(self.allocator.allocator(), u8, command[2])
+                    .string = try self.copy(command[2])
                 }
             });
             const response = try resp.encode_simple_string(allocator, "OK"[0..]);
