@@ -75,15 +75,15 @@ test "parse ascii strings" {
 test "parse special string-encoded values" {
     var allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer allocator.deinit();
-    const short_string = "\xc0\x7b";
+    const short_string = "\xc0\x7b"; // 0x7b = 123
     const parsed_short_string, const parsed_bytes1 = try parse_string(short_string[0..], allocator.allocator());
     try std.testing.expectEqualStrings("123", parsed_short_string);
     try std.testing.expectEqual(2, parsed_bytes1);
-    const long_string = "\xc1\x39\x30";
+    const long_string = "\xc1\x39\x30"; // 0x3930 = 12345
     const parsed_long_string, const parsed_bytes2 = try parse_string(long_string[0..], allocator.allocator());
     try std.testing.expectEqualStrings("12345", parsed_long_string);
     try std.testing.expectEqual(3, parsed_bytes2);
-    const long_long_string = "\xc2\x87\xd6\x12\x00";
+    const long_long_string = "\xc2\x87\xd6\x12\x00"; // 0x0012d687 = 1234567
     const parsed_long_long_string, const parsed_bytes3 = try parse_string(long_long_string[0..], allocator.allocator());
     try std.testing.expectEqualStrings("1234567", parsed_long_long_string);
     try std.testing.expectEqual(5, parsed_bytes3);
