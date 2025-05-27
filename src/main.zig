@@ -153,11 +153,12 @@ pub fn main() !void {
                     continue;
                 };
                 defer resp.destroyArray(allocator, request);
-                const reply = instance.executeCommand(allocator,request) catch {
+                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+                defer temp_allocator.deinit();
+                const reply = instance.executeCommand(temp_allocator.allocator(),request) catch {
                     // TODO: what if the command fails? Should I close the connection and kill the event? Notify the client?
                     continue;
                 };
-                defer allocator.free(reply);
                 event.buffer = event.buffer.?[0..reply.len]; // shrinking the buffer
                 @memcpy(event.buffer.?, reply);
                 event.ty = eq.EVENT_TYPE.SENT_RESPONSE;

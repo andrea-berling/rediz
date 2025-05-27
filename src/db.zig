@@ -69,8 +69,13 @@ pub const Instance = struct {
                 defer temp_allocator.deinit();
                 const data, _ = try rdb.parseData(db, temp_allocator.allocator());
                 for (data) |pair| {
+                    if (pair.value.expire_at_ms) |expire_at_ms| {
+                        if (expire_at_ms <= std.time.milliTimestamp()) {
+                            std.debug.print("Key {s} already expired at {d}, not adding it\n", .{ pair.key, expire_at_ms });
+                            continue;
+                        }
+                    }
                     var new_datum: Datum = .{ .expire_at_ms = pair.value.expire_at_ms, .value = undefined };
-                    std.debug.print("Key: {s} Expiration: {?}\n", .{ pair.key, pair.value.expire_at_ms });
                     new_datum.value.string = try instance.dupe(pair.value.value.string);
                     try instance.data.put(try instance.dupe(pair.key),new_datum);
                 }
@@ -92,12 +97,10 @@ pub const Instance = struct {
 
     pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: [][]u8) ![]u8 {
         if (std.ascii.eqlIgnoreCase(command[0], "PING")) {
-            const response = try resp.encodeSimpleString(allocator, "PONG"[0..]);
-            return response;
+            return try resp.encodeSimpleString(allocator, "PONG"[0..]);
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "ECHO")) {
-            const response = try resp.encodeSimpleString(allocator, command[1]);
-            return response;
+            return try resp.encodeSimpleString(allocator, command[1]);
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "SET")) {
             try self.data.put(try self.dupe(command[1]), .{
@@ -116,8 +119,7 @@ pub const Instance = struct {
                     .string = try self.dupe(command[2])
                 }
             });
-            const response = try resp.encodeSimpleString(allocator, "OK"[0..]);
-            return response;
+            return try resp.encodeSimpleString(allocator, "OK"[0..]);
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "GET")) {
             if ( self.data.get(command[1]) ) |data| {
@@ -127,8 +129,22 @@ pub const Instance = struct {
                         return try resp.encodeBulkString(allocator, null);
                     }
                 }
-                const response = try resp.encodeBulkString(allocator, data.value.string);
-                return response;
+                return  try resp.encodeBulkString(allocator, data.value.string);
+            }
+            else
+                return try resp.encodeBulkString(allocator, null);
+        }
+        else if (std.ascii.eqlIgnoreCase(command[0], "KEYS")) {
+            // TODO: support patterns
+            if ( command[1][0] == '*' ) {
+                var keys = try allocator.alloc([]const u8,self.data.count());
+
+                var keys_iterator = self.data.keyIterator();
+                var i: usize = 0;
+                while (keys_iterator.next()) |key|: (i += 1) {
+                    keys[i] = key.*;
+                }
+                return try resp.encodeArray(allocator, keys);
             }
             else
                 return try resp.encodeBulkString(allocator, null);
@@ -136,16 +152,14 @@ pub const Instance = struct {
         else if (std.ascii.eqlIgnoreCase(command[0], "CONFIG")) {
             if (std.ascii.eqlIgnoreCase(command[1], "GET")) {
                 if ( self.config.get(command[2]) ) |data| {
-                    const response = try resp.encodeArray(allocator, &[_][]u8{ command[2], data });
-                    return response;
+                    return try resp.encodeArray(allocator, &[_][]u8{ command[2], data });
                 }
                 else
                     return try resp.encodeBulkString(allocator, null);
             }
             else if (std.ascii.eqlIgnoreCase(command[1], "SET")) {
                 try self.config.put(command[2], command[3]);
-                const response = try resp.encodeSimpleString(allocator, "OK"[0..]);
-                return response;
+                return try resp.encodeSimpleString(allocator, "OK"[0..]);
             }
             else
                 return error.InvalidConfigCommand;
