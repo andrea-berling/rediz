@@ -11,8 +11,7 @@ const Value = union(ValueType) {
 
 const Datum = struct {
     value: Value,
-    created_at_ms: i64,
-    ttl_ms: ?u64,
+    expire_at_ms: ?i64,
 };
 
 pub const Instance = struct {
@@ -73,8 +72,17 @@ pub const Instance = struct {
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "SET")) {
             try self.data.put(try self.copy(command[1]), .{
-                .created_at_ms = std.time.milliTimestamp(),
-                .ttl_ms = if (command.len > 3 and std.ascii.eqlIgnoreCase(command[3], "PX")) try std.fmt.parseInt(u64, command[4], 10) else null,
+                .expire_at_ms = if (command.len > 3) {
+                    if (std.ascii.eqlIgnoreCase(command[3], "PX")) {
+                        std.time.milliTimestamp() + try std.fmt.parseInt(u64, command[4], 10);
+                    } else if (std.ascii.eqlIgnoreCase(command[3], "PXAT")) {
+                        try std.fmt.parseInt(u64, command[4], 10);
+                    } else if (std.ascii.eqlIgnoreCase(command[3], "EX")) {
+                        std.time.milliTimestamp() + try std.fmt.parseInt(u64, command[4], 10)*1000;
+                    } else if (std.ascii.eqlIgnoreCase(command[3], "EXAT")) {
+                        try std.fmt.parseInt(u64, command[4], 10)*1000;
+                    }
+                } else null,
                 .value = .{
                     .string = try self.copy(command[2])
                 }
@@ -84,8 +92,8 @@ pub const Instance = struct {
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "GET")) {
             if ( self.data.get(command[1]) ) |data| {
-                if ( data.ttl_ms ) |ttl_ms| {
-                    if (data.created_at_ms + @as(i64,@bitCast(ttl_ms)) < std.time.milliTimestamp()) {
+                if ( data.expire_at_ms ) |expire_at_ms| {
+                    if (expire_at_ms >= std.time.milliTimestamp()) {
                         _ = self.data.remove(command[1]);
                         return try resp.encodeBulkString(allocator, null);
                     }
