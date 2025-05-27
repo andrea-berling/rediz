@@ -62,13 +62,13 @@ pub const Instance = struct {
         allocator.destroy(self.allocator);
     }
 
-    pub fn execute_command(self: *Instance, allocator: std.mem.Allocator, command: [][]u8) ![]u8 {
+    pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: [][]u8) ![]u8 {
         if (std.ascii.eqlIgnoreCase(command[0], "PING")) {
-            const response = try resp.encode_simple_string(allocator, "PONG"[0..]);
+            const response = try resp.encodeSimpleString(allocator, "PONG"[0..]);
             return response;
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "ECHO")) {
-            const response = try resp.encode_simple_string(allocator, command[1]);
+            const response = try resp.encodeSimpleString(allocator, command[1]);
             return response;
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "SET")) {
@@ -79,7 +79,7 @@ pub const Instance = struct {
                     .string = try self.copy(command[2])
                 }
             });
-            const response = try resp.encode_simple_string(allocator, "OK"[0..]);
+            const response = try resp.encodeSimpleString(allocator, "OK"[0..]);
             return response;
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "GET")) {
@@ -87,27 +87,27 @@ pub const Instance = struct {
                 if ( data.ttl_ms ) |ttl_ms| {
                     if (data.created_at_ms + @as(i64,@bitCast(ttl_ms)) < std.time.milliTimestamp()) {
                         _ = self.data.remove(command[1]);
-                        return try resp.encode_bulk_string(allocator, null);
+                        return try resp.encodeBulkString(allocator, null);
                     }
                 }
-                const response = try resp.encode_bulk_string(allocator, data.value.string);
+                const response = try resp.encodeBulkString(allocator, data.value.string);
                 return response;
             }
             else
-                return try resp.encode_bulk_string(allocator, null);
+                return try resp.encodeBulkString(allocator, null);
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "CONFIG")) {
             if (std.ascii.eqlIgnoreCase(command[1], "GET")) {
                 if ( self.config.get(command[2]) ) |data| {
-                    const response = try resp.encode_array(allocator, &[_][]u8{ command[2], data });
+                    const response = try resp.encodeArray(allocator, &[_][]u8{ command[2], data });
                     return response;
                 }
                 else
-                    return try resp.encode_bulk_string(allocator, null);
+                    return try resp.encodeBulkString(allocator, null);
             }
             else if (std.ascii.eqlIgnoreCase(command[1], "SET")) {
                 try self.config.put(command[2], command[3]);
-                const response = try resp.encode_simple_string(allocator, "OK"[0..]);
+                const response = try resp.encodeSimpleString(allocator, "OK"[0..]);
                 return response;
             }
             else

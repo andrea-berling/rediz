@@ -5,7 +5,7 @@ const METADATA_SUBSECTION_MARKER = 0xfa;
 const DATABASE_SUBSECTION_MARKER = 0xfe;
 const EOF_SECTION_MARKER = 0xff;
 
-pub fn parse_string(bytes: []const u8, alloc: Allocator) !struct { []const u8, usize } {
+pub fn parseString(bytes: []const u8, alloc: Allocator) !struct { []const u8, usize } {
     const marker = bytes[0] >> 6;
     switch ( marker ) {
         0b00 => { // 1 byte len + ASCII
@@ -40,15 +40,15 @@ pub fn parse_string(bytes: []const u8, alloc: Allocator) !struct { []const u8, u
     }
 }
 
-pub fn parse_metadata_section(bytes: []const u8, alloc: Allocator) !struct { std.StringHashMap([]u8), usize } {
+pub fn parseMetadataSection(bytes: []const u8, alloc: Allocator) !struct { std.StringHashMap([]u8), usize } {
     std.debug.assert(bytes[0] == METADATA_SUBSECTION_MARKER);
     var i: usize = 0;
     var attributes = std.StringHashMap([]u8).init(alloc);
     while (bytes[i] == METADATA_SUBSECTION_MARKER) {
         i += 1;
-        const key, const key_bytes = try parse_string(bytes[i..], alloc);
+        const key, const key_bytes = try parseString(bytes[i..], alloc);
         i += key_bytes;
-        const value, const value_bytes = try parse_string(bytes[i..], alloc);
+        const value, const value_bytes = try parseString(bytes[i..], alloc);
         try attributes.put(key, @constCast(value));
         i += value_bytes;
     }
@@ -59,15 +59,15 @@ test "parse ascii strings" {
     var allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer allocator.deinit();
     const short_string = "\x0a" ++ "valkey-ver";
-    const parsed_short_string, const parsed_bytes1 = try parse_string(short_string[0..], allocator.allocator());
+    const parsed_short_string, const parsed_bytes1 = try parseString(short_string[0..], allocator.allocator());
     try std.testing.expectEqualStrings(short_string[1..], parsed_short_string);
     try std.testing.expectEqual(11, parsed_bytes1);
     const long_string = "\x42\xbc" ++ "hello" ** 140;
-    const parsed_long_string, const parsed_bytes2 = try parse_string(long_string[0..], allocator.allocator());
+    const parsed_long_string, const parsed_bytes2 = try parseString(long_string[0..], allocator.allocator());
     try std.testing.expectEqualStrings(long_string[2..], parsed_long_string);
     try std.testing.expectEqual(702, parsed_bytes2);
     const long_long_string = "\x80\x00\x00\x42\x68" ++ "hello" ** 3400;
-    const parsed_long_long_string, const parsed_bytes3 = try parse_string(long_long_string[0..], allocator.allocator());
+    const parsed_long_long_string, const parsed_bytes3 = try parseString(long_long_string[0..], allocator.allocator());
     try std.testing.expectEqualStrings(long_long_string[5..], parsed_long_long_string);
     try std.testing.expectEqual(17005, parsed_bytes3);
 }
@@ -76,15 +76,15 @@ test "parse special string-encoded values" {
     var allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer allocator.deinit();
     const short_string = "\xc0\x7b"; // 0x7b = 123
-    const parsed_short_string, const parsed_bytes1 = try parse_string(short_string[0..], allocator.allocator());
+    const parsed_short_string, const parsed_bytes1 = try parseString(short_string[0..], allocator.allocator());
     try std.testing.expectEqualStrings("123", parsed_short_string);
     try std.testing.expectEqual(2, parsed_bytes1);
     const long_string = "\xc1\x39\x30"; // 0x3930 = 12345
-    const parsed_long_string, const parsed_bytes2 = try parse_string(long_string[0..], allocator.allocator());
+    const parsed_long_string, const parsed_bytes2 = try parseString(long_string[0..], allocator.allocator());
     try std.testing.expectEqualStrings("12345", parsed_long_string);
     try std.testing.expectEqual(3, parsed_bytes2);
     const long_long_string = "\xc2\x87\xd6\x12\x00"; // 0x0012d687 = 1234567
-    const parsed_long_long_string, const parsed_bytes3 = try parse_string(long_long_string[0..], allocator.allocator());
+    const parsed_long_long_string, const parsed_bytes3 = try parseString(long_long_string[0..], allocator.allocator());
     try std.testing.expectEqualStrings("1234567", parsed_long_long_string);
     try std.testing.expectEqual(5, parsed_bytes3);
 }
@@ -107,7 +107,7 @@ const dump = [_]u8{
 test "parse metadata" {
     var allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer allocator.deinit();
-    const metadata, const parsed_bytes = try parse_metadata_section(dump[("REDIS0011"[0..]).len..], allocator.allocator());
+    const metadata, const parsed_bytes = try parseMetadataSection(dump[("REDIS0011"[0..]).len..], allocator.allocator());
     try std.testing.expectEqualStrings(metadata.get("valkey-ver").?, "8.0.3");
     try std.testing.expectEqualStrings(metadata.get("redis-bits").?, "64");
     try std.testing.expectEqualStrings(metadata.get("ctime").?, "1748284668");

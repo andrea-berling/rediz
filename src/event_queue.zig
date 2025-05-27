@@ -2,25 +2,25 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 
-fn handle_error(errno: i64) !void {
+fn handleError(errno: i64) !void {
     var error_string = std.ArrayList(u8).init(std.heap.page_allocator);
     try std.fmt.format(error_string.writer(), "Errno: {d}. Error: {any}", .{errno, linux.E.init(@bitCast(errno))});
     @panic(try error_string.toOwnedSlice());
 }
 
-fn io_uring_setup(entries: u32, p: *linux.io_uring_params) !linux.fd_t {
+fn ioUringSetup(entries: u32, p: *linux.io_uring_params) !linux.fd_t {
     const fd: i64 = @bitCast(linux.io_uring_setup(entries,p));
     if ( fd < 0 ) {
-        try handle_error(fd);
+        try handleError(fd);
     }
     return @truncate(fd);
 }
 
-fn io_uring_enter(fd: i32, to_submit: u32, min_complete: u32, flags: u32, sig: ?*linux.sigset_t) !usize {
+fn ioUringEnter(fd: i32, to_submit: u32, min_complete: u32, flags: u32, sig: ?*linux.sigset_t) !usize {
     const consumed_io_ops: i64 = @bitCast(linux.io_uring_enter(fd, to_submit, min_complete, flags, sig));
 
     if (consumed_io_ops < 0) {
-        try handle_error(fd);
+        try handleError(fd);
     }
     return @bitCast(consumed_io_ops);
 }
@@ -69,7 +69,7 @@ pub const EventQueue = struct {
         var params = try allocator.create(linux.io_uring_params);
         params.flags = linux.IORING_SETUP_SINGLE_ISSUER;
         @memset(&params.resv, 0);
-        const io_uring_fd = try io_uring_setup(entries,params);
+        const io_uring_fd = try ioUringSetup(entries,params);
 
 
         const sqring_ptr = try posix.mmap(null, params.sq_off.array + params.sq_entries * @sizeOf(u32),
@@ -109,7 +109,7 @@ pub const EventQueue = struct {
         };
     }
 
-    pub fn add_async_event(self: *Self, event: *const Event) !void {
+    pub fn addAsyncEvent(self: *Self, event: *const Event) !void {
         const tail = self.sqring.tail.*;
         const index = tail & (self.sqring.ring_mask.*);
         const sqe = &self.sqring.sqes[index];
@@ -130,17 +130,17 @@ pub const EventQueue = struct {
         sqe.user_data = @intFromPtr(event);
         self.sqring.array[index] = @intCast(index);
         @atomicStore(c_uint, self.sqring.tail, tail + 1, std.builtin.AtomicOrder.release);
-        _ = try io_uring_enter(self.io_uring_fd, 1, 0, 0, null);
+        _ = try ioUringEnter(self.io_uring_fd, 1, 0, 0, null);
     }
 
-    pub fn cancel_all_pending_ops(self: *Self) !void {
+    pub fn cancelAllPendingOps(self: *Self) !void {
         const tail = self.sqring.tail.*;
         const index = tail & (self.sqring.ring_mask.*);
         const sqe = &self.sqring.sqes[index];
         sqe.prep_cancel(0, linux.IORING_ASYNC_CANCEL_ANY);
         self.sqring.array[index] = @intCast(index);
         @atomicStore(c_uint, self.sqring.tail, tail + 1, std.builtin.AtomicOrder.release);
-        _ = try io_uring_enter(self.io_uring_fd, 1, 1, linux.IORING_ENTER_GETEVENTS, null);
+        _ = try ioUringEnter(self.io_uring_fd, 1, 1, linux.IORING_ENTER_GETEVENTS, null);
     }
 
 
@@ -148,7 +148,7 @@ pub const EventQueue = struct {
         const head = self.cqring.head.*;
         const tail = @atomicLoad(c_uint,self.cqring.tail,std.builtin.AtomicOrder.acquire);
         if (head == tail) {
-            _  = try io_uring_enter(self.io_uring_fd, 0, 1, linux.IORING_ENTER_GETEVENTS, null);
+            _  = try ioUringEnter(self.io_uring_fd, 0, 1, linux.IORING_ENTER_GETEVENTS, null);
         }
         const index = head & (self.cqring.ring_mask.*);
         const cqe = &self.cqring.cqes[index];
@@ -159,7 +159,7 @@ pub const EventQueue = struct {
     }
 
     pub fn destroy(self: *Self) !void {
-        try self.cancel_all_pending_ops();
+        try self.cancelAllPendingOps();
         self.allocator.destroy(self.params);
         posix.close(self.io_uring_fd);
     }
