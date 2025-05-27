@@ -84,6 +84,7 @@ pub fn parseKeyValuePair(bytes: []const u8, alloc: Allocator) !struct { struct{ 
     var parsed_bytes: usize = 0;
     var expire_timestamp_ms: i64 = 0;
     var value: db.Datum = undefined;
+    value.expire_at_ms = null;
     var key: []u8 = undefined;
     while(true) {
         switch (@as(MarkerByte,@enumFromInt(bytes[parsed_bytes]))) {
@@ -125,15 +126,24 @@ pub fn parseDatabaseSection(bytes: []const u8, alloc: Allocator) !struct { []Key
     std.debug.assert(marker == .HASH_TABLE_SIZE_INFO);
     const key_value_hash_table_size, const key_value_hash_table_size_n_parsed_bytes = try parseSize(bytes[3..]);
     _, const expires_hash_table_size_n_parsed_bytes = try parseSize(bytes[3 + key_value_hash_table_size_n_parsed_bytes..]);
-    var data = try alloc.alloc(KeyValuePair, key_value_hash_table_size);
+    var pairs = try alloc.alloc(KeyValuePair, key_value_hash_table_size);
     var cursor: usize = 3 + key_value_hash_table_size_n_parsed_bytes + expires_hash_table_size_n_parsed_bytes;
     for (0..key_value_hash_table_size) |i| {
-        const datum, const n_parsed_bytes = try parseKeyValuePair(bytes[cursor..],alloc);
-        data[i].key = datum.key;
-        data[i].value = datum.value;
+        const pair, const n_parsed_bytes = try parseKeyValuePair(bytes[cursor..],alloc);
+        pairs[i].key = pair.key;
+        pairs[i].value = pair.value;
         cursor += n_parsed_bytes;
     }
-    return .{ data, cursor };
+    return .{ pairs, cursor };
+}
+
+pub fn parseData(bytes: []const u8, alloc: Allocator) !struct { []KeyValuePair, usize } {
+    var offset = ("REDIS0011"[0..]).len;
+    _, const metadata_parsed_btyes = try parseMetadataSection(bytes[offset..], alloc);
+    offset += metadata_parsed_btyes;
+    const data, const data_parsed_bytes = try parseDatabaseSection(bytes[offset..], alloc);
+    offset += data_parsed_bytes;
+    return .{data, offset};
 }
 
 test "parse ascii strings" {
@@ -203,7 +213,7 @@ test "parse database" {
     var offset = ("REDIS0011"[0..]).len;
     _, const metadata_parsed_btyes = try parseMetadataSection(dump[offset..], allocator.allocator());
     offset += metadata_parsed_btyes;
-    const data, const set_commands_parsed_bytes = try parseDatabaseSection(dump[offset..], allocator.allocator());
+    const data, const data_parsed_bytes = try parseDatabaseSection(dump[offset..], allocator.allocator());
     try std.testing.expectEqualStrings("apple",data[0].key);
     try std.testing.expectEqualStrings("red",data[0].value.value.string);
     try std.testing.expectEqualStrings("banana",data[1].key);
@@ -211,5 +221,5 @@ test "parse database" {
     try std.testing.expectEqualStrings("broccoli",data[2].key);
     try std.testing.expectEqualStrings("green",data[2].value.value.string);
     try std.testing.expectEqual(1748342288601, data[2].value.expire_at_ms);
-    try std.testing.expectEqual(56,set_commands_parsed_bytes);
+    try std.testing.expectEqual(56,data_parsed_bytes);
 }

@@ -1,5 +1,8 @@
 const std = @import("std");
 const resp = @import("resp.zig");
+const rdb = @import("rdb.zig");
+
+const RDB_FILE_SIZE_LIMIT = 100*1024*1024*1024;
 
 const ValueType = enum {
     string,
@@ -31,8 +34,7 @@ pub const Instance = struct {
         instance.data = std.StringHashMap(Datum).init(instance.allocator.allocator());
         instance.config = std.StringHashMap([]u8).init(instance.allocator.allocator());
 
-        const config_defaults: [2]struct{[]const u8,[]const u8} = .{
-            .{ "dir", "."},
+        const config_defaults = [_]struct{[]const u8,[]const u8}{
             .{ "dbfilename", "dump.rdb"}
         };
 
@@ -50,6 +52,33 @@ pub const Instance = struct {
                     try instance.dupe(config_pair[0]),
                     try instance.dupe(config_pair[1]),
                 );
+            }
+        }
+
+        var rdb_directory = std.fs.cwd();
+
+        if (instance.config.get("dir")) |dir| {
+            rdb_directory = try std.fs.openDirAbsolute(dir, .{});
+        }
+
+        if (instance.config.get("dbfilename")) |dbfilename| {
+            std.debug.print("Initializing from RDB file {s}...\n", .{dbfilename});
+            if (rdb_directory.openFile(dbfilename, .{})) |file| {
+                const db = try file.readToEndAlloc(instance.allocator.allocator(), RDB_FILE_SIZE_LIMIT);
+                var temp_allocator = std.heap.ArenaAllocator.init(instance.allocator.allocator());
+                defer temp_allocator.deinit();
+                const data, _ = try rdb.parseData(db, temp_allocator.allocator());
+                for (data) |pair| {
+                    var new_datum: Datum = .{ .expire_at_ms = pair.value.expire_at_ms, .value = undefined };
+                    std.debug.print("Key: {s} Expiration: {?}\n", .{ pair.key, pair.value.expire_at_ms });
+                    new_datum.value.string = try instance.dupe(pair.value.value.string);
+                    try instance.data.put(try instance.dupe(pair.key),new_datum);
+                }
+            } else |err| {
+                if (err != error.FileNotFound) {
+                    @panic("Error opening dbfilename");
+                }
+                std.debug.print("File {s} not found\n", .{dbfilename});
             }
         }
 
@@ -72,16 +101,16 @@ pub const Instance = struct {
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "SET")) {
             try self.data.put(try self.dupe(command[1]), .{
-                .expire_at_ms = if (command.len > 3) {
+                .expire_at_ms = if (command.len > 3) blk: {
                     if (std.ascii.eqlIgnoreCase(command[3], "PX")) {
-                        std.time.milliTimestamp() + try std.fmt.parseInt(u64, command[4], 10);
+                        break :blk std.time.milliTimestamp() + @as(i64,@bitCast(try std.fmt.parseInt(u64, command[4], 10)));
                     } else if (std.ascii.eqlIgnoreCase(command[3], "PXAT")) {
-                        try std.fmt.parseInt(u64, command[4], 10);
+                        break :blk @as(i64,@bitCast(try std.fmt.parseInt(u64, command[4], 10)));
                     } else if (std.ascii.eqlIgnoreCase(command[3], "EX")) {
-                        std.time.milliTimestamp() + try std.fmt.parseInt(u64, command[4], 10)*1000;
+                        break :blk std.time.milliTimestamp() + @as(i64,@bitCast(try std.fmt.parseInt(u64, command[4], 10)))*1000;
                     } else if (std.ascii.eqlIgnoreCase(command[3], "EXAT")) {
-                        try std.fmt.parseInt(u64, command[4], 10)*1000;
-                    }
+                        break :blk @as(i64,@bitCast(try std.fmt.parseInt(u64, command[4], 10)))*1000;
+                    } else break :blk null;
                 } else null,
                 .value = .{
                     .string = try self.dupe(command[2])
@@ -93,7 +122,7 @@ pub const Instance = struct {
         else if (std.ascii.eqlIgnoreCase(command[0], "GET")) {
             if ( self.data.get(command[1]) ) |data| {
                 if ( data.expire_at_ms ) |expire_at_ms| {
-                    if (expire_at_ms >= std.time.milliTimestamp()) {
+                    if (expire_at_ms <= std.time.milliTimestamp()) {
                         _ = self.data.remove(command[1]);
                         return try resp.encodeBulkString(allocator, null);
                     }

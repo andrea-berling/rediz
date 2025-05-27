@@ -123,7 +123,7 @@ pub fn main() !void {
     config.deinit();
 
     while (true) {
-        try stdout.print("Waiting for something to come through\n", .{});
+        try stdout.print("Waiting for something to come through...\n", .{});
         const event = try event_queue.next();
         try stdout.print("Event fd/type/ptr: {} {} {*}\n", .{ event.fd, event.ty, event });
         switch (event.ty) {
