@@ -1,4 +1,6 @@
 const std = @import("std");
+const db = @import("db.zig");
+
 const Allocator = std.mem.Allocator;
 
 const MarkerByte = enum(u8) {
@@ -37,12 +39,12 @@ pub fn parseSize(bytes: []const u8) !struct { usize, u3 } {
     return .{size, parsed_bytes};
 }
 
-pub fn parseString(bytes: []const u8, alloc: Allocator) !struct { []const u8, usize } {
+pub fn parseString(bytes: []const u8, alloc: Allocator) !struct { []u8, usize } {
     const marker = bytes[0] >> 6;
     switch ( marker ) {
         0b00, 0b01, 0b10 => {
             const length, const parsed_bytes = try parseSize(bytes);
-            return .{ bytes[parsed_bytes..][0..length], parsed_bytes + length };
+            return .{ try alloc.dupe(u8,bytes[parsed_bytes..][0..length]), parsed_bytes + length };
         },
         0b11 => {
             if (bytes[0] & 0x3f == 0xc3) { // LZF-compressed string
@@ -78,10 +80,11 @@ pub fn parseMetadataSection(bytes: []const u8, alloc: Allocator) !struct { std.S
     return .{ attributes, i };
 }
 
-pub fn parseKeyValueAsSetCommand(bytes: []const u8, alloc: Allocator) !struct { []u8, usize } {
-    var set_command = std.ArrayList(u8).init(alloc);
+pub fn parseKeyValuePair(bytes: []const u8, alloc: Allocator) !struct { struct{ key: []u8, value: db.Datum}, usize } {
     var parsed_bytes: usize = 0;
     var expire_timestamp_ms: i64 = 0;
+    var value: db.Datum = undefined;
+    var key: []u8 = undefined;
     while(true) {
         switch (@as(MarkerByte,@enumFromInt(bytes[parsed_bytes]))) {
             .KEY_EXPIRE_MS, .KEY_EXPIRE_S => |marker| {
@@ -94,30 +97,27 @@ pub fn parseKeyValueAsSetCommand(bytes: []const u8, alloc: Allocator) !struct { 
                     expire_timestamp_ms = expire_timestamp_ms | (@as(i64,bytes[i+1]) << @as(u6,@truncate(8*@as(u8,@truncate(i)))));
                 }
                 if ( marker == .KEY_EXPIRE_S) expire_timestamp_ms *= 1000;
+                value.expire_at_ms = expire_timestamp_ms;
                 parsed_bytes += 1 + timestamp_size;
             },
             .KEY_TYPE_STRING => {
                 parsed_bytes += 1;
-                const key, const key_bytes = try parseString(bytes[parsed_bytes..], alloc);
+                key, const key_bytes = try parseString(bytes[parsed_bytes..], alloc);
                 parsed_bytes += key_bytes;
-                const value, const value_bytes = try parseString(bytes[parsed_bytes..], alloc);
+                value.value.string, const value_bytes = try parseString(bytes[parsed_bytes..], alloc);
                 parsed_bytes += value_bytes;
-                // TODO: leaks
-                try std.fmt.format(set_command.writer(), "SET {s} {s}", .{key,value});
                 break;
             },
             else => { break; }
         }
     }
 
-    if (expire_timestamp_ms > 0) {
-        try std.fmt.format(set_command.writer(), " PXAT {d}", .{expire_timestamp_ms});
-    }
-
-    return .{try set_command.toOwnedSlice(), parsed_bytes};
+    return .{ .{.key = key, .value = value}, parsed_bytes};
 }
 
-pub fn parseDatabaseSectionSetCommands(bytes: []const u8, alloc: Allocator) !struct { [][]u8, usize } {
+const KeyValuePair = struct{ key: []u8, value: db.Datum };
+
+pub fn parseDatabaseSection(bytes: []const u8, alloc: Allocator) !struct { []KeyValuePair, usize } {
     var marker = @as(MarkerByte,@enumFromInt(bytes[0]));
     std.debug.assert(marker == .DATABASE);
     // NOTE: Simplifying assumption: there is only one database, and we don't care about the number
@@ -125,15 +125,15 @@ pub fn parseDatabaseSectionSetCommands(bytes: []const u8, alloc: Allocator) !str
     std.debug.assert(marker == .HASH_TABLE_SIZE_INFO);
     const key_value_hash_table_size, const key_value_hash_table_size_n_parsed_bytes = try parseSize(bytes[3..]);
     _, const expires_hash_table_size_n_parsed_bytes = try parseSize(bytes[3 + key_value_hash_table_size_n_parsed_bytes..]);
-    var creation_commands = try alloc.alloc([]u8, key_value_hash_table_size);
+    var data = try alloc.alloc(KeyValuePair, key_value_hash_table_size);
     var cursor: usize = 3 + key_value_hash_table_size_n_parsed_bytes + expires_hash_table_size_n_parsed_bytes;
     for (0..key_value_hash_table_size) |i| {
-        // NOTE: Inefficient to turn keys into commands and then execute them, but easier to implement initially
-        const command, const n_parsed_bytes = try parseKeyValueAsSetCommand(bytes[cursor..],alloc);
-        creation_commands[i] = command;
+        const datum, const n_parsed_bytes = try parseKeyValuePair(bytes[cursor..],alloc);
+        data[i].key = datum.key;
+        data[i].value = datum.value;
         cursor += n_parsed_bytes;
     }
-    return .{ creation_commands, cursor };
+    return .{ data, cursor };
 }
 
 test "parse ascii strings" {
@@ -203,9 +203,13 @@ test "parse database" {
     var offset = ("REDIS0011"[0..]).len;
     _, const metadata_parsed_btyes = try parseMetadataSection(dump[offset..], allocator.allocator());
     offset += metadata_parsed_btyes;
-    const set_commands, const set_commands_parsed_bytes = try parseDatabaseSectionSetCommands(dump[offset..], allocator.allocator());
-    try std.testing.expectEqualStrings("SET apple red",set_commands[0]);
-    try std.testing.expectEqualStrings("SET banana yellow", set_commands[1]);
-    try std.testing.expectEqualStrings("SET broccoli green PXAT 1748342288601",set_commands[2]);
+    const data, const set_commands_parsed_bytes = try parseDatabaseSection(dump[offset..], allocator.allocator());
+    try std.testing.expectEqualStrings("apple",data[0].key);
+    try std.testing.expectEqualStrings("red",data[0].value.value.string);
+    try std.testing.expectEqualStrings("banana",data[1].key);
+    try std.testing.expectEqualStrings("yellow",data[1].value.value.string);
+    try std.testing.expectEqualStrings("broccoli",data[2].key);
+    try std.testing.expectEqualStrings("green",data[2].value.value.string);
+    try std.testing.expectEqual(1748342288601, data[2].value.expire_at_ms);
     try std.testing.expectEqual(56,set_commands_parsed_bytes);
 }
