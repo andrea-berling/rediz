@@ -91,7 +91,11 @@ pub const Instance = struct {
 
         if (instance.config.get("master")) |master| {
             var it = std.mem.splitScalar(u8, master, ' ');
-            const address = it.next().?;
+            var address = it.next().?;
+            // TODO: DNS
+            if (std.mem.eql(u8,address,"localhost")) {
+                address = "127.0.0.1";
+            }
             const port = try std.fmt.parseInt(u16, it.next().?, 10);
             instance.master = .{
                 .in = try std.net.Ip4Address.resolveIp(address, port)
