@@ -20,7 +20,7 @@ inline fn addReceiveCommandEvent(fd: linux.socket_t, buffer: []u8, event_queue: 
     receive_command_event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
     receive_command_event.fd = fd;
     receive_command_event.buffer = buffer;
-    try event_queue.addAsyncEvent(receive_command_event);
+    try event_queue.addAsyncEvent(receive_command_event,true);
 }
 
 inline fn destroyEvent(event: *eq.Event, allocator: Allocator) void {
@@ -111,13 +111,13 @@ pub fn main() !void {
         .ty = eq.EVENT_TYPE.SIGTERM,
         .fd = sfd,
     };
-    try event_queue.addAsyncEvent(&termination_event);
+    try event_queue.addAsyncEvent(&termination_event, false);
 
     const connection_event: eq.Event = .{
         .ty = eq.EVENT_TYPE.CONNECTION,
         .fd = listener.stream.handle,
     };
-    try event_queue.addAsyncEvent(&connection_event);
+    try event_queue.addAsyncEvent(&connection_event, false);
 
     var instance = try db.Instance.init(allocator,config.allocatedSlice());
     defer instance.destroy(allocator);
@@ -134,7 +134,7 @@ pub fn main() !void {
                 try stdout.print("accepted new connection\n", .{});
                 const buffer = try allocator.alloc(u8, CLIENT_BUFFER_SIZE);
                 try addReceiveCommandEvent(connection_socket, buffer, &event_queue, allocator);
-                try event_queue.addAsyncEvent(&connection_event);
+                try event_queue.addAsyncEvent(&connection_event, false);
             },
             .RECEIVE_COMMAND => {
                 const buffer = event.buffer.?;
@@ -164,13 +164,13 @@ pub fn main() !void {
                 event.buffer = event.buffer.?[0..reply.len]; // shrinking the buffer
                 @memcpy(event.buffer.?, reply);
                 event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-                try event_queue.addAsyncEvent(event);
+                try event_queue.addAsyncEvent(event, true);
             },
             .SENT_RESPONSE => {
                 event.buffer = (@as([*]u8,@ptrCast(event.buffer.?.ptr)))[0..CLIENT_BUFFER_SIZE]; // resizing the buffer
                 event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
                 @memset(event.buffer.?, 0);
-                try event_queue.addAsyncEvent(event);
+                try event_queue.addAsyncEvent(event, true);
             },
             .SIGTERM => {
                 std.debug.print("Gracefully shutting down...\n",.{});

@@ -61,6 +61,8 @@ pub const EventQueue = struct {
     params: *linux.io_uring_params,
     sqring : SQRing,
     cqring : CQRing,
+    // TODO: is there a ZST I can put in here?
+    pending_events: std.AutoHashMap(*const Event, bool),
 
     const Self = @This();
 
@@ -106,10 +108,11 @@ pub const EventQueue = struct {
             .params = params,
             .sqring = sqring,
             .cqring = cqring,
+            .pending_events = std.AutoHashMap(*const Event, bool).init(allocator)
         };
     }
 
-    pub fn addAsyncEvent(self: *Self, event: *const Event) !void {
+    pub fn addAsyncEvent(self: *Self, event: *const Event, allocated_at_runtime: bool) !void {
         const tail = self.sqring.tail.*;
         const index = tail & (self.sqring.ring_mask.*);
         const sqe = &self.sqring.sqes[index];
@@ -129,6 +132,9 @@ pub const EventQueue = struct {
         }
         sqe.user_data = @intFromPtr(event);
         self.sqring.array[index] = @intCast(index);
+        if (allocated_at_runtime) {
+            try self.pending_events.put(event, true);
+        }
         @atomicStore(c_uint, self.sqring.tail, tail + 1, std.builtin.AtomicOrder.release);
         _ = try ioUringEnter(self.io_uring_fd, 1, 0, 0, null);
     }
@@ -155,11 +161,22 @@ pub const EventQueue = struct {
         const event: *Event = @ptrFromInt(cqe.user_data);
         event.async_result = cqe.res;
         @atomicStore(c_uint, self.cqring.head, head + 1, std.builtin.AtomicOrder.release);
+
+        _ = self.pending_events.remove(event);
+
         return event;
     }
 
     pub fn destroy(self: *Self) !void {
         try self.cancelAllPendingOps();
+        var keys_iterator = self.pending_events.keyIterator();
+        while (keys_iterator.next()) |key| {
+            if (key.*.buffer) |buffer| {
+                self.allocator.free(buffer);
+            }
+            self.allocator.destroy(key.*);
+        }
+        self.pending_events.deinit();
         self.allocator.destroy(self.params);
         posix.close(self.io_uring_fd);
     }
