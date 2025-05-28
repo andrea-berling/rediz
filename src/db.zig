@@ -22,6 +22,8 @@ pub const Instance = struct {
     data: std.StringHashMap(Datum),
     config: std.StringHashMap([]u8),
     master: ?std.net.Address = null,
+    replid: []const u8,
+    repl_offset: usize,
 
     inline fn dupe(self: *Instance, bytes: []const u8) ![]u8 {
         return try self.allocator.allocator().dupe(u8,bytes);
@@ -35,6 +37,7 @@ pub const Instance = struct {
         instance.data = std.StringHashMap(Datum).init(instance.allocator.allocator());
         instance.config = std.StringHashMap([]u8).init(instance.allocator.allocator());
         instance.master = null;
+        instance.repl_offset = 0;
 
         const config_defaults = [_]struct{[]const u8,[]const u8}{
             .{ "dbfilename", "dump.rdb"}
@@ -89,6 +92,7 @@ pub const Instance = struct {
             }
         }
 
+        instance.replid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
         if (instance.config.get("master")) |master| {
             var it = std.mem.splitScalar(u8, master, ' ');
             var address = it.next().?;
@@ -100,6 +104,8 @@ pub const Instance = struct {
             instance.master = .{
                 .in = try std.net.Ip4Address.resolveIp(address, port)
             };
+        } else {
+            // TODO: initialize the replid as a random 40 character alphanumeric string
         }
 
         return instance;
@@ -181,7 +187,11 @@ pub const Instance = struct {
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "INFO")) {
             if (std.ascii.eqlIgnoreCase(command[1], "REPLICATION")) {
-                return try resp.encodeBulkString(allocator, if (self.master) |_| "role:slave" else "role:master");
+                var response = std.ArrayList(u8).init(allocator);
+                try response.appendSlice(if (self.master) |_| "role:slave\n" else "role:master\n");
+                try std.fmt.format(response.writer(),"master_replid:{s}\n",.{self.replid});
+                try std.fmt.format(response.writer(),"master_repl_offset:{d}\n",.{self.repl_offset});
+                return try resp.encodeBulkString(allocator, try response.toOwnedSlice());
             }
             else
                 return error.InvalidInfoCommand;
