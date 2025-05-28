@@ -21,6 +21,7 @@ pub const Instance = struct {
     allocator: *std.heap.ArenaAllocator,
     data: std.StringHashMap(Datum),
     config: std.StringHashMap([]u8),
+    master: ?std.net.Address = null,
 
     inline fn dupe(self: *Instance, bytes: []const u8) ![]u8 {
         return try self.allocator.allocator().dupe(u8,bytes);
@@ -33,6 +34,7 @@ pub const Instance = struct {
         instance.allocator.* = std.heap.ArenaAllocator.init(allocator);
         instance.data = std.StringHashMap(Datum).init(instance.allocator.allocator());
         instance.config = std.StringHashMap([]u8).init(instance.allocator.allocator());
+        instance.master = null;
 
         const config_defaults = [_]struct{[]const u8,[]const u8}{
             .{ "dbfilename", "dump.rdb"}
@@ -85,6 +87,15 @@ pub const Instance = struct {
                 }
                 std.debug.print("File {s} not found\n", .{dbfilename});
             }
+        }
+
+        if (instance.config.get("master")) |master| {
+            var it = std.mem.splitScalar(u8, master, ' ');
+            const address = it.next().?;
+            const port = try std.fmt.parseInt(u16, it.next().?, 10);
+            instance.master = .{
+                .in = try std.net.Ip4Address.resolveIp(address, port)
+            };
         }
 
         return instance;
@@ -163,6 +174,13 @@ pub const Instance = struct {
             }
             else
                 return error.InvalidConfigCommand;
+        }
+        else if (std.ascii.eqlIgnoreCase(command[0], "INFO")) {
+            if (std.ascii.eqlIgnoreCase(command[1], "REPLICATION")) {
+                return try resp.encodeBulkString(allocator, if (self.master) |_| "role:slave" else "role:master");
+            }
+            else
+                return error.InvalidInfoCommand;
         }
         else {
             std.debug.print("Unsupported command received: {s}\n",.{command[0]});

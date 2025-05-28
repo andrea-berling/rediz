@@ -53,6 +53,7 @@ pub fn main() !void {
         \\--dir <str>   Directory where dbfilename can be found
         \\--dbfilename <str>  The name of a .rdb file to load on startup
         \\-p, --port <u16>  The port to listen on
+        \\--replicaof <str>  The master instance for this replica
         \\
     );
 
@@ -79,6 +80,12 @@ pub fn main() !void {
     if (res.args.dbfilename) |dbfilename| {
         try config.append(.{
             "dbfilename",dbfilename
+        });
+    }
+
+    if (res.args.replicaof) |replicaof| {
+        try config.append(.{
+            "master",replicaof
         });
     }
 
