@@ -38,41 +38,9 @@ pub fn main() !void {
     try stdout.print("Logs from your program will appear here!\n", .{});
     std.debug.print("My PID is {}\n", .{ linux.getpid() });
 
-    // Uncomment this block to pass the first stage
-
-    const address = try net.Address.resolveIp("127.0.0.1", 6379);
-
-    var listener = try address.listen(.{
-        .reuse_address = true,
-    });
-    defer listener.deinit();
-
-    // TODO: error handling?
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
     var allocator = gpa.allocator();
-
-    var event_queue = try eq.EventQueue.init(allocator, IO_URING_ENTRIES);
-    defer event_queue.destroy() catch {@panic("Failed destroying the event queue");};
-
-    var sigset = posix.empty_sigset;
-    linux.sigaddset(&sigset, posix.SIG.TERM);
-    linux.sigaddset(&sigset, posix.SIG.INT);
-    posix.sigprocmask(posix.SIG.BLOCK, &sigset, null);
-    const sfd = try posix.signalfd(-1, &sigset, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
-    defer posix.close(sfd);
-    const termination_event: eq.Event = .{
-        .ty = eq.EVENT_TYPE.SIGTERM,
-        .fd = sfd,
-    };
-    try event_queue.addAsyncEvent(&termination_event);
-
-    const connection_event: eq.Event = .{
-        .ty = eq.EVENT_TYPE.CONNECTION,
-        .fd = listener.stream.handle,
-    };
-    try event_queue.addAsyncEvent(&connection_event);
 
     var config = std.ArrayList(struct{[]const u8,[]const u8}).init(allocator);
 
@@ -82,8 +50,9 @@ pub fn main() !void {
     // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`.
     const params = comptime clap.parseParamsComptime(
         \\-h, --help             Display this help and exit.
-        \\--dir <str>   An option parameter, which takes a value.
-        \\--dbfilename <str>  An option parameter which can be specified multiple times.
+        \\--dir <str>   Directory where dbfilename can be found
+        \\--dbfilename <str>  The name of a .rdb file to load on startup
+        \\-p, --port <u16>  The port to listen on
         \\
     );
 
@@ -114,8 +83,41 @@ pub fn main() !void {
     }
 
     try config.append(.{
+        // TODO: Janky, to be fixed
         "END",""
     });
+
+    const port = res.args.port orelse 6379;
+
+    const address = try net.Address.resolveIp("127.0.0.1", port);
+
+    var listener = try address.listen(.{
+        .reuse_address = true,
+    });
+    defer listener.deinit();
+
+    std.debug.print("Listening on port {}...\n", .{ port });
+
+    var event_queue = try eq.EventQueue.init(allocator, IO_URING_ENTRIES);
+    defer event_queue.destroy() catch {@panic("Failed destroying the event queue");};
+
+    var sigset = posix.empty_sigset;
+    linux.sigaddset(&sigset, posix.SIG.TERM);
+    linux.sigaddset(&sigset, posix.SIG.INT);
+    posix.sigprocmask(posix.SIG.BLOCK, &sigset, null);
+    const sfd = try posix.signalfd(-1, &sigset, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
+    defer posix.close(sfd);
+    const termination_event: eq.Event = .{
+        .ty = eq.EVENT_TYPE.SIGTERM,
+        .fd = sfd,
+    };
+    try event_queue.addAsyncEvent(&termination_event);
+
+    const connection_event: eq.Event = .{
+        .ty = eq.EVENT_TYPE.CONNECTION,
+        .fd = listener.stream.handle,
+    };
+    try event_queue.addAsyncEvent(&connection_event);
 
     var instance = try db.Instance.init(allocator,config.allocatedSlice());
     defer instance.destroy(allocator);
