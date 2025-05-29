@@ -104,6 +104,13 @@ pub const Instance = struct {
             instance.master = .{
                 .in = try std.net.Ip4Address.resolveIp(address, port)
             };
+
+
+            var temp_allocator = std.heap.ArenaAllocator.init(instance.allocator.allocator());
+            defer temp_allocator.deinit();
+            var stream = try std.net.tcpConnectToHost(temp_allocator.allocator(),address,port);
+            const ping = try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PING"});
+            _ = try stream.write(ping);
         } else {
             // TODO: initialize the replid as a random 40 character alphanumeric string
         }
