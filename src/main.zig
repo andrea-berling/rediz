@@ -89,6 +89,12 @@ pub fn main() !void {
         });
     }
 
+    var listening_port = [_]u8{0} ** 5;
+
+    try config.append(.{
+        "listening-port",try std.fmt.bufPrint(&listening_port,"{d}",.{ res.args.port orelse 6379 })
+    });
+
     try config.append(.{
         // TODO: Janky, to be fixed
         "END",""

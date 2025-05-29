@@ -104,18 +104,32 @@ pub const Instance = struct {
             instance.master = .{
                 .in = try std.net.Ip4Address.resolveIp(address, port)
             };
-
-
-            var temp_allocator = std.heap.ArenaAllocator.init(instance.allocator.allocator());
-            defer temp_allocator.deinit();
-            var stream = try std.net.tcpConnectToHost(temp_allocator.allocator(),address,port);
-            const ping = try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PING"});
-            _ = try stream.write(ping);
+            try instance.handshake(address, port);
         } else {
             // TODO: initialize the replid as a random 40 character alphanumeric string
         }
 
         return instance;
+    }
+
+    fn handshake(self: *Instance, address: []const u8, port: u16) !void {
+        var temp_allocator = std.heap.ArenaAllocator.init(self.allocator.allocator());
+        defer temp_allocator.deinit();
+        var stream = try std.net.tcpConnectToHost(temp_allocator.allocator(),address,port);
+        const ping = try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PING"});
+        _ = try stream.write(ping);
+        const buffer = try temp_allocator.allocator().alloc(u8, 128);
+        var n = try stream.read(buffer);
+        std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+PONG\r\n"));
+        const replconf1 = try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"REPLCONF", "listening-port", self.config.get("listening-port").? });
+        _ = try stream.write(replconf1);
+        n = try stream.read(buffer);
+        std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
+        const replconf2 = try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"REPLCONF", "capa", "psync2" });
+        _ = try stream.write(replconf2);
+        n = try stream.read(buffer);
+        std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
+        std.debug.print("Handshake with {s}:{d} was succesful!\n",.{address,port});
     }
 
     pub fn destroy(self: *Instance, allocator: std.mem.Allocator) void {
