@@ -219,6 +219,11 @@ pub const Instance = struct {
         else if (std.ascii.eqlIgnoreCase(command[0], "REPLCONF")) {
             return try resp.encodeSimpleString(allocator, "OK"[0..]);
         }
+        else if (std.ascii.eqlIgnoreCase(command[0], "PSYNC")) {
+            var response = std.ArrayList(u8).init(allocator);
+            try std.fmt.format(response.writer(),"FULLRESYNC {s} {d}", .{self.replid, self.repl_offset});
+            return try resp.encodeSimpleString(allocator, try response.toOwnedSlice());
+        }
         else {
             std.debug.print("Unsupported command received: {s}\n",.{command[0]});
             return error.UnsupportedCommand;
