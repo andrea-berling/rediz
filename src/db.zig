@@ -116,19 +116,18 @@ pub const Instance = struct {
         var temp_allocator = std.heap.ArenaAllocator.init(self.allocator.allocator());
         defer temp_allocator.deinit();
         var stream = try std.net.tcpConnectToHost(temp_allocator.allocator(),address,port);
-        const ping = try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PING"});
-        _ = try stream.write(ping);
+        _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PING"}));
         const buffer = try temp_allocator.allocator().alloc(u8, 128);
         var n = try stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+PONG\r\n"));
-        const replconf1 = try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"REPLCONF", "listening-port", self.config.get("listening-port").? });
-        _ = try stream.write(replconf1);
+        _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"REPLCONF", "listening-port", self.config.get("listening-port").? }));
         n = try stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
-        const replconf2 = try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"REPLCONF", "capa", "psync2" });
-        _ = try stream.write(replconf2);
+        _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"REPLCONF", "capa", "psync2" }));
         n = try stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
+        _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PSYNC", "?", "-1" }));
+        _ = try stream.read(buffer);
         std.debug.print("Handshake with {s}:{d} was succesful!\n",.{address,port});
     }
 
