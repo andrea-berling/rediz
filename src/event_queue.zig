@@ -29,6 +29,8 @@ pub const EVENT_TYPE = enum {
     CONNECTION,
     RECEIVE_COMMAND,
     SENT_RESPONSE,
+    SENT_DUMP,
+    PROPAGATE_COMMAND,
     FULL_SYNC,
     SIGTERM
 };
@@ -63,7 +65,7 @@ pub const EventQueue = struct {
     sqring : SQRing,
     cqring : CQRing,
     // TODO: is there a ZST I can put in here?
-    pending_events: std.AutoHashMap(*const Event, bool),
+    pending_events: std.AutoHashMap(*const Event, void),
 
     const Self = @This();
 
@@ -109,7 +111,7 @@ pub const EventQueue = struct {
             .params = params,
             .sqring = sqring,
             .cqring = cqring,
-            .pending_events = std.AutoHashMap(*const Event, bool).init(allocator)
+            .pending_events = std.AutoHashMap(*const Event, void).init(allocator)
         };
     }
 
@@ -124,7 +126,7 @@ pub const EventQueue = struct {
             .RECEIVE_COMMAND => {
                 sqe.prep_recv(event.fd, event.buffer.?, 0);
             },
-            .SENT_RESPONSE,.FULL_SYNC => {
+            .SENT_RESPONSE,.FULL_SYNC,.SENT_DUMP,.PROPAGATE_COMMAND => {
                 sqe.prep_send(event.fd, event.buffer.?, 0);
             },
             .SIGTERM => {
@@ -134,7 +136,7 @@ pub const EventQueue = struct {
         sqe.user_data = @intFromPtr(event);
         self.sqring.array[index] = @intCast(index);
         if (allocated_at_runtime) {
-            try self.pending_events.put(event, true);
+            try self.pending_events.put(event, {});
         }
         @atomicStore(c_uint, self.sqring.tail, tail + 1, std.builtin.AtomicOrder.release);
         _ = try ioUringEnter(self.io_uring_fd, 1, 0, 0, null);

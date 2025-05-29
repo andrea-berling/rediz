@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const resp = @import("resp.zig");
 const rdb = @import("rdb.zig");
 
@@ -18,7 +19,7 @@ pub const Datum = struct {
 };
 
 pub const Instance = struct {
-    allocator: *std.heap.ArenaAllocator,
+    arena_allocator: *std.heap.ArenaAllocator,
     data: std.StringHashMap(Datum),
     config: std.StringHashMap([]u8),
     master: ?std.net.Address = null,
@@ -26,16 +27,16 @@ pub const Instance = struct {
     repl_offset: usize,
 
     inline fn dupe(self: *Instance, bytes: []const u8) ![]u8 {
-        return try self.allocator.allocator().dupe(u8,bytes);
+        return try self.arena_allocator.allocator().dupe(u8,bytes);
     }
 
     pub fn init(allocator: std.mem.Allocator, config: ?[]struct{[]const u8,[]const u8}) !Instance {
 
         var instance: Instance = undefined;
-        instance.allocator = try allocator.create(std.heap.ArenaAllocator);
-        instance.allocator.* = std.heap.ArenaAllocator.init(allocator);
-        instance.data = std.StringHashMap(Datum).init(instance.allocator.allocator());
-        instance.config = std.StringHashMap([]u8).init(instance.allocator.allocator());
+        instance.arena_allocator = try allocator.create(std.heap.ArenaAllocator);
+        instance.arena_allocator.* = std.heap.ArenaAllocator.init(allocator);
+        instance.data = std.StringHashMap(Datum).init(instance.arena_allocator.allocator());
+        instance.config = std.StringHashMap([]u8).init(instance.arena_allocator.allocator());
         instance.master = null;
         instance.repl_offset = 0;
 
@@ -69,8 +70,8 @@ pub const Instance = struct {
         if (instance.config.get("dbfilename")) |dbfilename| {
             std.debug.print("Initializing from RDB file {s}...\n", .{dbfilename});
             if (rdb_directory.openFile(dbfilename, .{})) |file| {
-                const db = try file.readToEndAlloc(instance.allocator.allocator(), RDB_FILE_SIZE_LIMIT);
-                var temp_allocator = std.heap.ArenaAllocator.init(instance.allocator.allocator());
+                const db = try file.readToEndAlloc(instance.arena_allocator.allocator(), RDB_FILE_SIZE_LIMIT);
+                var temp_allocator = std.heap.ArenaAllocator.init(instance.arena_allocator.allocator());
                 defer temp_allocator.deinit();
                 const data, _ = try rdb.parseData(db, temp_allocator.allocator());
                 for (data) |pair| {
@@ -113,7 +114,7 @@ pub const Instance = struct {
     }
 
     fn handshake(self: *Instance, address: []const u8, port: u16) !void {
-        var temp_allocator = std.heap.ArenaAllocator.init(self.allocator.allocator());
+        var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
         defer temp_allocator.deinit();
         var stream = try std.net.tcpConnectToHost(temp_allocator.allocator(),address,port);
         _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PING"}));
@@ -132,16 +133,16 @@ pub const Instance = struct {
     }
 
     pub fn destroy(self: *Instance, allocator: std.mem.Allocator) void {
-        self.allocator.deinit();
-        allocator.destroy(self.allocator);
+        self.arena_allocator.deinit();
+        allocator.destroy(self.arena_allocator);
     }
 
-    pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: [][]u8) ![]u8 {
+    pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: [][]u8) !struct { []u8, bool } {
         if (std.ascii.eqlIgnoreCase(command[0], "PING")) {
-            return try resp.encodeSimpleString(allocator, "PONG"[0..]);
+            return .{ try resp.encodeSimpleString(allocator, "PONG"[0..]), false };
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "ECHO")) {
-            return try resp.encodeSimpleString(allocator, command[1]);
+            return .{ try resp.encodeSimpleString(allocator, command[1]), false };
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "SET")) {
             try self.data.put(try self.dupe(command[1]), .{
@@ -160,20 +161,20 @@ pub const Instance = struct {
                     .string = try self.dupe(command[2])
                 }
             });
-            return try resp.encodeSimpleString(allocator, "OK"[0..]);
+            return .{ try resp.encodeSimpleString(allocator, "OK"[0..]), true };
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "GET")) {
             if ( self.data.get(command[1]) ) |data| {
                 if ( data.expire_at_ms ) |expire_at_ms| {
                     if (expire_at_ms <= std.time.milliTimestamp()) {
                         _ = self.data.remove(command[1]);
-                        return try resp.encodeBulkString(allocator, null);
+                        return .{ try resp.encodeBulkString(allocator, null), false };
                     }
                 }
-                return  try resp.encodeBulkString(allocator, data.value.string);
+                return  .{ try resp.encodeBulkString(allocator, data.value.string), false };
             }
             else
-                return try resp.encodeBulkString(allocator, null);
+                return .{ try resp.encodeBulkString(allocator, null), false };
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "KEYS")) {
             // TODO: support patterns
@@ -185,22 +186,22 @@ pub const Instance = struct {
                 while (keys_iterator.next()) |key|: (i += 1) {
                     keys[i] = key.*;
                 }
-                return try resp.encodeArray(allocator, keys);
+                return .{ try resp.encodeArray(allocator, keys), false };
             }
             else
-                return try resp.encodeBulkString(allocator, null);
+                return .{ try resp.encodeBulkString(allocator, null), false };
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "CONFIG")) {
             if (std.ascii.eqlIgnoreCase(command[1], "GET")) {
                 if ( self.config.get(command[2]) ) |data| {
-                    return try resp.encodeArray(allocator, &[_][]u8{ command[2], data });
+                    return .{ try resp.encodeArray(allocator, &[_][]u8{ command[2], data }), false };
                 }
                 else
-                    return try resp.encodeBulkString(allocator, null);
+                    return .{ try resp.encodeBulkString(allocator, null), false };
             }
             else if (std.ascii.eqlIgnoreCase(command[1], "SET")) {
                 try self.config.put(command[2], command[3]);
-                return try resp.encodeSimpleString(allocator, "OK"[0..]);
+                return .{ try resp.encodeSimpleString(allocator, "OK"[0..]), false };
             }
             else
                 return error.InvalidConfigCommand;
@@ -211,18 +212,18 @@ pub const Instance = struct {
                 try response.appendSlice(if (self.master) |_| "role:slave\n" else "role:master\n");
                 try std.fmt.format(response.writer(),"master_replid:{s}\n",.{self.replid});
                 try std.fmt.format(response.writer(),"master_repl_offset:{d}\n",.{self.repl_offset});
-                return try resp.encodeBulkString(allocator, try response.toOwnedSlice());
+                return .{ try resp.encodeBulkString(allocator, try response.toOwnedSlice()), false };
             }
             else
                 return error.InvalidInfoCommand;
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "REPLCONF")) {
-            return try resp.encodeSimpleString(allocator, "OK"[0..]);
+            return .{ try resp.encodeSimpleString(allocator, "OK"[0..]), false };
         }
         else if (std.ascii.eqlIgnoreCase(command[0], "PSYNC")) {
             var response = std.ArrayList(u8).init(allocator);
             try std.fmt.format(response.writer(),"FULLRESYNC {s} {d}", .{self.replid, self.repl_offset});
-            return try resp.encodeSimpleString(allocator, try response.toOwnedSlice());
+            return .{ try resp.encodeSimpleString(allocator, try response.toOwnedSlice()), false };
         }
         else {
             std.debug.print("Unsupported command received: {s}\n",.{command[0]});

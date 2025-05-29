@@ -137,6 +137,9 @@ pub fn main() !void {
 
     config.deinit();
 
+    var slaves = std.AutoHashMap(posix.socket_t, void).init(allocator);
+    defer slaves.deinit();
+
     while (true) {
         try stdout.print("Waiting for something to come through...\n", .{});
         const event = try event_queue.next();
@@ -145,32 +148,36 @@ pub fn main() !void {
             .CONNECTION => {
                 const connection_socket = event.async_result.?;
                 try stdout.print("accepted new connection\n", .{});
-                const buffer = try allocator.alloc(u8, CLIENT_BUFFER_SIZE);
-                try addReceiveCommandEvent(connection_socket, buffer, &event_queue, allocator);
+                try addReceiveCommandEvent(connection_socket, try allocator.alloc(u8, CLIENT_BUFFER_SIZE), &event_queue, allocator);
                 try event_queue.addAsyncEvent(&connection_event, false);
             },
             .RECEIVE_COMMAND => {
                 const buffer = event.buffer.?;
                 if (event.async_result.? == 0) { // Connection closed
+                    _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
                     destroyEvent(event, allocator);
                     continue;
                 }
                 if (event.async_result.? < 0) {
                     std.debug.print("Error: {} {d}\n", .{linux.E.init(@intCast(@as(u32,@bitCast(event.async_result.?)))), event.async_result.?});
+                    _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
                     destroyEvent(event, allocator);
                     continue;
                 }
                 const request, _ = resp.parseArray(allocator, buffer) catch |err| {
                     std.debug.print("Error: {}\n", .{err});
                     std.debug.print("Got: {any} (return value: {d})\n",.{ buffer, event.async_result.? });
+                    _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
                     // TODO: be more gracious if the client sends invalid commands
                     destroyEvent(event, allocator);
                     continue;
                 };
                 defer resp.destroyArray(allocator, request);
+                var request_copy = [_]u8{0}**CLIENT_BUFFER_SIZE;
+                @memcpy(&request_copy, event.buffer.?);
                 var temp_allocator = std.heap.ArenaAllocator.init(allocator);
                 defer temp_allocator.deinit();
-                const reply = instance.executeCommand(temp_allocator.allocator(),request) catch {
+                const reply, const propagate = instance.executeCommand(temp_allocator.allocator(),request) catch {
                     // TODO: what if the command fails? Should I close the connection and kill the event? Notify the client?
                     continue;
                 };
@@ -181,6 +188,18 @@ pub fn main() !void {
                 event.buffer = event.buffer.?[0..reply.len]; // shrinking the buffer
                 @memcpy(event.buffer.?, reply);
                 try event_queue.addAsyncEvent(event, true);
+
+                if (propagate) {
+                    var slaves_it = slaves.keyIterator();
+                    while (slaves_it.next()) |slave| {
+                        var propagation_event = try allocator.create(eq.Event);
+                        propagation_event.ty = eq.EVENT_TYPE.PROPAGATE_COMMAND;
+                        propagation_event.fd = slave.*;
+                        propagation_event.buffer = try allocator.alloc(u8, @intCast(event.async_result.?));
+                        @memcpy(propagation_event.buffer.?, request_copy[0..propagation_event.buffer.?.len]);
+                        try event_queue.addAsyncEvent(propagation_event, true);
+                    }
+                }
             },
             .FULL_SYNC => {
                 // TODO: not stricly correct, whatever
@@ -191,14 +210,21 @@ pub fn main() !void {
                 event.buffer = (@as([*]u8,@ptrCast(event.buffer.?.ptr)))[0..CLIENT_BUFFER_SIZE]; // resizing the buffer
                 @memcpy(event.buffer.?[preamble.len..][0..dump_size],tmp_buf[0..dump_size]);
                 event.buffer = (@as([*]u8,@ptrCast(event.buffer.?.ptr)))[0..preamble.len+dump_size]; // resizing the buffer
-                event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+                event.ty = eq.EVENT_TYPE.SENT_DUMP;
                 try event_queue.addAsyncEvent(event, true);
             },
-            .SENT_RESPONSE => {
+            .SENT_RESPONSE, .SENT_DUMP => {
+                if (event.ty == .SENT_DUMP) {
+                    try slaves.put(event.fd, {});
+                }
                 event.buffer = (@as([*]u8,@ptrCast(event.buffer.?.ptr)))[0..CLIENT_BUFFER_SIZE]; // resizing the buffer
                 event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
                 @memset(event.buffer.?, 0);
                 try event_queue.addAsyncEvent(event, true);
+            },
+            .PROPAGATE_COMMAND => {
+                allocator.free(event.buffer.?);
+                allocator.destroy(event);
             },
             .SIGTERM => {
                 std.debug.print("Gracefully shutting down...\n",.{});
