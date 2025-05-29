@@ -216,6 +216,9 @@ pub const Instance = struct {
             else
                 return error.InvalidInfoCommand;
         }
+        else if (std.ascii.eqlIgnoreCase(command[0], "REPLCONF")) {
+            return try resp.encodeSimpleString(allocator, "OK"[0..]);
+        }
         else {
             std.debug.print("Unsupported command received: {s}\n",.{command[0]});
             return error.UnsupportedCommand;
