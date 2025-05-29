@@ -29,6 +29,7 @@ pub const EVENT_TYPE = enum {
     CONNECTION,
     RECEIVE_COMMAND,
     SENT_RESPONSE,
+    FULL_SYNC,
     SIGTERM
 };
 
@@ -123,7 +124,7 @@ pub const EventQueue = struct {
             .RECEIVE_COMMAND => {
                 sqe.prep_recv(event.fd, event.buffer.?, 0);
             },
-            .SENT_RESPONSE => {
+            .SENT_RESPONSE,.FULL_SYNC => {
                 sqe.prep_send(event.fd, event.buffer.?, 0);
             },
             .SIGTERM => {

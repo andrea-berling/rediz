@@ -174,8 +174,23 @@ pub fn main() !void {
                     // TODO: what if the command fails? Should I close the connection and kill the event? Notify the client?
                     continue;
                 };
+                event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+                if (std.mem.indexOf(u8, reply, "FULLRESYNC") != null) {
+                    event.ty = eq.EVENT_TYPE.FULL_SYNC;
+                }
                 event.buffer = event.buffer.?[0..reply.len]; // shrinking the buffer
                 @memcpy(event.buffer.?, reply);
+                try event_queue.addAsyncEvent(event, true);
+            },
+            .FULL_SYNC => {
+                // TODO: not stricly correct, whatever
+                const tmp_buf = try allocator.alloc(u8, CLIENT_BUFFER_SIZE);
+                defer allocator.free(tmp_buf);
+                const dump_size = try instance.dumpToBuffer(tmp_buf);
+                const preamble = try std.fmt.bufPrint(event.buffer.?, "${d}\r\n", .{dump_size});
+                event.buffer = (@as([*]u8,@ptrCast(event.buffer.?.ptr)))[0..CLIENT_BUFFER_SIZE]; // resizing the buffer
+                @memcpy(event.buffer.?[preamble.len..][0..dump_size],tmp_buf[0..dump_size]);
+                event.buffer = (@as([*]u8,@ptrCast(event.buffer.?.ptr)))[0..preamble.len+dump_size]; // resizing the buffer
                 event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
                 try event_queue.addAsyncEvent(event, true);
             },
