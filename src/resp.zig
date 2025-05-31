@@ -13,7 +13,24 @@ pub fn parseDecimal(bytes: []u8) !struct { u64, usize } {
     return .{ return_value, i };
 }
 
-pub fn parseBulkString(allocator: std.mem.Allocator, bytes: []u8) !struct { []u8, usize } {
+pub fn parseSimpleString(allocator: std.mem.Allocator, bytes: []u8) !struct { []u8, usize } {
+    if (bytes[0] != '+') return error.InvalidRESPSimpleString;
+    var i: usize = 1;
+
+    var return_value = std.ArrayList(u8).init(allocator);
+
+    while (bytes[i] != '\r') : (i += 1) {
+        try return_value.append(bytes[i]);
+    }
+
+    if (!std.mem.eql(u8, bytes[i .. i + 2], "\r\n")) return error.InvalidRESPSimpleString;
+
+    i += 2;
+
+    return .{ try return_value.toOwnedSlice(), i };
+}
+
+pub fn parseBulkString(allocator: std.mem.Allocator, bytes: []u8, cr_nl_terminated: bool) !struct { []u8, usize } {
     if (bytes[0] != '$') return error.InvalidRESPBulkString;
     var i: usize = 1;
     const string_length, const bytes_parsed = try parseDecimal(bytes[i..]);
@@ -24,8 +41,10 @@ pub fn parseBulkString(allocator: std.mem.Allocator, bytes: []u8) !struct { []u8
     const return_value = try allocator.alloc(u8, string_length);
     std.mem.copyBackwards(u8, return_value, bytes[i .. i + string_length]);
     i += string_length;
-    if (!std.mem.eql(u8, bytes[i .. i + 2], "\r\n")) return error.InvalidRESPBulkString;
-    i += 2;
+    if (cr_nl_terminated) {
+        if (!std.mem.eql(u8, bytes[i .. i + 2], "\r\n")) return error.InvalidRESPBulkString;
+        i += 2;
+    }
     return .{ return_value, i };
 }
 
@@ -39,7 +58,7 @@ pub fn parseArray(allocator: std.mem.Allocator, bytes: []u8) !struct { [][]u8, u
     var elements = try allocator.alloc([]u8, n_elem);
 
     for (0..n_elem) |n| {
-        const element, const parsed_bytes = try parseBulkString(allocator, bytes[i..]);
+        const element, const parsed_bytes = try parseBulkString(allocator, bytes[i..], true);
         elements[n] = element;
         i += parsed_bytes;
     }

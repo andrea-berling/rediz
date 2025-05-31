@@ -188,11 +188,6 @@ pub fn main() !void {
                     };
                     try requests.append(request);
                     n += bytes_parsed;
-                    std.debug.print("Request: {s}\n", .{request});
-                    std.debug.print("Parsed this many bytes so far: {d}\n", .{n});
-                    if (n > 100) {
-                        @panic("Howah");
-                    }
                 }
 
                 var replies = std.ArrayList(u8).init(temp_allocator.allocator());
@@ -234,6 +229,7 @@ pub fn main() !void {
                         propagation_event.ty = eq.EVENT_TYPE.PROPAGATE_COMMAND;
                         propagation_event.fd = slave.*;
                         propagation_event.buffer = try allocator.alloc(u8, @intCast(event.async_result.?));
+                        propagation_event.canary = null;
                         @memcpy(propagation_event.buffer.?, request_copy[0..propagation_event.buffer.?.len]);
                         try event_queue.addAsyncEvent(propagation_event, true);
                     }

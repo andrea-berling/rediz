@@ -67,9 +67,9 @@ pub const Instance = struct {
         if (instance.config.get("dbfilename")) |dbfilename| {
             std.debug.print("Initializing from RDB file {s}...\n", .{dbfilename});
             if (rdb_directory.openFile(dbfilename, .{})) |file| {
-                const db = try file.readToEndAlloc(instance.arena_allocator.allocator(), RDB_FILE_SIZE_LIMIT);
                 var temp_allocator = std.heap.ArenaAllocator.init(instance.arena_allocator.allocator());
                 defer temp_allocator.deinit();
+                const db = try file.readToEndAlloc(temp_allocator.allocator(), RDB_FILE_SIZE_LIMIT);
                 const data, _ = try rdb.parseData(db, temp_allocator.allocator());
                 for (data) |pair| {
                     if (pair.value.expire_at_ms) |expire_at_ms| {
@@ -122,8 +122,37 @@ pub const Instance = struct {
         n = try stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
         _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{ "PSYNC", "?", "-1" }));
-        n = try stream.read(buffer);
-        _ = try stream.read(buffer[n..]);
+
+        var timeout = posix.timeval{
+            .sec = 0,
+            .usec = 100 * 1000,
+        };
+        try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, (@as([*]u8, @ptrCast(&timeout)))[0..@sizeOf(posix.timeval)]);
+
+        n = 0;
+        while (stream.read(buffer[n..])) |read_bytes| : (n += read_bytes) {
+            if (read_bytes == 0) {
+                break;
+            }
+        } else |err| {
+            if (err != error.WouldBlock) {
+                return err;
+            }
+        }
+
+        timeout.usec = 0;
+
+        try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, (@as([*]u8, @ptrCast(&timeout)))[0..@sizeOf(posix.timeval)]);
+
+        _, const fullsync_parsed_bytes = try resp.parseSimpleString(temp_allocator.allocator(), buffer); // FULLSYNC
+        _, const db_parsed_bytes = try resp.parseBulkString(temp_allocator.allocator(), buffer[fullsync_parsed_bytes..], false);
+        var parsed_bytes = fullsync_parsed_bytes + db_parsed_bytes;
+        while (n > parsed_bytes) {
+            const request, const command_bytes = try resp.parseArray(temp_allocator.allocator(), buffer[parsed_bytes..]);
+            _ = try self.executeCommand(temp_allocator.allocator(), request);
+            parsed_bytes += command_bytes;
+        }
+
         std.debug.print("Handshake and sync with {s}:{d} was succesful!\n", .{ address, port });
         return stream.handle;
     }
