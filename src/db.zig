@@ -149,7 +149,12 @@ pub const Instance = struct {
         var parsed_bytes = fullsync_parsed_bytes + db_parsed_bytes;
         while (n > parsed_bytes) {
             const request, const command_bytes = try resp.parseArray(temp_allocator.allocator(), buffer[parsed_bytes..]);
-            _ = try self.executeCommand(temp_allocator.allocator(), request);
+            const reply, _ = try self.executeCommand(temp_allocator.allocator(), request);
+            if (std.ascii.eqlIgnoreCase(request[0], "REPLCONF") and
+                std.ascii.eqlIgnoreCase(request[1], "GETACK"))
+            {
+                _ = try stream.write(reply);
+            }
             parsed_bytes += command_bytes;
         }
 
@@ -162,7 +167,7 @@ pub const Instance = struct {
         allocator.destroy(self.arena_allocator);
     }
 
-    pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: [][]u8) !struct { []u8, bool } {
+    pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: []const []const u8) !struct { []u8, bool } {
         if (std.ascii.eqlIgnoreCase(command[0], "PING")) {
             return .{ try resp.encodeSimpleString(allocator, "PONG"[0..]), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "ECHO")) {
@@ -205,10 +210,10 @@ pub const Instance = struct {
         } else if (std.ascii.eqlIgnoreCase(command[0], "CONFIG")) {
             if (std.ascii.eqlIgnoreCase(command[1], "GET")) {
                 if (self.config.get(command[2])) |data| {
-                    return .{ try resp.encodeArray(allocator, &[_][]u8{ command[2], data }), false };
+                    return .{ try resp.encodeArray(allocator, &[_][]const u8{ command[2], data }), false };
                 } else return .{ try resp.encodeBulkString(allocator, null), false };
             } else if (std.ascii.eqlIgnoreCase(command[1], "SET")) {
-                try self.config.put(command[2], command[3]);
+                try self.config.put(try self.dupe(command[2]), try self.dupe(command[3]));
                 return .{ try resp.encodeSimpleString(allocator, "OK"[0..]), false };
             } else return error.InvalidConfigCommand;
         } else if (std.ascii.eqlIgnoreCase(command[0], "INFO")) {
@@ -220,7 +225,9 @@ pub const Instance = struct {
                 return .{ try resp.encodeBulkString(allocator, try response.toOwnedSlice()), false };
             } else return error.InvalidInfoCommand;
         } else if (std.ascii.eqlIgnoreCase(command[0], "REPLCONF")) {
-            return .{ try resp.encodeSimpleString(allocator, "OK"[0..]), false };
+            if (std.ascii.eqlIgnoreCase(command[1], "GETACK")) {
+                return .{ try resp.encodeArray(allocator, &[_][]const u8{ "REPLCONF", "ACK", try std.fmt.allocPrint(allocator, "{d}", .{self.repl_offset}) }), false };
+            } else return .{ try resp.encodeSimpleString(allocator, "OK"[0..]), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "PSYNC")) {
             var response = std.ArrayList(u8).init(allocator);
             try std.fmt.format(response.writer(), "FULLRESYNC {s} {d}", .{ self.replid, self.repl_offset });

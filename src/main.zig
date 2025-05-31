@@ -15,6 +15,10 @@ const CLIENT_BUFFER_SIZE = 1024;
 const IO_URING_ENTRIES = 100;
 const MASTER_CANARY = 0x1;
 
+inline fn resizeBuffer(buffer: []u8, new_size: usize) []u8 {
+    return (@as([*]u8, @ptrCast(buffer.ptr)))[0..new_size];
+}
+
 inline fn addReceiveCommandEvent(fd: linux.socket_t, buffer: []u8, event_queue: *eq.EventQueue, canary: ?u64, allocator: Allocator) !void {
     var receive_command_event = try allocator.create(eq.Event);
     @memset(buffer, 0);
@@ -140,7 +144,7 @@ pub fn main() !void {
     var slaves = std.AutoHashMap(posix.socket_t, void).init(allocator);
     defer slaves.deinit();
 
-    while (true) {
+    event_loop: while (true) {
         try stdout.print("Waiting for something to come through...\n", .{});
         const event = try event_queue.next();
         try stdout.print("Event fd/type/ptr: {} {} {*}\n", .{ event.fd, event.ty, event });
@@ -153,97 +157,103 @@ pub fn main() !void {
             },
             .RECEIVE_COMMAND => {
                 const buffer = event.buffer.?;
-                if (event.async_result.? == 0) { // Connection closed
+                const return_value = event.async_result.?;
+
+                if (return_value == 0) { // Connection closed
                     _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
                     destroyEvent(event, allocator);
                     continue;
                 }
 
-                var request_copy = [_]u8{0} ** CLIENT_BUFFER_SIZE;
-                if (instance.master == null) {
-                    @memcpy(&request_copy, event.buffer.?); // for propagation
-                }
-
-                if (event.async_result.? < 0) {
-                    std.debug.print("Error: {} {d}\n", .{ linux.E.init(@intCast(@as(u32, @bitCast(event.async_result.?)))), event.async_result.? });
+                if (return_value < 0) {
+                    std.debug.print("Error: {} {d}\n", .{ linux.E.init(@intCast(@as(u32, @bitCast(return_value)))), return_value });
                     _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
                     destroyEvent(event, allocator);
                     continue;
                 }
+
+                const recv_return_value = @as(usize, @intCast(@as(u32, @bitCast(return_value))));
 
                 var temp_allocator = std.heap.ArenaAllocator.init(allocator);
                 defer temp_allocator.deinit();
 
-                var requests = std.ArrayList([][]u8).init(temp_allocator.allocator());
+                var replies = std.ArrayList(u8).init(temp_allocator.allocator());
 
                 var n: usize = 0;
-                while (event.async_result.? - @as(i32, @intCast(n)) != 0) {
+                while (recv_return_value - n != 0) {
                     const request, const bytes_parsed = resp.parseArray(temp_allocator.allocator(), buffer[n..]) catch |err| {
                         std.debug.print("Error: {}\n", .{err});
-                        std.debug.print("Got: {x} (return value: {d})\n", .{ buffer, event.async_result.? });
+                        std.debug.print("Got: {x} (return value: {d})\n", .{ buffer, recv_return_value });
                         _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
                         // TODO: be more gracious if the client sends invalid commands
                         destroyEvent(event, allocator);
                         continue;
                     };
-                    try requests.append(request);
-                    n += bytes_parsed;
-                }
-
-                var replies = std.ArrayList(u8).init(temp_allocator.allocator());
-
-                var propagate = false;
-
-                event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-
-                for (try requests.toOwnedSlice()) |request| {
-                    const reply, const should_propagate = instance.executeCommand(temp_allocator.allocator(), request) catch {
+                    if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
+                        instance.repl_offset += bytes_parsed;
+                    }
+                    if (std.ascii.eqlIgnoreCase(request[0], "PSYNC")) {
+                        const reply, _ = try instance.executeCommand(temp_allocator.allocator(), request);
+                        event.ty = .FULL_SYNC;
+                        event.buffer = resizeBuffer(event.buffer.?, reply.len);
+                        @memcpy(event.buffer.?, reply);
+                        try event_queue.addAsyncEvent(event, true);
+                        continue :event_loop;
+                    }
+                    const reply, const propagate = instance.executeCommand(temp_allocator.allocator(), request) catch {
                         // TODO: what if the command fails? Should I close the connection and kill the event? Notify the client?
                         continue;
                     };
-                    try replies.appendSlice(reply);
-                    propagate = propagate or should_propagate;
-                    if (std.mem.indexOf(u8, reply, "FULLRESYNC") != null) {
-                        event.ty = eq.EVENT_TYPE.FULL_SYNC;
-                    }
-                }
 
-                if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
-                    event.buffer = (@as([*]u8, @ptrCast(event.buffer.?.ptr)))[0..CLIENT_BUFFER_SIZE]; // resizing the buffer
-                    event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
-                    @memset(event.buffer.?, 0);
-                    try event_queue.addAsyncEvent(event, true);
-                    continue;
+                    if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
+                        if (std.ascii.eqlIgnoreCase(request[0], "REPLCONF") and
+                            std.ascii.eqlIgnoreCase(request[1], "GETACK"))
+                        {
+                            try replies.appendSlice(reply);
+                        }
+                    } else {
+                        try replies.appendSlice(reply);
+                    }
+
+                    if (propagate) {
+                        var slaves_it = slaves.keyIterator();
+                        while (slaves_it.next()) |slave| {
+                            var propagation_event = try allocator.create(eq.Event);
+                            propagation_event.ty = eq.EVENT_TYPE.PROPAGATE_COMMAND;
+                            propagation_event.fd = slave.*;
+                            propagation_event.buffer = try allocator.alloc(u8, n + bytes_parsed);
+                            propagation_event.canary = null;
+                            @memcpy(propagation_event.buffer.?, buffer[n..][0..bytes_parsed]);
+                            try event_queue.addAsyncEvent(propagation_event, true);
+                        }
+                    }
+                    n += bytes_parsed;
                 }
 
                 const reply = try replies.toOwnedSlice();
 
-                event.buffer = event.buffer.?[0..reply.len]; // shrinking the buffer
-                @memcpy(event.buffer.?, reply);
-                try event_queue.addAsyncEvent(event, true);
-
-                if (propagate) {
-                    var slaves_it = slaves.keyIterator();
-                    while (slaves_it.next()) |slave| {
-                        var propagation_event = try allocator.create(eq.Event);
-                        propagation_event.ty = eq.EVENT_TYPE.PROPAGATE_COMMAND;
-                        propagation_event.fd = slave.*;
-                        propagation_event.buffer = try allocator.alloc(u8, @intCast(event.async_result.?));
-                        propagation_event.canary = null;
-                        @memcpy(propagation_event.buffer.?, request_copy[0..propagation_event.buffer.?.len]);
-                        try event_queue.addAsyncEvent(propagation_event, true);
-                    }
+                if (reply.len > 0) {
+                    event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+                    event.buffer = resizeBuffer(event.buffer.?, reply.len);
+                    @memcpy(event.buffer.?, reply);
+                    try event_queue.addAsyncEvent(event, true);
+                } else {
+                    event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
+                    event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
+                    @memset(event.buffer.?, 0);
+                    try event_queue.addAsyncEvent(event, true);
                 }
             },
             .FULL_SYNC => {
+                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+                defer temp_allocator.deinit();
                 // TODO: not stricly correct, whatever
-                const tmp_buf = try allocator.alloc(u8, CLIENT_BUFFER_SIZE);
-                defer allocator.free(tmp_buf);
+                const tmp_buf = try temp_allocator.allocator().alloc(u8, CLIENT_BUFFER_SIZE);
                 const dump_size = try instance.dumpToBuffer(tmp_buf);
                 const preamble = try std.fmt.bufPrint(event.buffer.?, "${d}\r\n", .{dump_size});
-                event.buffer = (@as([*]u8, @ptrCast(event.buffer.?.ptr)))[0..CLIENT_BUFFER_SIZE]; // resizing the buffer
+                event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
                 @memcpy(event.buffer.?[preamble.len..][0..dump_size], tmp_buf[0..dump_size]);
-                event.buffer = (@as([*]u8, @ptrCast(event.buffer.?.ptr)))[0 .. preamble.len + dump_size]; // resizing the buffer
+                event.buffer = resizeBuffer(event.buffer.?, preamble.len + dump_size);
                 event.ty = eq.EVENT_TYPE.SENT_DUMP;
                 try event_queue.addAsyncEvent(event, true);
             },
@@ -251,7 +261,7 @@ pub fn main() !void {
                 if (event.ty == .SENT_DUMP) {
                     try slaves.put(event.fd, {});
                 }
-                event.buffer = (@as([*]u8, @ptrCast(event.buffer.?.ptr)))[0..CLIENT_BUFFER_SIZE]; // resizing the buffer
+                event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
                 event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
                 @memset(event.buffer.?, 0);
                 try event_queue.addAsyncEvent(event, true);
