@@ -53,21 +53,20 @@ pub fn destroyArray(allocator: std.mem.Allocator, array: [][]u8) void {
     allocator.free(array);
 }
 
-pub fn encodeBulkString(allocator: std.mem.Allocator,maybe_s: ?[]const u8) ![]u8 {
+pub fn encodeBulkString(allocator: std.mem.Allocator, maybe_s: ?[]const u8) ![]u8 {
     var response = std.ArrayList(u8).init(allocator);
     if (maybe_s) |s| {
         try std.fmt.format(response.writer(), "${d}\r\n", .{s.len});
         _ = try response.writer().write(s);
         _ = try response.writer().write("\r\n");
         return response.toOwnedSlice();
-    }
-    else {
-        _ = try response.writer().write( "$-1\r\n");
+    } else {
+        _ = try response.writer().write("$-1\r\n");
         return response.toOwnedSlice();
     }
 }
 
-pub fn encodeSimpleString(allocator: std.mem.Allocator ,s: []const u8) ![]u8 {
+pub fn encodeSimpleString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var response = std.ArrayList(u8).init(allocator);
     try std.fmt.format(response.writer(), "+{s}\r\n", .{s});
     return response.toOwnedSlice();

@@ -4,13 +4,13 @@ const posix = std.posix;
 
 fn handleError(errno: i64) !void {
     var error_string = std.ArrayList(u8).init(std.heap.page_allocator);
-    try std.fmt.format(error_string.writer(), "Errno: {d}. Error: {any}", .{errno, linux.E.init(@bitCast(errno))});
+    try std.fmt.format(error_string.writer(), "Errno: {d}. Error: {any}", .{ errno, linux.E.init(@bitCast(errno)) });
     @panic(try error_string.toOwnedSlice());
 }
 
 fn ioUringSetup(entries: u32, p: *linux.io_uring_params) !linux.fd_t {
-    const fd: i64 = @bitCast(linux.io_uring_setup(entries,p));
-    if ( fd < 0 ) {
+    const fd: i64 = @bitCast(linux.io_uring_setup(entries, p));
+    if (fd < 0) {
         try handleError(fd);
     }
     return @truncate(fd);
@@ -25,15 +25,7 @@ fn ioUringEnter(fd: i32, to_submit: u32, min_complete: u32, flags: u32, sig: ?*l
     return @bitCast(consumed_io_ops);
 }
 
-pub const EVENT_TYPE = enum {
-    CONNECTION,
-    RECEIVE_COMMAND,
-    SENT_RESPONSE,
-    SENT_DUMP,
-    PROPAGATE_COMMAND,
-    FULL_SYNC,
-    SIGTERM
-};
+pub const EVENT_TYPE = enum { CONNECTION, RECEIVE_COMMAND, SENT_RESPONSE, SENT_DUMP, PROPAGATE_COMMAND, FULL_SYNC, SIGTERM };
 
 pub const Event = struct {
     ty: EVENT_TYPE = EVENT_TYPE.CONNECTION,
@@ -61,59 +53,44 @@ const CQRing = struct {
 
 pub const EventQueue = struct {
     allocator: std.mem.Allocator,
-    io_uring_fd : linux.fd_t,
+    io_uring_fd: linux.fd_t,
     params: *linux.io_uring_params,
-    sqring : SQRing,
-    cqring : CQRing,
+    sqring: SQRing,
+    cqring: CQRing,
     // TODO: is there a ZST I can put in here?
     pending_events: std.AutoHashMap(*const Event, void),
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, entries: u32) !EventQueue {
-
         var params = try allocator.create(linux.io_uring_params);
         params.flags = linux.IORING_SETUP_SINGLE_ISSUER;
         @memset(&params.resv, 0);
-        const io_uring_fd = try ioUringSetup(entries,params);
+        const io_uring_fd = try ioUringSetup(entries, params);
 
+        const sqring_ptr = try posix.mmap(null, params.sq_off.array + params.sq_entries * @sizeOf(u32), linux.PROT.READ | linux.PROT.WRITE, .{ .TYPE = linux.MAP_TYPE.SHARED, .POPULATE = true }, io_uring_fd, linux.IORING_OFF_SQ_RING);
 
-        const sqring_ptr = try posix.mmap(null, params.sq_off.array + params.sq_entries * @sizeOf(u32),
-                           linux.PROT.READ|linux.PROT.WRITE, .{ .TYPE = linux.MAP_TYPE.SHARED, .POPULATE = true},
-                           io_uring_fd, linux.IORING_OFF_SQ_RING);
-
-        const sqes = try posix.mmap(null, params.sq_entries * @sizeOf(linux.io_uring_sqe),
-                            linux.PROT.READ|linux.PROT.WRITE, .{ .TYPE = linux.MAP_TYPE.SHARED, .POPULATE = true},
-                            io_uring_fd, linux.IORING_OFF_SQES);
+        const sqes = try posix.mmap(null, params.sq_entries * @sizeOf(linux.io_uring_sqe), linux.PROT.READ | linux.PROT.WRITE, .{ .TYPE = linux.MAP_TYPE.SHARED, .POPULATE = true }, io_uring_fd, linux.IORING_OFF_SQES);
 
         const sqring: SQRing = .{
-            .array = @as([*]c_uint,@alignCast(@ptrCast(&sqring_ptr[params.sq_off.array])))[0..params.sq_entries],
+            .array = @as([*]c_uint, @alignCast(@ptrCast(&sqring_ptr[params.sq_off.array])))[0..params.sq_entries],
             .head = @alignCast(@ptrCast(&sqring_ptr.ptr[params.sq_off.head])),
             .tail = @alignCast(@ptrCast(&sqring_ptr.ptr[params.sq_off.tail])),
             .dropped = @alignCast(@ptrCast(&sqring_ptr.ptr[params.sq_off.dropped])),
-            .sqes = @as([*]linux.io_uring_sqe,@alignCast(@ptrCast(sqes)))[0..params.sq_entries],
+            .sqes = @as([*]linux.io_uring_sqe, @alignCast(@ptrCast(sqes)))[0..params.sq_entries],
             .ring_mask = @alignCast(@ptrCast(&sqring_ptr.ptr[params.sq_off.ring_mask])),
         };
 
-        const cqring_ptr = try posix.mmap(null, params.cq_off.cqes + params.cq_entries * @sizeOf(linux.io_uring_cqe),
-                           linux.PROT.READ|linux.PROT.WRITE, .{ .TYPE = linux.MAP_TYPE.SHARED, .POPULATE = true}, io_uring_fd,
-                           linux.IORING_OFF_CQ_RING);
+        const cqring_ptr = try posix.mmap(null, params.cq_off.cqes + params.cq_entries * @sizeOf(linux.io_uring_cqe), linux.PROT.READ | linux.PROT.WRITE, .{ .TYPE = linux.MAP_TYPE.SHARED, .POPULATE = true }, io_uring_fd, linux.IORING_OFF_CQ_RING);
 
         const cqring: CQRing = .{
             .head = @alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.head])),
             .tail = @alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.tail])),
             .ring_mask = @alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.ring_mask])),
-            .cqes = @as([*]linux.io_uring_cqe,@alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.cqes])))[0..params.cq_entries],
+            .cqes = @as([*]linux.io_uring_cqe, @alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.cqes])))[0..params.cq_entries],
         };
 
-        return .{
-            .allocator = allocator,
-            .io_uring_fd = io_uring_fd,
-            .params = params,
-            .sqring = sqring,
-            .cqring = cqring,
-            .pending_events = std.AutoHashMap(*const Event, void).init(allocator)
-        };
+        return .{ .allocator = allocator, .io_uring_fd = io_uring_fd, .params = params, .sqring = sqring, .cqring = cqring, .pending_events = std.AutoHashMap(*const Event, void).init(allocator) };
     }
 
     pub fn addAsyncEvent(self: *Self, event: *const Event, allocated_at_runtime: bool) !void {
@@ -127,12 +104,12 @@ pub const EventQueue = struct {
             .RECEIVE_COMMAND => {
                 sqe.prep_recv(event.fd, event.buffer.?, 0);
             },
-            .SENT_RESPONSE,.FULL_SYNC,.SENT_DUMP,.PROPAGATE_COMMAND => {
+            .SENT_RESPONSE, .FULL_SYNC, .SENT_DUMP, .PROPAGATE_COMMAND => {
                 sqe.prep_send(event.fd, event.buffer.?, 0);
             },
             .SIGTERM => {
                 sqe.prep_poll_add(event.fd, posix.POLL.IN);
-            }
+            },
         }
         sqe.user_data = @intFromPtr(event);
         self.sqring.array[index] = @intCast(index);
@@ -153,12 +130,11 @@ pub const EventQueue = struct {
         _ = try ioUringEnter(self.io_uring_fd, 1, 1, linux.IORING_ENTER_GETEVENTS, null);
     }
 
-
     pub fn next(self: *Self) !*Event {
         const head = self.cqring.head.*;
-        const tail = @atomicLoad(c_uint,self.cqring.tail,std.builtin.AtomicOrder.acquire);
+        const tail = @atomicLoad(c_uint, self.cqring.tail, std.builtin.AtomicOrder.acquire);
         if (head == tail) {
-            _  = try ioUringEnter(self.io_uring_fd, 0, 1, linux.IORING_ENTER_GETEVENTS, null);
+            _ = try ioUringEnter(self.io_uring_fd, 0, 1, linux.IORING_ENTER_GETEVENTS, null);
         }
         const index = head & (self.cqring.ring_mask.*);
         const cqe = &self.cqring.cqes[index];
@@ -185,4 +161,3 @@ pub const EventQueue = struct {
         posix.close(self.io_uring_fd);
     }
 };
-
