@@ -40,6 +40,7 @@ pub const Event = struct {
     fd: posix.socket_t,
     buffer: ?[]u8 = null,
     async_result: ?i32 = null,
+    canary: ?u64 = null,
 };
 
 const SQRing = struct {

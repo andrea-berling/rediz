@@ -22,7 +22,7 @@ pub const Instance = struct {
     arena_allocator: *std.heap.ArenaAllocator,
     data: std.StringHashMap(Datum),
     config: std.StringHashMap([]u8),
-    master: ?std.net.Address = null,
+    master: ?posix.socket_t = null,
     replid: []const u8,
     repl_offset: usize,
 
@@ -102,10 +102,7 @@ pub const Instance = struct {
                 address = "127.0.0.1";
             }
             const port = try std.fmt.parseInt(u16, it.next().?, 10);
-            instance.master = .{
-                .in = try std.net.Ip4Address.resolveIp(address, port)
-            };
-            try instance.handshake(address, port);
+            instance.master = try instance.handshake_and_sync(address, port);
         } else {
             // TODO: initialize the replid as a random 40 character alphanumeric string
         }
@@ -113,12 +110,12 @@ pub const Instance = struct {
         return instance;
     }
 
-    fn handshake(self: *Instance, address: []const u8, port: u16) !void {
+    fn handshake_and_sync(self: *Instance, address: []const u8, port: u16) !posix.socket_t {
         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
         defer temp_allocator.deinit();
         var stream = try std.net.tcpConnectToHost(temp_allocator.allocator(),address,port);
         _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PING"}));
-        const buffer = try temp_allocator.allocator().alloc(u8, 128);
+        const buffer = try temp_allocator.allocator().alloc(u8, 1024);
         var n = try stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+PONG\r\n"));
         _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"REPLCONF", "listening-port", self.config.get("listening-port").? }));
@@ -128,8 +125,10 @@ pub const Instance = struct {
         n = try stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
         _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PSYNC", "?", "-1" }));
-        _ = try stream.read(buffer);
-        std.debug.print("Handshake with {s}:{d} was succesful!\n",.{address,port});
+        n = try stream.read(buffer);
+        _ = try stream.read(buffer[n..]);
+        std.debug.print("Handshake and sync with {s}:{d} was succesful!\n",.{address,port});
+        return stream.handle;
     }
 
     pub fn destroy(self: *Instance, allocator: std.mem.Allocator) void {
