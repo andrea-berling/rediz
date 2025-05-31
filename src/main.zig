@@ -260,6 +260,7 @@ pub fn main() !void {
             .SENT_RESPONSE, .SENT_DUMP => {
                 if (event.ty == .SENT_DUMP) {
                     try slaves.put(event.fd, {});
+                    instance.n_slaves += 1;
                 }
                 event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
                 event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;

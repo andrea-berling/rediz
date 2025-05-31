@@ -85,6 +85,16 @@ pub fn encodeBulkString(allocator: std.mem.Allocator, maybe_s: ?[]const u8) ![]u
     }
 }
 
+pub fn encodeInteger(allocator: std.mem.Allocator, n: i64) ![]u8 {
+    var response = std.ArrayList(u8).init(allocator);
+    try response.append(':');
+    if (n < 0) {
+        try response.append('-');
+    }
+    try std.fmt.format(response.writer(), "{d}\r\n", .{n});
+    return response.toOwnedSlice();
+}
+
 pub fn encodeSimpleString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var response = std.ArrayList(u8).init(allocator);
     try std.fmt.format(response.writer(), "+{s}\r\n", .{s});

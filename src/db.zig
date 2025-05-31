@@ -25,6 +25,7 @@ pub const Instance = struct {
     master: ?posix.socket_t = null,
     replid: []const u8,
     repl_offset: usize,
+    n_slaves: i64,
 
     inline fn dupe(self: *Instance, bytes: []const u8) ![]u8 {
         return try self.arena_allocator.allocator().dupe(u8, bytes);
@@ -38,6 +39,7 @@ pub const Instance = struct {
         instance.config = std.StringHashMap([]u8).init(instance.arena_allocator.allocator());
         instance.master = null;
         instance.repl_offset = 0;
+        instance.n_slaves = 0;
 
         const config_defaults = [_]struct { []const u8, []const u8 }{.{ "dbfilename", "dump.rdb" }};
 
@@ -232,6 +234,8 @@ pub const Instance = struct {
             var response = std.ArrayList(u8).init(allocator);
             try std.fmt.format(response.writer(), "FULLRESYNC {s} {d}", .{ self.replid, self.repl_offset });
             return .{ try resp.encodeSimpleString(allocator, try response.toOwnedSlice()), false };
+        } else if (std.ascii.eqlIgnoreCase(command[0], "WAIT")) {
+            return .{ try resp.encodeInteger(allocator, self.n_slaves), false };
         } else {
             std.debug.print("Unsupported command received: {s}\n", .{command[0]});
             return error.UnsupportedCommand;
