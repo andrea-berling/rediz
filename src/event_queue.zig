@@ -1,6 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const root = @import("root");
 
 fn handleError(errno: i64) !void {
     var error_string = std.ArrayList(u8).init(std.heap.page_allocator);
@@ -25,7 +26,7 @@ fn ioUringEnter(fd: i32, to_submit: u32, min_complete: u32, flags: u32, sig: ?*l
     return @bitCast(consumed_io_ops);
 }
 
-pub const EVENT_TYPE = enum { CONNECTION, RECEIVE_COMMAND, SENT_RESPONSE, SENT_DUMP, PROPAGATE_COMMAND, FULL_SYNC, SIGTERM };
+pub const EVENT_TYPE = enum { CONNECTION, RECEIVE_COMMAND, SENT_RESPONSE, SENT_DUMP, PROPAGATE_COMMAND, FULL_SYNC, SIGTERM, SEND_GETACK, RECEIVED_ACK, TIMEOUT };
 
 pub const Event = struct {
     ty: EVENT_TYPE = EVENT_TYPE.CONNECTION,
@@ -33,6 +34,7 @@ pub const Event = struct {
     buffer: ?[]u8 = null,
     async_result: ?i32 = null,
     canary: ?u64 = null,
+    pending_wait: ?*root.PendingWait = null,
 };
 
 const SQRing = struct {
@@ -101,11 +103,14 @@ pub const EventQueue = struct {
             .CONNECTION => {
                 sqe.prep_accept(event.fd, null, null, 0);
             },
-            .RECEIVE_COMMAND => {
+            .RECEIVE_COMMAND, .RECEIVED_ACK => {
                 sqe.prep_recv(event.fd, event.buffer.?, 0);
             },
-            .SENT_RESPONSE, .FULL_SYNC, .SENT_DUMP, .PROPAGATE_COMMAND => {
+            .SENT_RESPONSE, .FULL_SYNC, .SENT_DUMP, .PROPAGATE_COMMAND, .SEND_GETACK => {
                 sqe.prep_send(event.fd, event.buffer.?, 0);
+            },
+            .TIMEOUT => {
+                sqe.prep_read(event.fd, event.buffer.?, 0);
             },
             .SIGTERM => {
                 sqe.prep_poll_add(event.fd, posix.POLL.IN);
