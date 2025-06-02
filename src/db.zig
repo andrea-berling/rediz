@@ -5,13 +5,9 @@ const rdb = @import("rdb.zig");
 
 const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
-const ValueType = enum {
-    string,
-};
+const ValueType = enum { string, stream };
 
-const Value = union(ValueType) {
-    string: []u8,
-};
+const Value = union(ValueType) { string: []u8, stream: std.StringHashMap(std.StringHashMap([]u8)) };
 
 pub const Datum = struct {
     value: Value,
@@ -209,6 +205,21 @@ pub const Instance = struct {
                 }
                 return .{ try resp.encodeArray(allocator, keys), false };
             } else return .{ try resp.encodeBulkString(allocator, null), false };
+        } else if (std.ascii.eqlIgnoreCase(command[0], "XADD")) {
+            const stream = try self.data.getOrPut(try self.dupe(command[1]));
+            if (!stream.found_existing) {
+                stream.value_ptr.*.value.stream = std.StringHashMap(std.StringHashMap([]u8)).init(self.arena_allocator.allocator());
+            }
+
+            var new_entry = std.StringHashMap([]u8).init(self.arena_allocator.allocator());
+            var i: usize = 3;
+
+            while (i < command.len) : (i += 2) {
+                try new_entry.put(try self.dupe(command[i]), try self.dupe(command[i + 1]));
+            }
+            try stream.value_ptr.*.value.stream.put(try self.dupe(command[2]), new_entry);
+
+            return .{ try resp.encodeBulkString(allocator, command[2]), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "CONFIG")) {
             if (std.ascii.eqlIgnoreCase(command[1], "GET")) {
                 if (self.config.get(command[2])) |data| {
@@ -241,6 +252,9 @@ pub const Instance = struct {
                 switch (data.value) {
                     .string => {
                         return .{ try resp.encodeSimpleString(allocator, "string"), false };
+                    },
+                    .stream => {
+                        return .{ try resp.encodeSimpleString(allocator, "stream"), false };
                     },
                 }
             } else return .{ try resp.encodeSimpleString(allocator, "none"), false };
