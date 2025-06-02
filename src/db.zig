@@ -236,6 +236,14 @@ pub const Instance = struct {
             return .{ try resp.encodeSimpleString(allocator, try response.toOwnedSlice()), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "WAIT")) {
             return .{ try resp.encodeInteger(allocator, self.n_slaves), false };
+        } else if (std.ascii.eqlIgnoreCase(command[0], "TYPE")) {
+            if (self.data.get(command[1])) |data| {
+                switch (data.value) {
+                    .string => {
+                        return .{ try resp.encodeSimpleString(allocator, "string"), false };
+                    },
+                }
+            } else return .{ try resp.encodeSimpleString(allocator, "none"), false };
         } else {
             std.debug.print("Unsupported command received: {s}\n", .{command[0]});
             return error.UnsupportedCommand;
