@@ -85,8 +85,8 @@ pub fn parseMetadataSection(bytes: []const u8, alloc: Allocator) !struct { std.S
 pub fn parseKeyValuePair(bytes: []const u8, alloc: Allocator) !struct { struct { key: []u8, value: db.Datum }, usize } {
     var parsed_bytes: usize = 0;
     var expire_timestamp_ms: i64 = 0;
-    var value: db.Datum = undefined;
-    value.expire_at_ms = null;
+    var datum: db.Datum = undefined;
+    datum.expire_at_ms = null;
     var key: []u8 = undefined;
     while (true) {
         switch (@as(MarkerByte, @enumFromInt(bytes[parsed_bytes]))) {
@@ -100,14 +100,15 @@ pub fn parseKeyValuePair(bytes: []const u8, alloc: Allocator) !struct { struct {
                     expire_timestamp_ms = expire_timestamp_ms | (@as(i64, bytes[i + 1]) << @as(u6, @truncate(8 * @as(u8, @truncate(i)))));
                 }
                 if (marker == .KEY_EXPIRE_S) expire_timestamp_ms *= 1000;
-                value.expire_at_ms = expire_timestamp_ms;
+                datum.expire_at_ms = expire_timestamp_ms;
                 parsed_bytes += 1 + timestamp_size;
             },
             .KEY_TYPE_STRING => {
                 parsed_bytes += 1;
                 key, const key_bytes = try parseString(bytes[parsed_bytes..], alloc);
                 parsed_bytes += key_bytes;
-                value.value.string, const value_bytes = try parseString(bytes[parsed_bytes..], alloc);
+                const string_value, const value_bytes = try parseString(bytes[parsed_bytes..], alloc);
+                datum.value = .{ .string = string_value };
                 parsed_bytes += value_bytes;
                 break;
             },
@@ -117,7 +118,7 @@ pub fn parseKeyValuePair(bytes: []const u8, alloc: Allocator) !struct { struct {
         }
     }
 
-    return .{ .{ .key = key, .value = value }, parsed_bytes };
+    return .{ .{ .key = key, .value = datum }, parsed_bytes };
 }
 
 const KeyValuePair = struct { key: []u8, value: db.Datum };

@@ -7,7 +7,7 @@ const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
 const ValueType = enum { string, stream };
 
-const Value = union(ValueType) { string: []u8, stream: std.StringHashMap(std.StringHashMap([]u8)) };
+pub const Value = union(ValueType) { string: []u8, stream: std.StringHashMap(std.StringHashMap([]u8)) };
 
 pub const Datum = struct {
     value: Value,
@@ -77,7 +77,7 @@ pub const Instance = struct {
                         }
                     }
                     var new_datum: Datum = .{ .expire_at_ms = pair.value.expire_at_ms, .value = undefined };
-                    new_datum.value.string = try instance.dupe(pair.value.value.string);
+                    new_datum.value = .{ .string = try instance.dupe(pair.value.value.string) };
                     try instance.data.put(try instance.dupe(pair.key), new_datum);
                 }
             } else |err| {
