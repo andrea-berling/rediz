@@ -288,16 +288,26 @@ pub const Instance = struct {
                 switch (datum.value) {
                     .stream => |stream| {
                         // TODO: please make an interator
-                        const request_entry_timestamp_1, const maybe_request_entry_seq_1 = try parseStreamEntryId(command[2]);
-                        const request_entry_timestamp_2, const maybe_request_entry_seq_2 = try parseStreamEntryId(command[3]);
+                        const stream_keys = stream.keys();
+                        const n = stream_keys.len;
+
+                        const request_entry_timestamp_1, const maybe_request_entry_seq_1 = if (!std.mem.eql(u8, command[2], "-")) try parseStreamEntryId(command[2]) else blk: {
+                            const timestamp = stream_keys[0];
+                            const seq = stream.get(timestamp).?.keys()[0];
+                            break :blk .{ timestamp, seq };
+                        };
+                        const request_entry_timestamp_2, const maybe_request_entry_seq_2 = if (!std.mem.eql(u8, command[3], "+")) try parseStreamEntryId(command[3]) else blk: {
+                            const timestamp = stream_keys[n - 1];
+                            const seq_keys = stream.get(timestamp).?.keys();
+                            const seq = seq_keys[seq_keys.len - 1];
+                            break :blk .{ timestamp, seq };
+                        };
                         if (request_entry_timestamp_2 < request_entry_timestamp_1) {
                             @panic("Error: invalid range");
                         }
                         const request_entry_seq_1 = maybe_request_entry_seq_1 orelse 0;
                         const request_entry_seq_2 = maybe_request_entry_seq_2 orelse 0;
 
-                        const stream_keys = stream.keys();
-                        const n = stream_keys.len;
                         var first_timestamp_index: usize = 0;
                         var last_timestamp_index: usize = 0;
                         while (first_timestamp_index < n and last_timestamp_index < n) {
