@@ -14,6 +14,13 @@ pub const Datum = struct {
     expire_at_ms: ?i64,
 };
 
+fn parseStreamId(string: []const u8) !u64 {
+    const separator_pos = std.mem.indexOf(u8, string, "-") orelse return error.InvalidStreamId;
+    const timestamp: u48 = try std.fmt.parseInt(u48, string[0..separator_pos], 10);
+    const sequence_number: u16 = try std.fmt.parseInt(u16, string[separator_pos + 1 ..], 10);
+    return (timestamp << 16) | sequence_number;
+}
+
 pub const Instance = struct {
     arena_allocator: *std.heap.ArenaAllocator,
     data: std.StringHashMap(Datum),
@@ -22,6 +29,7 @@ pub const Instance = struct {
     replid: []const u8,
     repl_offset: usize,
     n_slaves: i64,
+    streams_ids: std.StringHashMap(u64),
 
     inline fn dupe(self: *Instance, bytes: []const u8) ![]u8 {
         return try self.arena_allocator.allocator().dupe(u8, bytes);
@@ -36,6 +44,7 @@ pub const Instance = struct {
         instance.master = null;
         instance.repl_offset = 0;
         instance.n_slaves = 0;
+        instance.streams_ids = std.StringHashMap(u64).init(instance.arena_allocator.allocator());
 
         const config_defaults = [_]struct { []const u8, []const u8 }{.{ "dbfilename", "dump.rdb" }};
 
@@ -209,15 +218,22 @@ pub const Instance = struct {
             const stream = try self.data.getOrPut(try self.dupe(command[1]));
             if (!stream.found_existing) {
                 stream.value_ptr.*.value.stream = std.StringHashMap(std.StringHashMap([]u8)).init(self.arena_allocator.allocator());
+                try self.streams_ids.put(try self.dupe(command[1]), 0);
             }
 
             var new_entry = std.StringHashMap([]u8).init(self.arena_allocator.allocator());
+            const latest_stream_id = self.streams_ids.get(command[1]).?;
+            const stream_id = try parseStreamId(command[2]);
+            if (stream_id <= latest_stream_id) {
+                return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD is equal or smaller than the target stream top item"), false };
+            }
             var i: usize = 3;
 
             while (i < command.len) : (i += 2) {
                 try new_entry.put(try self.dupe(command[i]), try self.dupe(command[i + 1]));
             }
             try stream.value_ptr.*.value.stream.put(try self.dupe(command[2]), new_entry);
+            try self.streams_ids.put(command[1], stream_id);
 
             return .{ try resp.encodeBulkString(allocator, command[2]), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "CONFIG")) {

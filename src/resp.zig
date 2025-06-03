@@ -95,10 +95,12 @@ pub fn encodeInteger(allocator: std.mem.Allocator, n: i64) ![]u8 {
     return response.toOwnedSlice();
 }
 
-pub fn encodeSimpleString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var response = std.ArrayList(u8).init(allocator);
-    try std.fmt.format(response.writer(), "+{s}\r\n", .{s});
-    return response.toOwnedSlice();
+pub inline fn encodeSimpleString(allocator: std.mem.Allocator, string: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "+{s}\r\n", .{string});
+}
+
+pub inline fn encodeSimpleError(allocator: std.mem.Allocator, msg: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "-{s}\r\n", .{msg});
 }
 
 pub fn encodeArray(allocator: std.mem.Allocator, array: []const []const u8) ![]u8 {
