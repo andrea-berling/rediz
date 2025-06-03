@@ -224,6 +224,9 @@ pub const Instance = struct {
             var new_entry = std.StringHashMap([]u8).init(self.arena_allocator.allocator());
             const latest_stream_id = self.streams_ids.get(command[1]).?;
             const stream_id = try parseStreamId(command[2]);
+            if (stream_id == 0) {
+                return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD must be greater than 0-0"), false };
+            }
             if (stream_id <= latest_stream_id) {
                 return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD is equal or smaller than the target stream top item"), false };
             }
