@@ -22,11 +22,11 @@ pub const Datum = struct {
     expire_at_ms: ?i64,
 };
 
-fn parseStreamEntryId(string: []const u8) !struct { u64, u16 } {
+fn parseStreamEntryId(string: []const u8) !struct { i64, u16 } {
     if (std.mem.eql(u8, string, "*"))
-        return .{ ~@as(u64, 0), ~@as(u16, 0) };
+        return .{ ~@as(i64, 0), ~@as(u16, 0) };
     const separator_pos = std.mem.indexOf(u8, string, "-") orelse return error.InvalidStreamId;
-    const timestamp: u48 = try std.fmt.parseInt(u48, string[0..separator_pos], 10);
+    const timestamp: i64 = try std.fmt.parseInt(i64, string[0..separator_pos], 10);
     const sequence_number: u16 = if (std.mem.eql(u8, string[separator_pos + 1 ..], "*")) 0xffff else try std.fmt.parseInt(u16, string[separator_pos + 1 ..], 10);
     return .{ timestamp, sequence_number };
 }
@@ -236,21 +236,21 @@ pub const Instance = struct {
             if (!stream_datum.found_existing) { // all blank, no readblocks
                 stream_datum.value_ptr.*.value.stream = Stream.init(self.arena_allocator.allocator());
                 var stream = &stream_datum.value_ptr.value.stream;
-                if (request_entry_timestamp == ~@as(u64, 0))
-                    request_entry_timestamp = @bitCast(std.time.milliTimestamp());
+                if (request_entry_timestamp == ~@as(i64, 0))
+                    request_entry_timestamp = std.time.milliTimestamp();
                 if (request_entry_seq == ~@as(u16, 0))
                     request_entry_seq = 1;
-                try stream.put(request_entry_seq, std.AutoArrayHashMap(u16, std.StringHashMap([]u8)).init(self.arena_allocator.allocator()));
+                try stream.put(request_entry_timestamp, std.AutoArrayHashMap(u16, std.StringHashMap([]u8)).init(self.arena_allocator.allocator()));
             } else { // stream exists,
                 const stream = &stream_datum.value_ptr.value.stream;
                 const keys_array = stream.keys();
                 const latest_entry_timestamp = keys_array[keys_array.len - 1];
-                if (request_entry_timestamp == ~@as(u64, 0)) {
-                    request_entry_timestamp = @bitCast(std.time.milliTimestamp());
+                if (request_entry_timestamp == ~@as(i64, 0)) {
+                    request_entry_timestamp = std.time.milliTimestamp();
                 } else if (request_entry_timestamp < latest_entry_timestamp) {
                     return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD is equal or smaller than the target stream top item"), false };
                 }
-                const entry_keys = try stream.getOrPut(@bitCast(request_entry_timestamp));
+                const entry_keys = try stream.getOrPut(request_entry_timestamp);
                 if (!entry_keys.found_existing) {
                     entry_keys.value_ptr.* = std.AutoArrayHashMap(u16, std.StringHashMap([]u8)).init(self.arena_allocator.allocator());
                     if (request_entry_seq == ~@as(u16, 0)) {
@@ -268,7 +268,7 @@ pub const Instance = struct {
             }
 
             var stream = &self.data.getEntry(command[1]).?.value_ptr.value.stream;
-            var stream_entry = stream.getEntry(@bitCast(request_entry_timestamp));
+            var stream_entry = stream.getEntry(request_entry_timestamp);
 
             var new_key_value_pairs = std.StringHashMap([]u8).init(self.arena_allocator.allocator());
             var i: usize = 3;
