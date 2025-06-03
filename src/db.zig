@@ -330,7 +330,7 @@ pub const Instance = struct {
                         var last_seq_number_index = right_seq_keys.len - 1;
                         const last_timestamp = stream_keys[last_timestamp_index];
                         if (last_timestamp == request_entry_timestamp_2)
-                            while (request_entry_seq_2 > right_seq_keys[last_seq_number_index]) : (last_seq_number_index -= 1) {};
+                            while (request_entry_seq_2 < right_seq_keys[last_seq_number_index]) : (last_seq_number_index -= 1) {};
                         const last_seq_number = right_seq_keys[last_seq_number_index];
                         // TODO: Should I check that the stream contains the endpoints?
                         // TODO: properly handle all actual cases (i = j, i and j at 0, i and j at n - 1, etc.)
@@ -348,7 +348,7 @@ pub const Instance = struct {
                         while (current_timestamp <= last_timestamp) {
                             const entry = stream.get(current_timestamp).?;
                             const entry_keys = entry.keys();
-                            while (current_seq_number_index < entry_keys.len) : (current_seq_number_index += 1) {
+                            while (current_seq_number_index < entry_keys.len and current_seq_number < last_seq_number) : (current_seq_number_index += 1) {
                                 var entry_elements = std.ArrayList(resp.Value).init(temp_allocator.allocator());
                                 current_seq_number = entry_keys[current_seq_number_index];
                                 var entry_entries_it = entry.get(current_seq_number).?.iterator();
