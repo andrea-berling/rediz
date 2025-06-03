@@ -239,7 +239,7 @@ pub const Instance = struct {
                 if (request_entry_timestamp == ~@as(u64, 0))
                     request_entry_timestamp = @bitCast(std.time.milliTimestamp());
                 if (request_entry_seq == ~@as(u16, 0))
-                    request_entry_seq = 0;
+                    request_entry_seq = 1;
                 try stream.put(request_entry_seq, std.AutoArrayHashMap(u16, std.StringHashMap([]u8)).init(self.arena_allocator.allocator()));
             } else { // stream exists,
                 const stream = &stream_datum.value_ptr.value.stream;
@@ -254,7 +254,7 @@ pub const Instance = struct {
                 if (!entry_keys.found_existing) {
                     entry_keys.value_ptr.* = std.AutoArrayHashMap(u16, std.StringHashMap([]u8)).init(self.arena_allocator.allocator());
                     if (request_entry_seq == ~@as(u16, 0)) {
-                        request_entry_seq = 0;
+                        request_entry_seq = 1;
                     }
                 } else {
                     const entry_keys_array = entry_keys.value_ptr.*.keys();
