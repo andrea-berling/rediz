@@ -7,18 +7,28 @@ const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
 const ValueType = enum { string, stream };
 
-pub const Value = union(ValueType) { string: []u8, stream: std.StringHashMap(std.StringHashMap([]u8)) };
+// Stream ID -> entry ID (timestamp) -> seq1 -> key, value pairs
+//                                   -> seq2 -> key, value pairs
+//                                   -> seq3 -> key, value pairs
+//           -> entry ID (timestamp) -> seq1 -> key, value pairs
+//                                   -> seq2 -> key, value pairs
+//                                   -> seq3 -> key, value pairs
+const Stream = std.AutoArrayHashMap(i64, std.AutoArrayHashMap(u16, std.StringHashMap([]u8)));
+
+pub const Value = union(ValueType) { string: []u8, stream: Stream };
 
 pub const Datum = struct {
     value: Value,
     expire_at_ms: ?i64,
 };
 
-fn parseStreamId(string: []const u8) !u64 {
+fn parseStreamEntryId(string: []const u8) !struct { u64, u16 } {
+    if (std.mem.eql(u8, string, "*"))
+        return .{ ~@as(u64, 0), ~@as(u16, 0) };
     const separator_pos = std.mem.indexOf(u8, string, "-") orelse return error.InvalidStreamId;
     const timestamp: u48 = try std.fmt.parseInt(u48, string[0..separator_pos], 10);
-    const sequence_number: u16 = try std.fmt.parseInt(u16, string[separator_pos + 1 ..], 10);
-    return (timestamp << 16) | sequence_number;
+    const sequence_number: u16 = if (std.mem.eql(u8, string[separator_pos + 1 ..], "*")) 0xffff else try std.fmt.parseInt(u16, string[separator_pos + 1 ..], 10);
+    return .{ timestamp, sequence_number };
 }
 
 pub const Instance = struct {
@@ -29,7 +39,7 @@ pub const Instance = struct {
     replid: []const u8,
     repl_offset: usize,
     n_slaves: i64,
-    streams_ids: std.StringHashMap(u64),
+    rng: std.Random.DefaultPrng,
 
     inline fn dupe(self: *Instance, bytes: []const u8) ![]u8 {
         return try self.arena_allocator.allocator().dupe(u8, bytes);
@@ -44,7 +54,7 @@ pub const Instance = struct {
         instance.master = null;
         instance.repl_offset = 0;
         instance.n_slaves = 0;
-        instance.streams_ids = std.StringHashMap(u64).init(instance.arena_allocator.allocator());
+        instance.rng = std.Random.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
 
         const config_defaults = [_]struct { []const u8, []const u8 }{.{ "dbfilename", "dump.rdb" }};
 
@@ -97,7 +107,6 @@ pub const Instance = struct {
             }
         }
 
-        instance.replid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
         if (instance.config.get("master")) |master| {
             var it = std.mem.splitScalar(u8, master, ' ');
             var address = it.next().?;
@@ -106,15 +115,15 @@ pub const Instance = struct {
                 address = "127.0.0.1";
             }
             const port = try std.fmt.parseInt(u16, it.next().?, 10);
-            instance.master = try instance.handshake_and_sync(address, port);
+            instance.master, instance.replid = try instance.handshake_and_sync(address, port);
         } else {
-            // TODO: initialize the replid as a random 40 character alphanumeric string
+            instance.replid = try std.fmt.allocPrint(instance.arena_allocator.allocator(), "{x}{x}", .{ instance.rng.random().int(u128), instance.rng.random().int(u32) });
         }
 
         return instance;
     }
 
-    fn handshake_and_sync(self: *Instance, address: []const u8, port: u16) !posix.socket_t {
+    fn handshake_and_sync(self: *Instance, address: []const u8, port: u16) !struct { posix.socket_t, []u8 } {
         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
         defer temp_allocator.deinit();
         var stream = try std.net.tcpConnectToHost(temp_allocator.allocator(), address, port);
@@ -151,7 +160,10 @@ pub const Instance = struct {
 
         try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, (@as([*]u8, @ptrCast(&timeout)))[0..@sizeOf(posix.timeval)]);
 
-        _, const fullsync_parsed_bytes = try resp.parseSimpleString(temp_allocator.allocator(), buffer); // FULLSYNC
+        const fullsync, const fullsync_parsed_bytes = try resp.parseSimpleString(temp_allocator.allocator(), buffer); // FULLSYNC
+        var fullsync_it = std.mem.splitScalar(u8, fullsync, ' ');
+        _ = fullsync_it.next();
+        const replid = try self.dupe(fullsync_it.next().?);
         _, const db_parsed_bytes = try resp.parseBulkString(temp_allocator.allocator(), buffer[fullsync_parsed_bytes..], false);
         var parsed_bytes = fullsync_parsed_bytes + db_parsed_bytes;
         while (n > parsed_bytes) {
@@ -166,7 +178,7 @@ pub const Instance = struct {
         }
 
         std.debug.print("Handshake and sync with {s}:{d} was succesful!\n", .{ address, port });
-        return stream.handle;
+        return .{ stream.handle, replid };
     }
 
     pub fn destroy(self: *Instance, allocator: std.mem.Allocator) void {
@@ -215,30 +227,58 @@ pub const Instance = struct {
                 return .{ try resp.encodeArray(allocator, keys), false };
             } else return .{ try resp.encodeBulkString(allocator, null), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "XADD")) {
-            const stream = try self.data.getOrPut(try self.dupe(command[1]));
-            if (!stream.found_existing) {
-                stream.value_ptr.*.value.stream = std.StringHashMap(std.StringHashMap([]u8)).init(self.arena_allocator.allocator());
-                try self.streams_ids.put(try self.dupe(command[1]), 0);
+            var request_entry_timestamp, var request_entry_seq = try parseStreamEntryId(command[2]);
+
+            if (request_entry_timestamp == 0 and request_entry_seq == 0)
+                return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD must be greater than 0-0"), false };
+
+            const stream_datum = try self.data.getOrPut(try self.dupe(command[1]));
+            if (!stream_datum.found_existing) { // all blank, no readblocks
+                stream_datum.value_ptr.*.value.stream = Stream.init(self.arena_allocator.allocator());
+                var stream = &stream_datum.value_ptr.value.stream;
+                if (request_entry_timestamp == ~@as(u64, 0))
+                    request_entry_timestamp = @bitCast(std.time.milliTimestamp());
+                if (request_entry_seq == ~@as(u16, 0))
+                    request_entry_seq = 0;
+                try stream.put(request_entry_seq, std.AutoArrayHashMap(u16, std.StringHashMap([]u8)).init(self.arena_allocator.allocator()));
+            } else { // stream exists,
+                const stream = &stream_datum.value_ptr.value.stream;
+                const keys_array = stream.keys();
+                const latest_entry_timestamp = keys_array[keys_array.len - 1];
+                if (request_entry_timestamp == ~@as(u64, 0)) {
+                    request_entry_timestamp = @bitCast(std.time.milliTimestamp());
+                } else if (request_entry_timestamp < latest_entry_timestamp) {
+                    return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD is equal or smaller than the target stream top item"), false };
+                }
+                const entry_keys = try stream.getOrPut(@bitCast(request_entry_timestamp));
+                if (!entry_keys.found_existing) {
+                    entry_keys.value_ptr.* = std.AutoArrayHashMap(u16, std.StringHashMap([]u8)).init(self.arena_allocator.allocator());
+                    if (request_entry_seq == ~@as(u16, 0)) {
+                        request_entry_seq = 0;
+                    }
+                } else {
+                    const entry_keys_array = entry_keys.value_ptr.*.keys();
+                    const latest_seq = entry_keys_array[entry_keys_array.len - 1];
+                    if (request_entry_seq == ~@as(u16, 0)) {
+                        request_entry_seq = latest_seq + 1;
+                    } else if (request_entry_seq <= latest_seq) {
+                        return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD is equal or smaller than the target stream top item"), false };
+                    }
+                }
             }
 
-            var new_entry = std.StringHashMap([]u8).init(self.arena_allocator.allocator());
-            const latest_stream_id = self.streams_ids.get(command[1]).?;
-            const stream_id = try parseStreamId(command[2]);
-            if (stream_id == 0) {
-                return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD must be greater than 0-0"), false };
-            }
-            if (stream_id <= latest_stream_id) {
-                return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD is equal or smaller than the target stream top item"), false };
-            }
+            var stream = &self.data.getEntry(command[1]).?.value_ptr.value.stream;
+            var stream_entry = stream.getEntry(@bitCast(request_entry_timestamp));
+
+            var new_key_value_pairs = std.StringHashMap([]u8).init(self.arena_allocator.allocator());
             var i: usize = 3;
 
             while (i < command.len) : (i += 2) {
-                try new_entry.put(try self.dupe(command[i]), try self.dupe(command[i + 1]));
+                try new_key_value_pairs.put(try self.dupe(command[i]), try self.dupe(command[i + 1]));
             }
-            try stream.value_ptr.*.value.stream.put(try self.dupe(command[2]), new_entry);
-            try self.streams_ids.put(command[1], stream_id);
+            try stream_entry.?.value_ptr.put(request_entry_seq, new_key_value_pairs);
 
-            return .{ try resp.encodeBulkString(allocator, command[2]), false };
+            return .{ try resp.encodeBulkString(allocator, try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_timestamp, request_entry_seq })), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "CONFIG")) {
             if (std.ascii.eqlIgnoreCase(command[1], "GET")) {
                 if (self.config.get(command[2])) |data| {
