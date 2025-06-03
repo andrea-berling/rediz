@@ -1,5 +1,37 @@
 const std = @import("std");
 
+const ValueType = enum { simple_string, bulk_string, integer, simple_error, array };
+
+pub const Value = union(ValueType) {
+    simple_string: []const u8,
+    bulk_string: []const u8,
+    integer: i64,
+    simple_error: []const u8,
+    array: []const Value,
+
+    pub fn encode(self: *const Value, allocator: std.mem.Allocator) anyerror![]u8 {
+        var encoded_element: []u8 = undefined;
+        switch (self.*) {
+            .simple_string => {
+                encoded_element = try encodeSimpleString(allocator, self.simple_string);
+            },
+            .bulk_string => {
+                encoded_element = try encodeBulkString(allocator, self.bulk_string);
+            },
+            .integer => {
+                encoded_element = try encodeInteger(allocator, self.integer);
+            },
+            .simple_error => {
+                encoded_element = try encodeSimpleError(allocator, self.simple_error);
+            },
+            .array => {
+                encoded_element = try encodeArray(allocator, self.array);
+            },
+        }
+        return encoded_element;
+    }
+};
+
 const MAX_DECIMAL_LEN = 10;
 
 pub fn parseDecimal(bytes: []u8) !struct { u64, usize } {
@@ -103,13 +135,24 @@ pub inline fn encodeSimpleError(allocator: std.mem.Allocator, msg: []const u8) !
     return try std.fmt.allocPrint(allocator, "-{s}\r\n", .{msg});
 }
 
-pub fn encodeArray(allocator: std.mem.Allocator, array: []const []const u8) ![]u8 {
+pub fn encodeMessage(allocator: std.mem.Allocator, array: []const []const u8) ![]u8 {
+    var message_elements = std.ArrayList(Value).init(allocator);
+    defer message_elements.deinit();
+    for (array) |part| {
+        try message_elements.append(Value{ .bulk_string = part });
+    }
+    return try encodeArray(allocator, try message_elements.toOwnedSlice());
+}
+
+pub fn encodeArray(allocator: std.mem.Allocator, array: []const Value) ![]u8 {
     var response = std.ArrayList(u8).init(allocator);
     try std.fmt.format(response.writer(), "*{d}\r\n", .{array.len});
-    for (array) |string| {
-        const element = try encodeBulkString(allocator, string);
-        defer allocator.free(element);
-        _ = try response.writer().write(element);
+    for (array) |value| {
+        const encoded_element = try value.encode(allocator);
+        defer allocator.free(encoded_element);
+        try response.appendSlice(encoded_element);
     }
     return response.toOwnedSlice();
 }
+
+// TODO: tests for encoding and decoding

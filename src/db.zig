@@ -22,11 +22,14 @@ pub const Datum = struct {
     expire_at_ms: ?i64,
 };
 
-fn parseStreamEntryId(string: []const u8) !struct { i64, u16 } {
+fn parseStreamEntryId(string: []const u8) !struct { i64, ?u16 } {
     if (std.mem.eql(u8, string, "*"))
         return .{ ~@as(i64, 0), ~@as(u16, 0) };
-    const separator_pos = std.mem.indexOf(u8, string, "-") orelse return error.InvalidStreamId;
+    const separator_pos = std.mem.indexOf(u8, string, "-") orelse string.len;
     const timestamp: i64 = try std.fmt.parseInt(i64, string[0..separator_pos], 10);
+    if (separator_pos == string.len) {
+        return .{ timestamp, null };
+    }
     const sequence_number: u16 = if (std.mem.eql(u8, string[separator_pos + 1 ..], "*")) 0xffff else try std.fmt.parseInt(u16, string[separator_pos + 1 ..], 10);
     return .{ timestamp, sequence_number };
 }
@@ -127,17 +130,17 @@ pub const Instance = struct {
         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
         defer temp_allocator.deinit();
         var stream = try std.net.tcpConnectToHost(temp_allocator.allocator(), address, port);
-        _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{"PING"}));
+        _ = try stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{"PING"}));
         const buffer = try temp_allocator.allocator().alloc(u8, 1024);
         var n = try stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+PONG\r\n"));
-        _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "listening-port", self.config.get("listening-port").? }));
+        _ = try stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "listening-port", self.config.get("listening-port").? }));
         n = try stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
-        _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "capa", "psync2" }));
+        _ = try stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "capa", "psync2" }));
         n = try stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
-        _ = try stream.write(try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{ "PSYNC", "?", "-1" }));
+        _ = try stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "PSYNC", "?", "-1" }));
 
         var timeout = posix.timeval{
             .sec = 0,
@@ -224,11 +227,12 @@ pub const Instance = struct {
                 while (keys_iterator.next()) |key| : (i += 1) {
                     keys[i] = key.*;
                 }
-                return .{ try resp.encodeArray(allocator, keys), false };
+                return .{ try resp.encodeMessage(allocator, keys), false };
             } else return .{ try resp.encodeBulkString(allocator, null), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "XADD")) {
-            var request_entry_timestamp, var request_entry_seq = try parseStreamEntryId(command[2]);
-
+            var request_entry_timestamp, const maybe_request_entry_seq = try parseStreamEntryId(command[2]);
+            // TODO: proper error handling
+            var request_entry_seq = maybe_request_entry_seq.?;
             if (request_entry_timestamp == 0 and request_entry_seq == 0)
                 return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD must be greater than 0-0"), false };
 
@@ -278,11 +282,97 @@ pub const Instance = struct {
             }
             try stream_entry.?.value_ptr.put(request_entry_seq, new_key_value_pairs);
 
-            return .{ try resp.encodeBulkString(allocator, try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_timestamp, request_entry_seq })), false };
+            return .{ try resp.encodeBulkString(allocator, try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_timestamp, request_entry_seq })), true };
+        } else if (std.ascii.eqlIgnoreCase(command[0], "XRANGE")) {
+            if (self.data.get(command[1])) |datum| {
+                switch (datum.value) {
+                    .stream => |stream| {
+                        // TODO: please make an interator
+                        const request_entry_timestamp_1, const maybe_request_entry_seq_1 = try parseStreamEntryId(command[2]);
+                        const request_entry_timestamp_2, const maybe_request_entry_seq_2 = try parseStreamEntryId(command[3]);
+                        if (request_entry_timestamp_2 < request_entry_timestamp_1) {
+                            @panic("Error: invalid range");
+                        }
+                        const request_entry_seq_1 = maybe_request_entry_seq_1 orelse 0;
+                        const request_entry_seq_2 = maybe_request_entry_seq_2 orelse 0;
+
+                        const stream_keys = stream.keys();
+                        const n = stream_keys.len;
+                        var first_timestamp_index: usize = 0;
+                        var last_timestamp_index: usize = 0;
+                        while (first_timestamp_index < n and last_timestamp_index < n) {
+                            const before = first_timestamp_index + last_timestamp_index;
+                            if (request_entry_timestamp_1 > stream_keys[first_timestamp_index])
+                                first_timestamp_index += 1;
+                            if (request_entry_timestamp_2 > stream_keys[last_timestamp_index])
+                                last_timestamp_index += 1;
+                            if (first_timestamp_index + last_timestamp_index == before) { // neither pointer moved, time to eject
+                                break;
+                            }
+                        }
+                        const left_seq_keys = stream.get(stream_keys[first_timestamp_index]).?.keys();
+                        var first_seq_number_index: usize = 0;
+                        const first_timestamp = stream_keys[first_timestamp_index];
+                        if (first_timestamp == request_entry_timestamp_1)
+                            while (request_entry_seq_1 > left_seq_keys[first_seq_number_index]) : (first_seq_number_index += 1) {};
+
+                        const right_seq_keys = stream.get(stream_keys[last_timestamp_index]).?.keys();
+                        var last_seq_number_index = right_seq_keys.len - 1;
+                        const last_timestamp = stream_keys[last_timestamp_index];
+                        if (last_timestamp == request_entry_timestamp_2)
+                            while (request_entry_seq_2 > right_seq_keys[last_seq_number_index]) : (last_seq_number_index -= 1) {};
+                        const last_seq_number = right_seq_keys[last_seq_number_index];
+                        // TODO: Should I check that the stream contains the endpoints?
+                        // TODO: properly handle all actual cases (i = j, i and j at 0, i and j at n - 1, etc.)
+
+                        var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
+                        defer temp_allocator.deinit();
+                        var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+
+                        var current_timestamp_index = first_timestamp_index;
+                        var current_seq_number_index = first_seq_number_index;
+
+                        var current_timestamp = stream_keys[current_timestamp_index];
+                        var current_seq_number = stream.get(current_timestamp).?.keys()[current_seq_number_index];
+
+                        while (current_timestamp <= last_timestamp) {
+                            const entry = stream.get(current_timestamp).?;
+                            const entry_keys = entry.keys();
+                            while (current_seq_number_index < entry_keys.len) : (current_seq_number_index += 1) {
+                                var entry_elements = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+                                current_seq_number = entry_keys[current_seq_number_index];
+                                var entry_entries_it = entry.get(current_seq_number).?.iterator();
+                                while (entry_entries_it.next()) |keyval_pair| {
+                                    try entry_elements.append(resp.Value{ .bulk_string = keyval_pair.key_ptr.* });
+                                    try entry_elements.append(resp.Value{ .bulk_string = keyval_pair.value_ptr.* });
+                                }
+                                var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
+                                tmp_array[0] = resp.Value{ .bulk_string = try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ current_timestamp, current_seq_number }) };
+                                tmp_array[1] = resp.Value{ .array = try entry_elements.toOwnedSlice() };
+                                try response.append(resp.Value{ .array = tmp_array });
+                            }
+                            current_timestamp_index += 1;
+                            if (current_timestamp_index >= stream_keys.len) {
+                                break;
+                            }
+                            current_timestamp = stream_keys[current_timestamp_index];
+                            current_seq_number_index = 0;
+                            current_seq_number = stream.get(current_timestamp).?.keys()[current_seq_number_index];
+                            if (current_timestamp == last_timestamp and current_seq_number > last_seq_number) {
+                                break;
+                            }
+                        }
+                        return .{ try resp.encodeArray(allocator, try response.toOwnedSlice()), false };
+                    },
+                    else => {
+                        return .{ try resp.encodeBulkString(allocator, null), false };
+                    },
+                }
+            } else return .{ try resp.encodeBulkString(allocator, null), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "CONFIG")) {
             if (std.ascii.eqlIgnoreCase(command[1], "GET")) {
                 if (self.config.get(command[2])) |data| {
-                    return .{ try resp.encodeArray(allocator, &[_][]const u8{ command[2], data }), false };
+                    return .{ try resp.encodeMessage(allocator, &[_][]const u8{ command[2], data }), false };
                 } else return .{ try resp.encodeBulkString(allocator, null), false };
             } else if (std.ascii.eqlIgnoreCase(command[1], "SET")) {
                 try self.config.put(try self.dupe(command[2]), try self.dupe(command[3]));
@@ -298,7 +388,7 @@ pub const Instance = struct {
             } else return error.InvalidInfoCommand;
         } else if (std.ascii.eqlIgnoreCase(command[0], "REPLCONF")) {
             if (std.ascii.eqlIgnoreCase(command[1], "GETACK")) {
-                return .{ try resp.encodeArray(allocator, &[_][]const u8{ "REPLCONF", "ACK", try std.fmt.allocPrint(allocator, "{d}", .{self.repl_offset}) }), false };
+                return .{ try resp.encodeMessage(allocator, &[_][]const u8{ "REPLCONF", "ACK", try std.fmt.allocPrint(allocator, "{d}", .{self.repl_offset}) }), false };
             } else return .{ try resp.encodeSimpleString(allocator, "OK"[0..]), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "PSYNC")) {
             var response = std.ArrayList(u8).init(allocator);

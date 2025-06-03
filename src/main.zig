@@ -260,7 +260,7 @@ pub fn main() !void {
                                 send_get_ack_request_event.ty = eq.EVENT_TYPE.SEND_GETACK;
                                 send_get_ack_request_event.fd = slave.key_ptr.*;
                                 send_get_ack_request_event.buffer = try allocator.alloc(u8, GETACK_BUFFER_SIZE);
-                                const ack_request = try resp.encodeArray(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "GETACK", "*" });
+                                const ack_request = try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "GETACK", "*" });
                                 send_get_ack_request_event.buffer = resizeBuffer(send_get_ack_request_event.buffer.?, ack_request.len);
                                 @memcpy(send_get_ack_request_event.buffer.?, ack_request);
                                 send_get_ack_request_event.canary = null;
