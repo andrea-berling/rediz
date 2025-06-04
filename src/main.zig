@@ -47,7 +47,7 @@ pub const PendingWait = struct {
     actual_n_replicas: usize,
 };
 
-fn compareWaits(context: i32, a: *PendingWait, b: *PendingWait) std.math.Order {
+fn compareWaits(context: void, a: *PendingWait, b: *PendingWait) std.math.Order {
     _ = context;
     return std.math.order(a.timeout, b.timeout);
 }
@@ -159,7 +159,7 @@ pub fn main() !void {
     var slaves = std.AutoHashMap(posix.socket_t, usize).init(allocator);
     defer slaves.deinit();
 
-    var pending_waits = std.PriorityQueue(*PendingWait, i32, compareWaits).init(allocator, 42);
+    var pending_waits = std.PriorityQueue(*PendingWait, void, compareWaits).init(allocator, undefined);
     defer pending_waits.deinit();
 
     event_loop: while (true) {
