@@ -5,9 +5,39 @@ const rdb = @import("rdb.zig");
 
 const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
-const ValueType = enum { string, stream };
+const StreamEntryID = packed struct(u64) {
+    pub const TIMESTAMP_ANY: u48 = ~@as(u48, 0);
+    pub const SEQUENCE_NUMBER_ANY: u48 = 0xffff;
 
-const Stream = std.AutoArrayHashMap(u64, std.StringHashMap([]u8));
+    timestamp: u48 = TIMESTAMP_ANY,
+    sequence_number: u16 = SEQUENCE_NUMBER_ANY,
+
+    const Self = @This();
+
+    pub fn isZero(self: Self) bool {
+        return self.timestamp == 0 and self.sequence_number == 0;
+    }
+
+    pub fn isLessThanOrEqual(self: Self, other: Self) bool {
+        return self.timestamp < other.timestamp or (self.timestamp == other.timestamp and self.sequence_number <= other.sequence_number);
+    }
+};
+
+fn parseStreamEntryId(string: []const u8) !StreamEntryID {
+    var stream_entry_id = StreamEntryID{};
+    if (!std.mem.eql(u8, string, "*")) {
+        const separator_pos = std.mem.indexOf(u8, string, "-") orelse string.len;
+        stream_entry_id.timestamp = try std.fmt.parseInt(u48, string[0..separator_pos], 10);
+        if (separator_pos != string.len and !std.mem.eql(u8, string[separator_pos + 1 ..], "*")) {
+            stream_entry_id.sequence_number = try std.fmt.parseInt(u16, string[separator_pos + 1 ..], 10);
+        }
+    }
+    return stream_entry_id;
+}
+
+const Stream = std.AutoArrayHashMap(StreamEntryID, std.StringHashMap([]u8));
+
+const ValueType = enum { string, stream };
 
 pub const Value = union(ValueType) { string: []u8, stream: Stream };
 
@@ -15,18 +45,6 @@ pub const Datum = struct {
     value: Value,
     expire_at_ms: ?i64,
 };
-
-fn parseStreamEntryId(string: []const u8) !u64 {
-    if (std.mem.eql(u8, string, "*"))
-        return ~@as(u64, 0);
-    const separator_pos = std.mem.indexOf(u8, string, "-") orelse string.len;
-    const timestamp: u48 = try std.fmt.parseInt(u48, string[0..separator_pos], 10);
-    if (separator_pos == string.len) {
-        return @as(u64, timestamp) << 16;
-    }
-    const sequence_number: u16 = if (std.mem.eql(u8, string[separator_pos + 1 ..], "*")) 0xffff else try std.fmt.parseInt(u16, string[separator_pos + 1 ..], 10);
-    return (@as(u64, timestamp) << 16) | sequence_number;
-}
 
 pub const Instance = struct {
     arena_allocator: *std.heap.ArenaAllocator,
@@ -123,27 +141,27 @@ pub const Instance = struct {
     fn handshake_and_sync(self: *Instance, address: []const u8, port: u16) !struct { posix.socket_t, []u8 } {
         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
         defer temp_allocator.deinit();
-        var stream = try std.net.tcpConnectToHost(temp_allocator.allocator(), address, port);
-        _ = try stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{"PING"}));
+        var tcp_stream = try std.net.tcpConnectToHost(temp_allocator.allocator(), address, port);
+        _ = try tcp_stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{"PING"}));
         const buffer = try temp_allocator.allocator().alloc(u8, 1024);
-        var n = try stream.read(buffer);
+        var n = try tcp_stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+PONG\r\n"));
-        _ = try stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "listening-port", self.config.get("listening-port").? }));
-        n = try stream.read(buffer);
+        _ = try tcp_stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "listening-port", self.config.get("listening-port").? }));
+        n = try tcp_stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
-        _ = try stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "capa", "psync2" }));
-        n = try stream.read(buffer);
+        _ = try tcp_stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "capa", "psync2" }));
+        n = try tcp_stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
-        _ = try stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "PSYNC", "?", "-1" }));
+        _ = try tcp_stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "PSYNC", "?", "-1" }));
 
         var timeout = posix.timeval{
             .sec = 0,
             .usec = 100 * 1000,
         };
-        try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, (@as([*]u8, @ptrCast(&timeout)))[0..@sizeOf(posix.timeval)]);
+        try posix.setsockopt(tcp_stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, (@as([*]u8, @ptrCast(&timeout)))[0..@sizeOf(posix.timeval)]);
 
         n = 0;
-        while (stream.read(buffer[n..])) |read_bytes| : (n += read_bytes) {
+        while (tcp_stream.read(buffer[n..])) |read_bytes| : (n += read_bytes) {
             if (read_bytes == 0) {
                 break;
             }
@@ -155,7 +173,7 @@ pub const Instance = struct {
 
         timeout.usec = 0;
 
-        try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, (@as([*]u8, @ptrCast(&timeout)))[0..@sizeOf(posix.timeval)]);
+        try posix.setsockopt(tcp_stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, (@as([*]u8, @ptrCast(&timeout)))[0..@sizeOf(posix.timeval)]);
 
         const fullsync, const fullsync_parsed_bytes = try resp.parseSimpleString(temp_allocator.allocator(), buffer); // FULLSYNC
         var fullsync_it = std.mem.splitScalar(u8, fullsync, ' ');
@@ -169,13 +187,13 @@ pub const Instance = struct {
             if (std.ascii.eqlIgnoreCase(request[0], "REPLCONF") and
                 std.ascii.eqlIgnoreCase(request[1], "GETACK"))
             {
-                _ = try stream.write(reply);
+                _ = try tcp_stream.write(reply);
             }
             parsed_bytes += command_bytes;
         }
 
         std.debug.print("Handshake and sync with {s}:{d} was succesful!\n", .{ address, port });
-        return .{ stream.handle, replid };
+        return .{ tcp_stream.handle, replid };
     }
 
     pub fn destroy(self: *Instance, allocator: std.mem.Allocator) void {
@@ -226,17 +244,17 @@ pub const Instance = struct {
         } else if (std.ascii.eqlIgnoreCase(command[0], "XADD")) {
             var request_entry_id = try parseStreamEntryId(command[2]);
             // TODO: proper error handling
-            if (request_entry_id == 0)
+            if (request_entry_id.isZero())
                 return .{ try resp.encodeSimpleError(allocator, "The ID specified in XADD must be greater than 0-0"), false };
 
-            const should_generate_timestamp = request_entry_id == ~@as(u64, 0);
-            const should_generate_sequence_number = request_entry_id & 0xffff == 0xffff;
+            const should_generate_sequence_number = request_entry_id.sequence_number == StreamEntryID.SEQUENCE_NUMBER_ANY;
+            const should_generate_timestamp = should_generate_sequence_number and request_entry_id.timestamp == StreamEntryID.TIMESTAMP_ANY;
 
             if (should_generate_timestamp)
-                request_entry_id = @as(u64, @bitCast(std.time.milliTimestamp())) << 16;
+                request_entry_id.timestamp = @as(u48, @truncate(@as(u64, @bitCast(std.time.milliTimestamp()))));
 
             if (should_generate_sequence_number)
-                request_entry_id = (request_entry_id & ~@as(u64, 0xffff)) | (@as(u16, 1) - std.math.clamp(@as(u16, @truncate(request_entry_id >> 16)), 0, 1));
+                request_entry_id.sequence_number = if (request_entry_id.timestamp == 0) 1 else 0;
 
             const stream_datum = try self.data.getOrPut(try self.dupe(command[1]));
             if (!stream_datum.found_existing) {
@@ -249,11 +267,11 @@ pub const Instance = struct {
             if (stream_keys.len > 0) {
                 const latest_entry_id = stream_keys[stream_keys.len - 1];
 
-                if (should_generate_sequence_number and latest_entry_id >> 16 == request_entry_id >> 16) {
-                    request_entry_id = latest_entry_id + 1;
+                if (should_generate_sequence_number and latest_entry_id.timestamp == request_entry_id.timestamp) {
+                    request_entry_id.sequence_number = latest_entry_id.sequence_number + 1;
                 }
 
-                if (request_entry_id <= latest_entry_id) {
+                if (request_entry_id.isLessThanOrEqual(latest_entry_id)) {
                     return .{ try resp.encodeSimpleError(allocator, "The ID specified in XADD is equal or smaller than the target stream top item"), false };
                 }
             }
@@ -270,7 +288,7 @@ pub const Instance = struct {
                 try stream_entry.value_ptr.put(try self.dupe(command[i]), try self.dupe(command[i + 1]));
             }
 
-            return .{ try resp.encodeBulkString(allocator, try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_id >> 16, request_entry_id & 0xffff })), true };
+            return .{ try resp.encodeBulkString(allocator, try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_id.timestamp, request_entry_id.sequence_number })), true };
         } else if (std.ascii.eqlIgnoreCase(command[0], "XRANGE")) {
             if (self.data.get(command[1])) |datum| {
                 switch (datum.value) {
@@ -280,14 +298,14 @@ pub const Instance = struct {
                         var start_index: usize = 0;
                         if (!std.mem.eql(u8, command[2], "-")) {
                             const request_entry_id = try parseStreamEntryId(command[2]);
-                            while (request_entry_id > stream_keys[start_index] and start_index < stream_keys.len) : (start_index += 1) {}
+                            while (!request_entry_id.isLessThanOrEqual(stream_keys[start_index]) and start_index < stream_keys.len) : (start_index += 1) {}
                         }
 
                         var end_index = stream_keys.len - 1;
 
                         if (!std.mem.eql(u8, command[3], "+")) {
                             const request_entry_id = try parseStreamEntryId(command[3]);
-                            while (request_entry_id < stream_keys[end_index] and end_index > 0) : (end_index -= 1) {}
+                            while (request_entry_id.isLessThanOrEqual(stream_keys[end_index]) and request_entry_id != stream_keys[end_index] and end_index > 0) : (end_index -= 1) {}
                         }
 
                         if (end_index < start_index) {
@@ -307,7 +325,7 @@ pub const Instance = struct {
                             }
 
                             var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
-                            tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ stream_keys[index] >> 16, stream_keys[index] & 0xffff }));
+                            tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ stream_keys[index].timestamp, stream_keys[index].sequence_number }));
                             tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
                             try response.append(resp.Array(tmp_array));
                         }
@@ -321,7 +339,7 @@ pub const Instance = struct {
             } else return .{ try resp.encodeBulkString(allocator, null), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "XREAD")) {
             var i: usize = 2;
-            while ((parseStreamEntryId(command[i]) catch ~@as(u64, 0)) == ~@as(u64, 0)) : (i += 1) {}
+            while ((parseStreamEntryId(command[i]) catch StreamEntryID{}) == StreamEntryID{}) : (i += 1) {}
 
             const offset = i - 2;
             i = 2;
@@ -343,7 +361,7 @@ pub const Instance = struct {
 
                             const request_entry_id = try parseStreamEntryId(command[i + offset]);
                             var start_index: usize = 0;
-                            while (request_entry_id >= stream_keys[start_index] and start_index < stream_keys.len) : (start_index += 1) {}
+                            while ((!request_entry_id.isLessThanOrEqual(stream_keys[start_index]) or request_entry_id == stream_keys[start_index]) and start_index < stream_keys.len) : (start_index += 1) {}
 
                             for (start_index..stream_keys.len) |index| {
                                 var entry_entries_it = stream.get(stream_keys[index]).?.iterator();
@@ -354,7 +372,7 @@ pub const Instance = struct {
                                 }
 
                                 var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
-                                tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ stream_keys[index] >> 16, stream_keys[index] & 0xffff }));
+                                tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ stream_keys[index].timestamp, stream_keys[index].sequence_number }));
                                 tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
                                 try stream_entries.append(resp.Array(tmp_array));
                             }
