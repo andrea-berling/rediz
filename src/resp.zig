@@ -132,7 +132,7 @@ pub inline fn encodeSimpleString(allocator: std.mem.Allocator, string: []const u
 }
 
 pub inline fn encodeSimpleError(allocator: std.mem.Allocator, msg: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(allocator, "-{s}\r\n", .{msg});
+    return try std.fmt.allocPrint(allocator, "-ERR {s}\r\n", .{msg});
 }
 
 pub fn encodeMessage(allocator: std.mem.Allocator, array: []const []const u8) ![]u8 {

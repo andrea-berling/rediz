@@ -234,7 +234,7 @@ pub const Instance = struct {
             // TODO: proper error handling
             var request_entry_seq = maybe_request_entry_seq.?;
             if (request_entry_timestamp == 0 and request_entry_seq == 0)
-                return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD must be greater than 0-0"), false };
+                return .{ try resp.encodeSimpleError(allocator, "The ID specified in XADD must be greater than 0-0"), false };
 
             const stream_datum = try self.data.getOrPut(try self.dupe(command[1]));
             if (!stream_datum.found_existing) { // all blank, no readblocks
@@ -252,7 +252,7 @@ pub const Instance = struct {
                 if (request_entry_timestamp == ~@as(i64, 0)) {
                     request_entry_timestamp = std.time.milliTimestamp();
                 } else if (request_entry_timestamp < latest_entry_timestamp) {
-                    return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD is equal or smaller than the target stream top item"), false };
+                    return .{ try resp.encodeSimpleError(allocator, "The ID specified in XADD is equal or smaller than the target stream top item"), false };
                 }
                 const entry_keys = try stream.getOrPut(request_entry_timestamp);
                 if (!entry_keys.found_existing) {
@@ -266,7 +266,7 @@ pub const Instance = struct {
                     if (request_entry_seq == ~@as(u16, 0)) {
                         request_entry_seq = latest_seq + 1;
                     } else if (request_entry_seq <= latest_seq) {
-                        return .{ try resp.encodeSimpleError(allocator, "ERR The ID specified in XADD is equal or smaller than the target stream top item"), false };
+                        return .{ try resp.encodeSimpleError(allocator, "The ID specified in XADD is equal or smaller than the target stream top item"), false };
                     }
                 }
             }
