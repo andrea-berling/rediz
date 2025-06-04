@@ -319,6 +319,55 @@ pub const Instance = struct {
                     },
                 }
             } else return .{ try resp.encodeBulkString(allocator, null), false };
+        } else if (std.ascii.eqlIgnoreCase(command[0], "XREAD")) {
+            var i: usize = 2;
+            while ((parseStreamEntryId(command[i]) catch ~@as(u64, 0)) == ~@as(u64, 0)) : (i += 1) {}
+
+            const offset = i - 2;
+            i = 2;
+
+            var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
+            defer temp_allocator.deinit();
+
+            var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+            while (i + offset < command.len) : (i += 1) {
+                if (self.data.get(command[i])) |datum| {
+                    switch (datum.value) {
+                        .stream => |stream| {
+                            var new_response_entry = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+                            try new_response_entry.append(resp.BulkString(command[i]));
+
+                            var stream_entries = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+
+                            const stream_keys = stream.keys();
+
+                            const request_entry_id = try parseStreamEntryId(command[i + offset]);
+                            var start_index: usize = 0;
+                            while (request_entry_id >= stream_keys[start_index] and start_index < stream_keys.len) : (start_index += 1) {}
+
+                            for (start_index..stream_keys.len) |index| {
+                                var entry_entries_it = stream.get(stream_keys[index]).?.iterator();
+                                var entry_elements = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+                                while (entry_entries_it.next()) |keyval_pair| {
+                                    try entry_elements.append(resp.BulkString(keyval_pair.key_ptr.*));
+                                    try entry_elements.append(resp.BulkString(keyval_pair.value_ptr.*));
+                                }
+
+                                var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
+                                tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ stream_keys[index] >> 16, stream_keys[index] & 0xffff }));
+                                tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
+                                try stream_entries.append(resp.Array(tmp_array));
+                            }
+                            try new_response_entry.append(resp.Array(try stream_entries.toOwnedSlice()));
+                            try response.append(resp.Array(try new_response_entry.toOwnedSlice()));
+                        },
+                        else => {
+                            return .{ try resp.encodeBulkString(allocator, null), false };
+                        },
+                    }
+                } else return .{ try resp.encodeBulkString(allocator, null), false };
+            }
+            return .{ try resp.encodeArray(allocator, try response.toOwnedSlice()), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "CONFIG")) {
             if (std.ascii.eqlIgnoreCase(command[1], "GET")) {
                 if (self.config.get(command[2])) |data| {
