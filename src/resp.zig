@@ -32,6 +32,14 @@ pub const Value = union(ValueType) {
     }
 };
 
+pub inline fn BulkString(string: []const u8) Value {
+    return Value{ .bulk_string = string };
+}
+
+pub inline fn Array(array: []const Value) Value {
+    return Value{ .array = array };
+}
+
 const MAX_DECIMAL_LEN = 10;
 
 pub fn parseDecimal(bytes: []u8) !struct { u64, usize } {
@@ -139,7 +147,7 @@ pub fn encodeMessage(allocator: std.mem.Allocator, array: []const []const u8) ![
     var message_elements = std.ArrayList(Value).init(allocator);
     defer message_elements.deinit();
     for (array) |part| {
-        try message_elements.append(Value{ .bulk_string = part });
+        try message_elements.append(BulkString(part));
     }
     return try encodeArray(allocator, try message_elements.toOwnedSlice());
 }

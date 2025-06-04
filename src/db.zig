@@ -7,13 +7,7 @@ const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
 const ValueType = enum { string, stream };
 
-// Stream ID -> entry ID (timestamp) -> seq1 -> key, value pairs
-//                                   -> seq2 -> key, value pairs
-//                                   -> seq3 -> key, value pairs
-//           -> entry ID (timestamp) -> seq1 -> key, value pairs
-//                                   -> seq2 -> key, value pairs
-//                                   -> seq3 -> key, value pairs
-const Stream = std.AutoArrayHashMap(i64, std.AutoArrayHashMap(u16, std.StringHashMap([]u8)));
+const Stream = std.AutoArrayHashMap(u64, std.StringHashMap([]u8));
 
 pub const Value = union(ValueType) { string: []u8, stream: Stream };
 
@@ -22,16 +16,16 @@ pub const Datum = struct {
     expire_at_ms: ?i64,
 };
 
-fn parseStreamEntryId(string: []const u8) !struct { i64, ?u16 } {
+fn parseStreamEntryId(string: []const u8) !u64 {
     if (std.mem.eql(u8, string, "*"))
-        return .{ ~@as(i64, 0), ~@as(u16, 0) };
+        return ~@as(u64, 0);
     const separator_pos = std.mem.indexOf(u8, string, "-") orelse string.len;
-    const timestamp: i64 = try std.fmt.parseInt(i64, string[0..separator_pos], 10);
+    const timestamp: u48 = try std.fmt.parseInt(u48, string[0..separator_pos], 10);
     if (separator_pos == string.len) {
-        return .{ timestamp, null };
+        return @as(u64, timestamp) << 16;
     }
     const sequence_number: u16 = if (std.mem.eql(u8, string[separator_pos + 1 ..], "*")) 0xffff else try std.fmt.parseInt(u16, string[separator_pos + 1 ..], 10);
-    return .{ timestamp, sequence_number };
+    return (@as(u64, timestamp) << 16) | sequence_number;
 }
 
 pub const Instance = struct {
@@ -230,148 +224,94 @@ pub const Instance = struct {
                 return .{ try resp.encodeMessage(allocator, keys), false };
             } else return .{ try resp.encodeBulkString(allocator, null), false };
         } else if (std.ascii.eqlIgnoreCase(command[0], "XADD")) {
-            var request_entry_timestamp, const maybe_request_entry_seq = try parseStreamEntryId(command[2]);
+            var request_entry_id = try parseStreamEntryId(command[2]);
             // TODO: proper error handling
-            var request_entry_seq = maybe_request_entry_seq.?;
-            if (request_entry_timestamp == 0 and request_entry_seq == 0)
+            if (request_entry_id == 0)
                 return .{ try resp.encodeSimpleError(allocator, "The ID specified in XADD must be greater than 0-0"), false };
 
+            const should_generate_timestamp = request_entry_id == ~@as(u64, 0);
+            const should_generate_sequence_number = request_entry_id & 0xffff == 0xffff;
+
+            if (should_generate_timestamp)
+                request_entry_id = @as(u64, @bitCast(std.time.milliTimestamp())) << 16;
+
+            if (should_generate_sequence_number)
+                request_entry_id = (request_entry_id & ~@as(u64, 0xffff)) | (@as(u16, 1) - std.math.clamp(@as(u16, @truncate(request_entry_id >> 16)), 0, 1));
+
             const stream_datum = try self.data.getOrPut(try self.dupe(command[1]));
-            if (!stream_datum.found_existing) { // all blank, no readblocks
+            if (!stream_datum.found_existing) {
                 stream_datum.value_ptr.*.value.stream = Stream.init(self.arena_allocator.allocator());
-                var stream = &stream_datum.value_ptr.value.stream;
-                if (request_entry_timestamp == ~@as(i64, 0))
-                    request_entry_timestamp = std.time.milliTimestamp();
-                if (request_entry_seq == ~@as(u16, 0))
-                    request_entry_seq = @bitCast(@as(u16, 1) - std.math.clamp(@as(u16, @truncate(@as(u64, @bitCast(request_entry_timestamp)))), 0, 1)); // if 0, seq must be 1, otherwise can be 0
-                try stream.put(request_entry_timestamp, std.AutoArrayHashMap(u16, std.StringHashMap([]u8)).init(self.arena_allocator.allocator()));
-            } else { // stream exists,
-                const stream = &stream_datum.value_ptr.value.stream;
-                const keys_array = stream.keys();
-                const latest_entry_timestamp = keys_array[keys_array.len - 1];
-                if (request_entry_timestamp == ~@as(i64, 0)) {
-                    request_entry_timestamp = std.time.milliTimestamp();
-                } else if (request_entry_timestamp < latest_entry_timestamp) {
-                    return .{ try resp.encodeSimpleError(allocator, "The ID specified in XADD is equal or smaller than the target stream top item"), false };
+            }
+
+            var stream = &stream_datum.value_ptr.value.stream;
+            const stream_keys = stream.keys();
+
+            if (stream_keys.len > 0) {
+                const latest_entry_id = stream_keys[stream_keys.len - 1];
+
+                if (should_generate_sequence_number and latest_entry_id >> 16 == request_entry_id >> 16) {
+                    request_entry_id = latest_entry_id + 1;
                 }
-                const entry_keys = try stream.getOrPut(request_entry_timestamp);
-                if (!entry_keys.found_existing) {
-                    entry_keys.value_ptr.* = std.AutoArrayHashMap(u16, std.StringHashMap([]u8)).init(self.arena_allocator.allocator());
-                    if (request_entry_seq == ~@as(u16, 0)) {
-                        request_entry_seq = @bitCast(@as(u16, 1) - std.math.clamp(@as(u16, @truncate(@as(u64, @bitCast(request_entry_timestamp)))), 0, 1)); // if 0, seq must be 1, otherwise can be 0
-                    }
-                } else {
-                    const entry_keys_array = entry_keys.value_ptr.*.keys();
-                    const latest_seq = entry_keys_array[entry_keys_array.len - 1];
-                    if (request_entry_seq == ~@as(u16, 0)) {
-                        request_entry_seq = latest_seq + 1;
-                    } else if (request_entry_seq <= latest_seq) {
-                        return .{ try resp.encodeSimpleError(allocator, "The ID specified in XADD is equal or smaller than the target stream top item"), false };
-                    }
+
+                if (request_entry_id <= latest_entry_id) {
+                    return .{ try resp.encodeSimpleError(allocator, "The ID specified in XADD is equal or smaller than the target stream top item"), false };
                 }
             }
 
-            var stream = &self.data.getEntry(command[1]).?.value_ptr.value.stream;
-            var stream_entry = stream.getEntry(request_entry_timestamp);
+            var stream_entry = try stream.getOrPut(request_entry_id);
 
-            var new_key_value_pairs = std.StringHashMap([]u8).init(self.arena_allocator.allocator());
+            if (!stream_entry.found_existing) {
+                stream_entry.value_ptr.* = std.StringHashMap([]u8).init(self.arena_allocator.allocator());
+            }
+
             var i: usize = 3;
 
             while (i < command.len) : (i += 2) {
-                try new_key_value_pairs.put(try self.dupe(command[i]), try self.dupe(command[i + 1]));
+                try stream_entry.value_ptr.put(try self.dupe(command[i]), try self.dupe(command[i + 1]));
             }
-            try stream_entry.?.value_ptr.put(request_entry_seq, new_key_value_pairs);
 
-            return .{ try resp.encodeBulkString(allocator, try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_timestamp, request_entry_seq })), true };
+            return .{ try resp.encodeBulkString(allocator, try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_id >> 16, request_entry_id & 0xffff })), true };
         } else if (std.ascii.eqlIgnoreCase(command[0], "XRANGE")) {
             if (self.data.get(command[1])) |datum| {
                 switch (datum.value) {
                     .stream => |stream| {
-                        // TODO: please make an interator
                         const stream_keys = stream.keys();
-                        const n = stream_keys.len;
 
-                        const request_entry_timestamp_1, const maybe_request_entry_seq_1 = if (!std.mem.eql(u8, command[2], "-")) try parseStreamEntryId(command[2]) else blk: {
-                            const timestamp = stream_keys[0];
-                            const seq = stream.get(timestamp).?.keys()[0];
-                            break :blk .{ timestamp, seq };
-                        };
-                        const request_entry_timestamp_2, const maybe_request_entry_seq_2 = if (!std.mem.eql(u8, command[3], "+")) try parseStreamEntryId(command[3]) else blk: {
-                            const timestamp = stream_keys[n - 1];
-                            const seq_keys = stream.get(timestamp).?.keys();
-                            const seq = seq_keys[seq_keys.len - 1];
-                            break :blk .{ timestamp, seq };
-                        };
-                        if (request_entry_timestamp_2 < request_entry_timestamp_1) {
-                            @panic("Error: invalid range");
+                        var start_index: usize = 0;
+                        if (!std.mem.eql(u8, command[2], "-")) {
+                            const request_entry_id = try parseStreamEntryId(command[2]);
+                            while (request_entry_id > stream_keys[start_index] and start_index < stream_keys.len) : (start_index += 1) {}
                         }
-                        const request_entry_seq_1 = maybe_request_entry_seq_1 orelse 0;
-                        const request_entry_seq_2 = maybe_request_entry_seq_2 orelse 0;
 
-                        var first_timestamp_index: usize = 0;
-                        var last_timestamp_index: usize = 0;
-                        while (first_timestamp_index < n and last_timestamp_index < n) {
-                            const before = first_timestamp_index + last_timestamp_index;
-                            if (request_entry_timestamp_1 > stream_keys[first_timestamp_index])
-                                first_timestamp_index += 1;
-                            if (request_entry_timestamp_2 > stream_keys[last_timestamp_index])
-                                last_timestamp_index += 1;
-                            if (first_timestamp_index + last_timestamp_index == before) { // neither pointer moved, time to eject
-                                break;
-                            }
+                        var end_index = stream_keys.len - 1;
+
+                        if (!std.mem.eql(u8, command[3], "+")) {
+                            const request_entry_id = try parseStreamEntryId(command[3]);
+                            while (request_entry_id < stream_keys[end_index] and end_index > 0) : (end_index -= 1) {}
                         }
-                        const left_seq_keys = stream.get(stream_keys[first_timestamp_index]).?.keys();
-                        var first_seq_number_index: usize = 0;
-                        const first_timestamp = stream_keys[first_timestamp_index];
-                        if (first_timestamp == request_entry_timestamp_1)
-                            while (request_entry_seq_1 > left_seq_keys[first_seq_number_index]) : (first_seq_number_index += 1) {};
 
-                        const right_seq_keys = stream.get(stream_keys[last_timestamp_index]).?.keys();
-                        var last_seq_number_index = right_seq_keys.len - 1;
-                        const last_timestamp = stream_keys[last_timestamp_index];
-                        if (last_timestamp == request_entry_timestamp_2)
-                            while (request_entry_seq_2 < right_seq_keys[last_seq_number_index]) : (last_seq_number_index -= 1) {};
-                        const last_seq_number = right_seq_keys[last_seq_number_index];
-                        // TODO: Should I check that the stream contains the endpoints?
-                        // TODO: properly handle all actual cases (i = j, i and j at 0, i and j at n - 1, etc.)
+                        if (end_index < start_index) {
+                            return .{ try resp.encodeSimpleError(allocator, "Invalid range"), false };
+                        }
 
                         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
                         defer temp_allocator.deinit();
                         var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
 
-                        var current_timestamp_index = first_timestamp_index;
-                        var current_seq_number_index = first_seq_number_index;
+                        for (start_index..end_index + 1) |index| {
+                            var entry_entries_it = stream.get(stream_keys[index]).?.iterator();
+                            var entry_elements = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+                            while (entry_entries_it.next()) |keyval_pair| {
+                                try entry_elements.append(resp.BulkString(keyval_pair.key_ptr.*));
+                                try entry_elements.append(resp.BulkString(keyval_pair.value_ptr.*));
+                            }
 
-                        var current_timestamp = stream_keys[current_timestamp_index];
-                        var current_seq_number = stream.get(current_timestamp).?.keys()[current_seq_number_index];
-
-                        while (current_timestamp <= last_timestamp) {
-                            const entry = stream.get(current_timestamp).?;
-                            const entry_keys = entry.keys();
-                            while (current_seq_number_index < entry_keys.len and current_seq_number < last_seq_number) : (current_seq_number_index += 1) {
-                                var entry_elements = std.ArrayList(resp.Value).init(temp_allocator.allocator());
-                                current_seq_number = entry_keys[current_seq_number_index];
-                                var entry_entries_it = entry.get(current_seq_number).?.iterator();
-                                while (entry_entries_it.next()) |keyval_pair| {
-                                    try entry_elements.append(resp.Value{ .bulk_string = keyval_pair.key_ptr.* });
-                                    try entry_elements.append(resp.Value{ .bulk_string = keyval_pair.value_ptr.* });
-                                }
-                                var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
-                                tmp_array[0] = resp.Value{ .bulk_string = try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ current_timestamp, current_seq_number }) };
-                                tmp_array[1] = resp.Value{ .array = try entry_elements.toOwnedSlice() };
-                                try response.append(resp.Value{ .array = tmp_array });
-                            }
-                            current_timestamp_index += 1;
-                            if (current_timestamp_index >= stream_keys.len) {
-                                break;
-                            }
-                            current_timestamp = stream_keys[current_timestamp_index];
-                            current_seq_number_index = 0;
-                            current_seq_number = stream.get(current_timestamp).?.keys()[current_seq_number_index];
-                            if (current_timestamp == last_timestamp and current_seq_number > last_seq_number) {
-                                break;
-                            }
+                            var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
+                            tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ stream_keys[index] >> 16, stream_keys[index] & 0xffff }));
+                            tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
+                            try response.append(resp.Array(tmp_array));
                         }
+
                         return .{ try resp.encodeArray(allocator, try response.toOwnedSlice()), false };
                     },
                     else => {
