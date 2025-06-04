@@ -300,8 +300,13 @@ pub fn main() !void {
                             continue :event_loop;
                         }
                         const reply, const propagate = instance.executeCommand(temp_allocator.allocator(), request) catch {
-                            // TODO: what if the command fails? Should I close the connection and kill the event? Notify the client?
-                            continue;
+                            // TODO: better error handling
+                            event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+                            const reply = try resp.encodeSimpleError(temp_allocator.allocator(), try std.fmt.allocPrint(temp_allocator.allocator(), "ERR unknown command '{s}'", .{request[0]}));
+                            event.buffer = resizeBuffer(event.buffer.?, reply.len);
+                            @memcpy(event.buffer.?, reply);
+                            try event_queue.addAsyncEvent(event, true);
+                            continue :event_loop;
                         };
 
                         if (instance.master == null and propagate)
