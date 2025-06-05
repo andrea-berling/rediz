@@ -1,6 +1,8 @@
 const std = @import("std");
 const eq = @import("event_queue.zig");
 const resp = @import("resp.zig");
+const cmd = @import("command.zig");
+const Command = cmd.Command;
 const db = @import("db.zig");
 const clap = @import("clap");
 
@@ -209,21 +211,23 @@ pub fn main() !void {
                 var requeue = true;
 
                 while (recv_return_value - n != 0) {
-                    const request, const bytes_parsed = resp.parseArray(temp_allocator.allocator(), buffer[n..]) catch |err| {
-                        std.debug.print("Error: {}\n", .{err});
-                        std.debug.print("Got: {x} (return value: {d})\n", .{ buffer, recv_return_value });
+                    const command, const bytes_parsed = Command.parse(buffer[n..], temp_allocator.allocator()) catch |err| {
+                        std.debug.print("Error while parsing command: {}\n", .{err});
+                        std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ buffer, recv_return_value });
+                        event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
+                        event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.encodeSimpleError(temp_allocator.allocator(), try cmd.errorToString(err))});
+                        event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+                        try event_queue.addAsyncEvent(event, true);
                         _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
-                        // TODO: be more gracious if the client sends invalid commands
-                        destroyEvent(event, allocator);
-                        continue;
+                        continue :event_loop;
                     };
 
                     // TODO: Why the weird logic? To make Codecrafters tests pass really
-                    if (std.ascii.eqlIgnoreCase(request[0], "WAIT") and !std.ascii.eqlIgnoreCase(request[1], "0") and instance.repl_offset > 0) {
+                    if (command == .wait and command.wait.num_replicas != 0 and instance.repl_offset > 0) {
                         requeue = false;
                         var count: usize = 0;
-                        const threshold = try std.fmt.parseInt(usize, request[1], 10);
-                        const timeout_ms = try std.fmt.parseInt(usize, request[2], 10);
+                        const num_replicas_threshold = command.wait.num_replicas;
+                        const timeout_ms = command.wait.timeout_ms;
 
                         const timeout_timestamp = std.time.milliTimestamp() + @as(i64, @bitCast(timeout_ms));
 
@@ -245,7 +249,7 @@ pub fn main() !void {
                         while (slaves_it.next()) |slave| {
                             if (slave.value_ptr.* >= instance.repl_offset) {
                                 count += 1;
-                                if (count >= threshold) {
+                                if (count >= num_replicas_threshold) {
                                     block = false;
                                     const response = try resp.encodeInteger(temp_allocator.allocator(), @bitCast(count));
                                     try replies.appendSlice(response);
@@ -271,7 +275,7 @@ pub fn main() !void {
                             pending_wait.timeout = timeout_timestamp;
                             pending_wait.client_event = event;
                             pending_wait.threshold_offset = instance.repl_offset;
-                            pending_wait.expected_n_replicas = threshold;
+                            pending_wait.expected_n_replicas = num_replicas_threshold;
                             pending_wait.actual_n_replicas = count;
 
                             try pending_waits.add(pending_wait);
@@ -291,38 +295,35 @@ pub fn main() !void {
                         if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
                             instance.repl_offset += bytes_parsed; // propagated command from master
                         }
-                        if (std.ascii.eqlIgnoreCase(request[0], "PSYNC")) {
-                            const reply, _ = try instance.executeCommand(temp_allocator.allocator(), request);
+                        if (command == .psync) {
+                            const reply = try instance.executeCommand(temp_allocator.allocator(), &command);
                             event.ty = .FULL_SYNC;
                             event.buffer = resizeBuffer(event.buffer.?, reply.len);
                             @memcpy(event.buffer.?, reply);
                             try event_queue.addAsyncEvent(event, true);
                             continue :event_loop;
                         }
-                        const reply, const propagate = instance.executeCommand(temp_allocator.allocator(), request) catch {
+                        const reply = instance.executeCommand(temp_allocator.allocator(), &command) catch {
                             // TODO: better error handling
                             event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-                            const reply = try resp.encodeSimpleError(temp_allocator.allocator(), try std.fmt.allocPrint(temp_allocator.allocator(), "unknown command '{s}'", .{request[0]}));
-                            event.buffer = resizeBuffer(event.buffer.?, reply.len);
-                            @memcpy(event.buffer.?, reply);
+                            event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
+                            event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.encodeSimpleError(temp_allocator.allocator(), "Some error occurred during command execution")});
                             try event_queue.addAsyncEvent(event, true);
                             continue :event_loop;
                         };
 
-                        if (instance.master == null and propagate)
+                        if (instance.master == null and command.shouldPropagate())
                             instance.repl_offset += bytes_parsed; // Updating the master's counter
 
                         if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
-                            if (std.ascii.eqlIgnoreCase(request[0], "REPLCONF") and
-                                std.ascii.eqlIgnoreCase(request[1], "GETACK"))
-                            {
+                            if (command == .replconf and command.replconf == .getack) {
                                 try replies.appendSlice(reply);
                             }
                         } else {
                             try replies.appendSlice(reply);
                         }
 
-                        if (propagate) {
+                        if (command.shouldPropagate()) {
                             var slaves_it = slaves.keyIterator();
                             while (slaves_it.next()) |slave| {
                                 var propagation_event = try allocator.create(eq.Event);
@@ -413,7 +414,7 @@ pub fn main() !void {
                     try slaves.put(event.fd, new_offset);
                 }
 
-                var new_pending_waits = std.PriorityQueue(*PendingWait, i32, compareWaits).init(allocator, 42);
+                var new_pending_waits = std.PriorityQueue(*PendingWait, void, compareWaits).init(allocator, undefined);
                 while (pending_waits.removeOrNull()) |pending_wait| {
                     if (pending_wait.threshold_offset > old_offset.? and pending_wait.threshold_offset <= new_offset) {
                         pending_wait.actual_n_replicas += 1;

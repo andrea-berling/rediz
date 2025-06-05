@@ -42,7 +42,7 @@ pub inline fn Array(array: []const Value) Value {
 
 const MAX_DECIMAL_LEN = 10;
 
-pub fn parseDecimal(bytes: []u8) !struct { u64, usize } {
+pub fn parseDecimal(bytes: []const u8) !struct { u64, usize } {
     var i: usize = 0;
     var return_value: u64 = 0;
 
@@ -70,7 +70,7 @@ pub fn parseSimpleString(allocator: std.mem.Allocator, bytes: []u8) !struct { []
     return .{ try return_value.toOwnedSlice(), i };
 }
 
-pub fn parseBulkString(allocator: std.mem.Allocator, bytes: []u8, cr_nl_terminated: bool) !struct { []u8, usize } {
+pub fn parseBulkString(allocator: std.mem.Allocator, bytes: []const u8, cr_nl_terminated: bool) !struct { []u8, usize } {
     if (bytes[0] != '$') return error.InvalidRESPBulkString;
     var i: usize = 1;
     const string_length, const bytes_parsed = try parseDecimal(bytes[i..]);
@@ -88,7 +88,7 @@ pub fn parseBulkString(allocator: std.mem.Allocator, bytes: []u8, cr_nl_terminat
     return .{ return_value, i };
 }
 
-pub fn parseArray(allocator: std.mem.Allocator, bytes: []u8) !struct { [][]u8, usize } {
+pub fn parseArray(allocator: std.mem.Allocator, bytes: []const u8) !struct { [][]u8, usize } {
     if (bytes[0] != '*') return error.InvalidRESPArray;
     var i: usize = 1;
     const n_elem, const bytes_parsed = try parseDecimal(bytes[i..]);
