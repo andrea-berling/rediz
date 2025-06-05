@@ -215,7 +215,7 @@ pub fn main() !void {
                         std.debug.print("Error while parsing command: {}\n", .{err});
                         std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ buffer, recv_return_value });
                         event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
-                        event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.encodeSimpleError(temp_allocator.allocator(), try cmd.errorToString(err))});
+                        event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator())});
                         event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
                         try event_queue.addAsyncEvent(event, true);
                         _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
@@ -251,8 +251,7 @@ pub fn main() !void {
                                 count += 1;
                                 if (count >= num_replicas_threshold) {
                                     block = false;
-                                    const response = try resp.encodeInteger(temp_allocator.allocator(), @bitCast(count));
-                                    try replies.appendSlice(response);
+                                    try replies.appendSlice(try resp.Integer(@bitCast(count)).encode(temp_allocator.allocator()));
                                     break;
                                 }
                             }
@@ -264,9 +263,8 @@ pub fn main() !void {
                                 send_get_ack_request_event.ty = eq.EVENT_TYPE.SEND_GETACK;
                                 send_get_ack_request_event.fd = slave.key_ptr.*;
                                 send_get_ack_request_event.buffer = try allocator.alloc(u8, GETACK_BUFFER_SIZE);
-                                const ack_request = try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "GETACK", "*" });
-                                send_get_ack_request_event.buffer = resizeBuffer(send_get_ack_request_event.buffer.?, ack_request.len);
-                                @memcpy(send_get_ack_request_event.buffer.?, ack_request);
+                                const ack_request = resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("GETACK"), resp.BulkString("*") });
+                                send_get_ack_request_event.buffer = try std.fmt.bufPrint(send_get_ack_request_event.buffer.?, "{s}", .{try ack_request.encode(temp_allocator.allocator())});
                                 send_get_ack_request_event.canary = null;
                                 try event_queue.addAsyncEvent(send_get_ack_request_event, true);
                             }
@@ -298,8 +296,9 @@ pub fn main() !void {
                         if (command == .psync) {
                             const reply = try instance.executeCommand(temp_allocator.allocator(), &command);
                             event.ty = .FULL_SYNC;
-                            event.buffer = resizeBuffer(event.buffer.?, reply.len);
-                            @memcpy(event.buffer.?, reply);
+                            event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
+                            event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
+
                             try event_queue.addAsyncEvent(event, true);
                             continue :event_loop;
                         }
@@ -307,7 +306,7 @@ pub fn main() !void {
                             // TODO: better error handling
                             event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
                             event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
-                            event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.encodeSimpleError(temp_allocator.allocator(), "Some error occurred during command execution")});
+                            event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator())});
                             try event_queue.addAsyncEvent(event, true);
                             continue :event_loop;
                         };
@@ -317,10 +316,10 @@ pub fn main() !void {
 
                         if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
                             if (command == .replconf and command.replconf == .getack) {
-                                try replies.appendSlice(reply);
+                                try replies.appendSlice(try reply.encode(temp_allocator.allocator()));
                             }
                         } else {
-                            try replies.appendSlice(reply);
+                            try replies.appendSlice(try reply.encode(temp_allocator.allocator()));
                         }
 
                         if (command.shouldPropagate()) {
@@ -401,13 +400,16 @@ pub fn main() !void {
                     continue;
                 }
 
-                const response, _ = resp.parseArray(temp_allocator.allocator(), event.buffer.?) catch {
+                const response, _ = resp.Value.parse(event.buffer.?, temp_allocator.allocator()) catch {
                     std.debug.print("{?x}\n", .{event.buffer});
                     std.debug.print("{?d}\n", .{event.async_result});
                     @panic("TODO");
                 };
 
-                const new_offset = try std.fmt.parseInt(usize, response[2], 10);
+                if (response != .array)
+                    @panic("TODO");
+
+                const new_offset = try std.fmt.parseInt(usize, response.array[2].bulk_string, 10);
 
                 const old_offset = slaves.get(event.fd);
                 if (old_offset.? < new_offset) {
@@ -419,9 +421,9 @@ pub fn main() !void {
                     if (pending_wait.threshold_offset > old_offset.? and pending_wait.threshold_offset <= new_offset) {
                         pending_wait.actual_n_replicas += 1;
                         if (pending_wait.actual_n_replicas >= pending_wait.expected_n_replicas) {
-                            const reply = try resp.encodeInteger(temp_allocator.allocator(), @bitCast(pending_wait.actual_n_replicas));
-                            pending_wait.client_event.buffer = resizeBuffer(pending_wait.client_event.buffer.?, reply.len);
-                            @memcpy(pending_wait.client_event.buffer.?, reply);
+                            const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
+                            pending_wait.client_event.buffer = resizeBuffer(pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
+                            pending_wait.client_event.buffer = try std.fmt.bufPrint(pending_wait.client_event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
                             pending_wait.client_event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
                             try event_queue.addAsyncEvent(pending_wait.client_event, true);
                             allocator.destroy(pending_wait);
@@ -456,9 +458,9 @@ pub fn main() !void {
                 if (maybe_index) |index| {
                     _ = pending_waits.removeIndex(index);
 
-                    const reply = try resp.encodeInteger(temp_allocator.allocator(), @bitCast(pending_wait.actual_n_replicas));
-                    pending_wait.client_event.buffer = resizeBuffer(pending_wait.client_event.buffer.?, reply.len);
-                    @memcpy(pending_wait.client_event.buffer.?, reply);
+                    const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
+                    pending_wait.client_event.buffer = resizeBuffer(pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
+                    pending_wait.client_event.buffer = try std.fmt.bufPrint(pending_wait.client_event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
                     pending_wait.client_event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
                     try event_queue.addAsyncEvent(pending_wait.client_event, true);
                 }

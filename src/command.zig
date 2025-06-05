@@ -41,8 +41,26 @@ pub const Command = union(enum) {
         return -1;
     }
 
+    /// Slices of u8 have the same lifetime as the input bytes, arrays are dynamically allocated
     pub fn parse(bytes: []const u8, allocator: std.mem.Allocator) (Error || std.mem.Allocator.Error)!struct { Command, usize } {
-        const array, const parsed_bytes = resp.parseArray(allocator, bytes) catch return Error.InvalidInput;
+        var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+        defer temp_allocator.deinit();
+
+        const value, const parsed_bytes = resp.Value.parse(bytes, temp_allocator.allocator()) catch return Error.InvalidInput;
+        if (value != .array) {
+            return Error.InvalidInput;
+        }
+
+        var array = try temp_allocator.allocator().alloc([]const u8, value.array.len);
+
+        for (0..value.array.len) |i| {
+            switch (value.array[i]) {
+                .null => array[i] = "-1"[0..],
+                .bulk_string => |string| array[i] = string,
+                else => return Error.InvalidInput,
+            }
+        }
+
         const k2idx = keywordToIndex;
         const command: Command = blk: switch (k2idx(array[0])) {
             k2idx("ping") => {
@@ -282,7 +300,7 @@ pub const InfoCommand = union(enum) {
 
 pub const ReplicaConfigCommand = union(enum) {
     getack,
-    capabilities: []const []u8,
+    capabilities: []const []const u8,
     listening_port: u16,
 };
 

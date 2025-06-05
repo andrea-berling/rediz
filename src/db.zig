@@ -105,6 +105,7 @@ pub const Instance = struct {
                 if (err != error.FileNotFound) {
                     @panic("Error opening dbfilename");
                 }
+                // TODO: Change this for actual logs
                 std.debug.print("File {s} not found\n", .{dbfilename});
             }
         }
@@ -129,17 +130,17 @@ pub const Instance = struct {
         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
         defer temp_allocator.deinit();
         var tcp_stream = try std.net.tcpConnectToHost(temp_allocator.allocator(), address, port);
-        _ = try tcp_stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{"PING"}));
+        _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{resp.BulkString("PING")}).encode(temp_allocator.allocator()));
         const buffer = try temp_allocator.allocator().alloc(u8, 1024);
         var n = try tcp_stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+PONG\r\n"));
-        _ = try tcp_stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "listening-port", self.config.get("listening-port").? }));
+        _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("listening-port"), resp.BulkString(self.config.get("listening-port").?) }).encode(temp_allocator.allocator()));
         n = try tcp_stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
-        _ = try tcp_stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "REPLCONF", "capa", "psync2" }));
+        _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("capa"), resp.BulkString("psync2") }).encode(temp_allocator.allocator()));
         n = try tcp_stream.read(buffer);
         std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
-        _ = try tcp_stream.write(try resp.encodeMessage(temp_allocator.allocator(), &[_][]const u8{ "PSYNC", "?", "-1" }));
+        _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{ resp.BulkString("PSYNC"), resp.BulkString("?"), resp.BulkString("-1") }).encode(temp_allocator.allocator()));
 
         var timeout = posix.timeval{
             .sec = 0,
@@ -162,17 +163,17 @@ pub const Instance = struct {
 
         try posix.setsockopt(tcp_stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, (@as([*]u8, @ptrCast(&timeout)))[0..@sizeOf(posix.timeval)]);
 
-        const fullsync, const fullsync_parsed_bytes = try resp.parseSimpleString(temp_allocator.allocator(), buffer); // FULLSYNC
-        var fullsync_it = std.mem.splitScalar(u8, fullsync, ' ');
+        const fullsync, const fullsync_parsed_bytes = try resp.Value.parse(buffer, temp_allocator.allocator()); // FULLSYNC
+        var fullsync_it = std.mem.splitScalar(u8, fullsync.simple_string, ' ');
         _ = fullsync_it.next();
         const replid = try self.dupe(fullsync_it.next().?);
-        _, const db_parsed_bytes = try resp.parseBulkString(temp_allocator.allocator(), buffer[fullsync_parsed_bytes..], false);
+        const db_parsed_bytes = try rdb.parseDump(buffer[fullsync_parsed_bytes..]);
         var parsed_bytes = fullsync_parsed_bytes + db_parsed_bytes;
         while (n > parsed_bytes) {
             const command, const command_bytes = try Command.parse(buffer[parsed_bytes..], temp_allocator.allocator());
             const reply = try self.executeCommand(temp_allocator.allocator(), &command);
             if (command == .replconf and command.replconf == .getack) {
-                _ = try tcp_stream.write(reply);
+                _ = try tcp_stream.write(try reply.encode(temp_allocator.allocator()));
             }
             parsed_bytes += command_bytes;
         }
@@ -186,20 +187,22 @@ pub const Instance = struct {
         allocator.destroy(self.arena_allocator);
     }
 
-    pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: *const Command) ![]u8 {
+    /// Arrays returned are dynamicall allocated and should be freed by the
+    /// called, strings should not, as they point to the given command
+    pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: *const Command) !resp.Value {
         switch (command.*) {
-            .ping => return try resp.encodeSimpleString(allocator, "PONG"[0..]),
-            .echo => |string| return try resp.encodeSimpleString(allocator, string),
+            .ping => return resp.SimpleString("PONG"),
+            .echo => |string| return resp.SimpleString(string),
             .get => |key| {
                 if (self.data.get(key)) |data| {
                     if (data.expire_at_ms) |expire_at_ms| {
                         if (expire_at_ms <= std.time.milliTimestamp()) {
                             _ = self.data.remove(key);
-                            return try resp.encodeBulkString(allocator, null);
+                            return resp.Null;
                         }
                     }
-                    return resp.encodeBulkString(allocator, data.value.string);
-                } else return resp.encodeBulkString(allocator, null);
+                    return resp.BulkString(data.value.string);
+                } else return resp.Null;
             },
             .set => |set_command| {
                 var datum: Datum = .{ .value = .{ .string = try self.dupe(set_command.value) } };
@@ -207,22 +210,22 @@ pub const Instance = struct {
                     datum.expire_at_ms = expiration;
                 }
                 try self.data.put(try self.dupe(set_command.key), datum);
-                return try resp.encodeSimpleString(allocator, "OK"[0..]);
+                return resp.Ok;
             },
             .keys => {
-                var keys = try allocator.alloc([]const u8, self.data.count());
+                var keys = try allocator.alloc(resp.Value, self.data.count());
 
                 var keys_iterator = self.data.keyIterator();
                 var i: usize = 0;
                 while (keys_iterator.next()) |key| : (i += 1) {
-                    keys[i] = key.*;
+                    keys[i] = resp.BulkString(key.*);
                 }
-                return try resp.encodeMessage(allocator, keys);
+                return resp.Array(keys);
             },
             .xadd => |stream_add_command| {
                 var request_entry_id = stream_add_command.entry_id;
                 if (request_entry_id.isZero())
-                    return resp.encodeSimpleError(allocator, "The ID specified in XADD must be greater than 0-0");
+                    return resp.SimpleError("The ID specified in XADD must be greater than 0-0");
 
                 const should_generate_sequence_number = request_entry_id.sequence_number == StreamEntryID.SEQUENCE_NUMBER_ANY;
                 const should_generate_timestamp = should_generate_sequence_number and request_entry_id.timestamp == StreamEntryID.TIMESTAMP_ANY;
@@ -249,7 +252,7 @@ pub const Instance = struct {
                     }
 
                     if (request_entry_id.isLessThanOrEqual(latest_entry_id)) {
-                        return try resp.encodeSimpleError(allocator, "The ID specified in XADD is equal or smaller than the target stream top item");
+                        return resp.SimpleError("The ID specified in XADD is equal or smaller than the target stream top item");
                     }
                 }
 
@@ -262,7 +265,7 @@ pub const Instance = struct {
                 for (stream_add_command.key_value_pairs) |pair|
                     try stream_entry.value_ptr.put(try self.dupe(pair.key), try self.dupe(pair.value));
 
-                return try resp.encodeBulkString(allocator, try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_id.timestamp, request_entry_id.sequence_number }));
+                return resp.BulkString(try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_id.timestamp, request_entry_id.sequence_number }));
             },
             .xrange => |stream_range_command| {
                 if (self.data.get(stream_range_command.stream_key)) |datum| {
@@ -280,7 +283,7 @@ pub const Instance = struct {
                                     break :blk i;
                                 },
                                 else => {
-                                    return try resp.encodeSimpleError(allocator, "Invalid start ID");
+                                    return resp.SimpleError("Invalid start ID");
                                 },
                             };
 
@@ -294,12 +297,12 @@ pub const Instance = struct {
                                     break :blk i;
                                 },
                                 else => {
-                                    return try resp.encodeSimpleError(allocator, "Invalid end ID");
+                                    return resp.SimpleError("Invalid end ID");
                                 },
                             };
 
                             if (end_index < start_index) {
-                                return resp.encodeSimpleError(allocator, "Invalid range");
+                                return resp.SimpleError("Invalid range");
                             }
 
                             var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
@@ -320,13 +323,13 @@ pub const Instance = struct {
                                 try response.append(resp.Array(tmp_array));
                             }
 
-                            return try resp.encodeArray(allocator, try response.toOwnedSlice());
+                            return resp.Array(try response.toOwnedSlice());
                         },
                         else => {
-                            return try resp.encodeBulkString(allocator, null);
+                            return resp.Null;
                         },
                     }
-                } else return resp.encodeBulkString(allocator, null);
+                } else return resp.Null;
             },
             .xread => |stream_read_requests| {
                 var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
@@ -365,23 +368,23 @@ pub const Instance = struct {
                                 try response.append(resp.Array(try new_response_entry.toOwnedSlice()));
                             },
                             else => {
-                                return try resp.encodeSimpleError(allocator, try std.fmt.allocPrint(temp_allocator.allocator(), "{s} does not denote a stream", .{stream_read_request.stream_key}));
+                                return resp.SimpleError(try std.fmt.allocPrint(temp_allocator.allocator(), "{s} does not denote a stream", .{stream_read_request.stream_key}));
                             },
                         }
-                    } else return try resp.encodeBulkString(allocator, null);
+                    } else return resp.Null;
                 }
-                return resp.encodeArray(allocator, try response.toOwnedSlice());
+                return resp.Array(try response.toOwnedSlice());
             },
             .config => |config_command| {
                 switch (config_command) {
                     .get => |option| {
                         if (self.config.get(option)) |data| {
-                            return try resp.encodeMessage(allocator, &[_][]const u8{ option, data });
-                        } else return try resp.encodeBulkString(allocator, null);
+                            return resp.Array(try allocator.dupe(resp.Value, &[_]resp.Value{ resp.BulkString(option), resp.BulkString(data) }));
+                        } else return resp.Null;
                     },
                     .set => |set_command| {
                         try self.config.put(try self.dupe(set_command.option), try self.dupe(set_command.value));
-                        return try resp.encodeSimpleString(allocator, "OK"[0..]);
+                        return resp.Ok;
                     },
                 }
             },
@@ -395,44 +398,42 @@ pub const Instance = struct {
                         try response.appendSlice(if (self.master) |_| "role:slave\n" else "role:master\n");
                         try std.fmt.format(response.writer(), "master_replid:{s}\n", .{self.replid});
                         try std.fmt.format(response.writer(), "master_repl_offset:{d}\n", .{self.repl_offset});
-                        return try resp.encodeBulkString(allocator, try response.toOwnedSlice());
+                        return resp.BulkString(try response.toOwnedSlice());
                     },
                 }
             },
             .replconf => |replica_config_command| {
                 switch (replica_config_command) {
                     .getack => {
-                        return try resp.encodeMessage(allocator, &[_][]const u8{ "REPLCONF", "ACK", try std.fmt.allocPrint(allocator, "{d}", .{self.repl_offset}) });
+                        return resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("ACK"), resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{self.repl_offset})) });
                     },
                     .capabilities => |capabilities| {
-                        std.debug.print("Slave advertised the following capabilities: {s}", .{capabilities});
-                        return try resp.encodeSimpleString(allocator, "OK"[0..]);
+                        std.debug.print("Slave advertised the following capabilities: {s}\n", .{capabilities});
+                        return resp.Ok;
                     },
                     .listening_port => |listening_port| {
-                        std.debug.print("Slave advertised this listening port: {d}", .{listening_port});
-                        return try resp.encodeSimpleString(allocator, "OK"[0..]);
+                        std.debug.print("Slave advertised this listening port: {d}\n", .{listening_port});
+                        return resp.Ok;
                     },
                 }
             },
             .psync => {
-                var response = std.ArrayList(u8).init(allocator);
-                try std.fmt.format(response.writer(), "FULLRESYNC {s} {d}", .{ self.replid, self.repl_offset });
-                return try resp.encodeSimpleString(allocator, try response.toOwnedSlice());
+                return resp.SimpleString(try std.fmt.allocPrint(allocator, "FULLRESYNC {s} {d}", .{ self.replid, self.repl_offset }));
             },
             .wait => {
-                return try resp.encodeInteger(allocator, self.n_slaves);
+                return resp.Integer(self.n_slaves);
             },
             .type => |key| {
                 if (self.data.get(key)) |data| {
                     switch (data.value) {
                         .string => {
-                            return try resp.encodeSimpleString(allocator, "string");
+                            return resp.SimpleString("string");
                         },
                         .stream => {
-                            return try resp.encodeSimpleString(allocator, "stream");
+                            return resp.SimpleString("stream");
                         },
                     }
-                } else return try resp.encodeSimpleString(allocator, "none");
+                } else return resp.SimpleString("none");
             },
         }
     }

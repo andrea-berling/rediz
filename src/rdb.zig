@@ -146,9 +146,42 @@ pub fn parseData(bytes: []const u8, alloc: Allocator) !struct { []KeyValuePair, 
     var offset = ("REDIS0011"[0..]).len;
     _, const metadata_parsed_btyes = try parseMetadataSection(bytes[offset..], alloc);
     offset += metadata_parsed_btyes;
-    const data, const data_parsed_bytes = try parseDatabaseSection(bytes[offset..], alloc);
-    offset += data_parsed_bytes;
-    return .{ data, offset };
+    var data = std.ArrayList(KeyValuePair).init(alloc);
+    if (@as(MarkerByte, @enumFromInt(bytes[offset])) == .DATABASE) {
+        const keyval_pairs, const data_parsed_bytes = try parseDatabaseSection(bytes[offset..], alloc);
+        defer alloc.free(keyval_pairs);
+        try data.appendSlice(keyval_pairs);
+        offset += data_parsed_bytes;
+    }
+    return .{ try data.toOwnedSlice(), offset };
+}
+
+// for now it just verifies the dump is valid, in the future we can also make a
+// nice struct with methods and such
+pub fn parseDump(bytes: []const u8) !usize {
+    if (bytes[0] != '$') return error.InvalidDump;
+
+    var i: usize = 1;
+    var dump_length: usize = 0;
+
+    while (i < bytes.len - 2 and std.ascii.isDigit(bytes[i])) : (i += 1) {
+        dump_length = dump_length * 10 + bytes[i] - '0';
+    }
+
+    if (!(bytes[i] == '\r' and bytes[i + 1] == '\n')) return error.InvalidDump;
+
+    i += 2;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    var temp_allocator = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer temp_allocator.deinit();
+    _, const parsed_bytes = try parseData(bytes[i..][0..dump_length], temp_allocator.allocator());
+    i += parsed_bytes;
+    if (@as(MarkerByte, @enumFromInt(bytes[i])) != .EOF or dump_length - parsed_bytes - 1 != 8)
+        return error.InvalidDump;
+
+    return i + 1 + 8;
 }
 
 test "parse ascii strings" {
