@@ -18,8 +18,8 @@ const GETACK_BUFFER_SIZE = 256;
 const IO_URING_ENTRIES = 100;
 const MASTER_CANARY = 0x1;
 
-inline fn resizeBuffer(buffer: []u8, new_size: usize) []u8 {
-    return (@as([*]u8, @ptrCast(buffer.ptr)))[0..new_size];
+inline fn resizeBuffer(buffer: *[]u8, new_size: usize) void {
+    buffer.* = (@as([*]u8, @ptrCast(buffer.ptr)))[0..new_size];
 }
 
 inline fn addReceiveCommandEvent(fd: linux.socket_t, buffer: []u8, event_queue: *eq.EventQueue, canary: ?u64, allocator: Allocator) !void {
@@ -214,7 +214,7 @@ pub fn main() !void {
                     const command, const bytes_parsed = Command.parse(buffer[n..], temp_allocator.allocator()) catch |err| {
                         std.debug.print("Error while parsing command: {}\n", .{err});
                         std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ buffer, recv_return_value });
-                        event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
+                        resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
                         event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator())});
                         event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
                         try event_queue.addAsyncEvent(event, true);
@@ -296,7 +296,7 @@ pub fn main() !void {
                         if (command == .psync) {
                             const reply = try instance.executeCommand(temp_allocator.allocator(), &command);
                             event.ty = .FULL_SYNC;
-                            event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
+                            resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
                             event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
 
                             try event_queue.addAsyncEvent(event, true);
@@ -305,7 +305,7 @@ pub fn main() !void {
                         const reply = instance.executeCommand(temp_allocator.allocator(), &command) catch {
                             // TODO: better error handling
                             event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-                            event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
+                            resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
                             event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator())});
                             try event_queue.addAsyncEvent(event, true);
                             continue :event_loop;
@@ -343,31 +343,28 @@ pub fn main() !void {
 
                 if (reply.len > 0) {
                     event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-                    event.buffer = resizeBuffer(event.buffer.?, reply.len);
+                    resizeBuffer(&event.buffer.?, reply.len);
                     @memcpy(event.buffer.?, reply);
                     try event_queue.addAsyncEvent(event, true);
                 } else if (requeue) {
-                    event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
+                    resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
                     event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
                     @memset(event.buffer.?, 0);
                     try event_queue.addAsyncEvent(event, true);
                 }
             },
             .FULL_SYNC => {
-                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
-                defer temp_allocator.deinit();
-                // TODO: not stricly correct, whatever
-                const tmp_buf = try temp_allocator.allocator().alloc(u8, CLIENT_BUFFER_SIZE);
-                const dump_size = try instance.dumpToBuffer(tmp_buf);
+                resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
+                const dump_size = try instance.dumpToBuffer(event.buffer.?);
+                const n_digits = if (dump_size == 0) 1 else std.math.log10_int(dump_size) + 1;
+                std.mem.copyBackwards(u8, event.buffer.?[1 + n_digits + 2 ..], event.buffer.?[0..dump_size]);
                 const preamble = try std.fmt.bufPrint(event.buffer.?, "${d}\r\n", .{dump_size});
-                event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
-                @memcpy(event.buffer.?[preamble.len..][0..dump_size], tmp_buf[0..dump_size]);
-                event.buffer = resizeBuffer(event.buffer.?, preamble.len + dump_size);
+                resizeBuffer(&event.buffer.?, preamble.len + dump_size);
                 event.ty = eq.EVENT_TYPE.SENT_DUMP;
                 try event_queue.addAsyncEvent(event, true);
             },
             .SENT_RESPONSE, .SENT_DUMP => {
-                event.buffer = resizeBuffer(event.buffer.?, CLIENT_BUFFER_SIZE);
+                resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
                 if (event.ty == .SENT_DUMP) {
                     try slaves.put(event.fd, 0);
                     instance.n_slaves += 1;
@@ -386,7 +383,7 @@ pub fn main() !void {
                 allocator.destroy(event);
             },
             .SEND_GETACK => {
-                event.buffer = resizeBuffer(event.buffer.?, GETACK_BUFFER_SIZE);
+                resizeBuffer(&event.buffer.?, GETACK_BUFFER_SIZE);
                 @memset(event.buffer.?, 0);
                 event.ty = .RECEIVED_ACK;
                 try event_queue.addAsyncEvent(event, true);
@@ -422,7 +419,7 @@ pub fn main() !void {
                         pending_wait.actual_n_replicas += 1;
                         if (pending_wait.actual_n_replicas >= pending_wait.expected_n_replicas) {
                             const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
-                            pending_wait.client_event.buffer = resizeBuffer(pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
+                            resizeBuffer(&pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
                             pending_wait.client_event.buffer = try std.fmt.bufPrint(pending_wait.client_event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
                             pending_wait.client_event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
                             try event_queue.addAsyncEvent(pending_wait.client_event, true);
@@ -459,7 +456,7 @@ pub fn main() !void {
                     _ = pending_waits.removeIndex(index);
 
                     const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
-                    pending_wait.client_event.buffer = resizeBuffer(pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
+                    resizeBuffer(&pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
                     pending_wait.client_event.buffer = try std.fmt.bufPrint(pending_wait.client_event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
                     pending_wait.client_event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
                     try event_queue.addAsyncEvent(pending_wait.client_event, true);
