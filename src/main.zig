@@ -2,9 +2,11 @@ const std = @import("std");
 const eq = @import("event_queue.zig");
 const resp = @import("resp.zig");
 const cmd = @import("command.zig");
+const fsm = @import("fsm.zig");
 const Command = cmd.Command;
 const db = @import("db.zig");
 const clap = @import("clap");
+const resizeBuffer = @import("util.zig").resizeBuffer;
 
 const net = std.net;
 const posix = std.posix;
@@ -13,14 +15,7 @@ const Allocator = std.mem.Allocator;
 
 const stdout = std.io.getStdOut().writer();
 
-const CLIENT_BUFFER_SIZE = 1024;
-const GETACK_BUFFER_SIZE = 256;
 const IO_URING_ENTRIES = 100;
-const MASTER_CANARY = 0x1;
-
-inline fn resizeBuffer(buffer: *[]u8, new_size: usize) void {
-    buffer.* = (@as([*]u8, @ptrCast(buffer.ptr)))[0..new_size];
-}
 
 inline fn addReceiveCommandEvent(fd: linux.socket_t, buffer: []u8, event_queue: *eq.EventQueue, canary: ?u64, allocator: Allocator) !void {
     var receive_command_event = try allocator.create(eq.Event);
@@ -40,20 +35,6 @@ fn destroyEvent(event: *eq.Event, allocator: Allocator) void {
     allocator.destroy(event);
 }
 
-// TODO: Move this somewhere more appropriate
-pub const PendingWait = struct {
-    timeout: i64,
-    client_event: *eq.Event,
-    threshold_offset: usize,
-    expected_n_replicas: usize,
-    actual_n_replicas: usize,
-};
-
-fn compareWaits(context: void, a: *PendingWait, b: *PendingWait) std.math.Order {
-    _ = context;
-    return std.math.order(a.timeout, b.timeout);
-}
-
 pub fn main() !void {
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -61,9 +42,13 @@ pub fn main() !void {
     try stdout.print("Logs from your program will appear here!\n", .{});
     std.debug.print("My PID is {}\n", .{linux.getpid()});
 
+    // INFO: Allocator set up
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
     var allocator = gpa.allocator();
+
+    // INFO: Config parsing
 
     var config = std.ArrayList(struct { []const u8, []const u8 }).init(allocator);
 
@@ -106,14 +91,11 @@ pub fn main() !void {
         try config.append(.{ "master", replicaof });
     }
 
+    // INFO: address binding and socket listening
+
     var listening_port = [_]u8{0} ** 5;
 
     try config.append(.{ "listening-port", try std.fmt.bufPrint(&listening_port, "{d}", .{res.args.port orelse 6379}) });
-
-    try config.append(.{
-        // TODO: Janky, to be fixed
-        "END", "",
-    });
 
     const port = res.args.port orelse 6379;
 
@@ -126,10 +108,7 @@ pub fn main() !void {
 
     std.debug.print("Listening on port {}...\n", .{port});
 
-    var event_queue = try eq.EventQueue.init(allocator, IO_URING_ENTRIES);
-    defer event_queue.destroy() catch {
-        @panic("Failed destroying the event queue");
-    };
+    // INFO: signalfd set up to catch signals (SIGINT & SIGTERM)
 
     var sigset = posix.empty_sigset;
     linux.sigaddset(&sigset, posix.SIG.TERM);
@@ -137,341 +116,469 @@ pub fn main() !void {
     posix.sigprocmask(posix.SIG.BLOCK, &sigset, null);
     const sfd = try posix.signalfd(-1, &sigset, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
     defer posix.close(sfd);
-    const termination_event: eq.Event = .{
-        .ty = eq.EVENT_TYPE.SIGTERM,
-        .fd = sfd,
-    };
-    try event_queue.addAsyncEvent(&termination_event, false);
 
-    const connection_event: eq.Event = .{
-        .ty = eq.EVENT_TYPE.CONNECTION,
-        .fd = listener.stream.handle,
-    };
-    try event_queue.addAsyncEvent(&connection_event, false);
+    // INFO: Server FSM setup
 
-    var instance = try db.Instance.init(allocator, config.allocatedSlice());
+    var global_data = fsm.GlobalData.init(allocator);
+    defer global_data.deinit();
+
+    var server_fsm = fsm.FSM{ .global_data = &global_data, .type = .{ .server = fsm.Server{
+        .socket = listener.stream.handle,
+        .state = .waiting,
+    } } };
+
+    const EventQueue = eq.EventQueue(fsm.FSM);
+    const Event = eq.Event(fsm.FSM);
+
+    // INFO: Event queue init
+
+    var event_queue = try EventQueue.init(allocator, IO_URING_ENTRIES);
+
+    defer event_queue.destroy() catch {
+        @panic("Failed destroying the event queue");
+    };
+
+    const new_connection_event = Event{ .type = .{ .accept = server_fsm.type.server.socket }, .user_data = &server_fsm };
+
+    const termination_event = Event{ .type = .{ .pollin = sfd }, .user_data = &server_fsm };
+
+    try event_queue.addAsyncEvent(termination_event);
+    try event_queue.addAsyncEvent(new_connection_event);
+
+    // INFO: DB init
+    const db_config = try config.toOwnedSlice();
+    var instance = try db.Instance.init(allocator, db_config);
     defer instance.destroy(allocator);
+    allocator.free(db_config);
+
+    var master_server_fsm: ?fsm.FSM = null;
 
     if (instance.master) |master_fd| {
-        try addReceiveCommandEvent(master_fd, try allocator.alloc(u8, CLIENT_BUFFER_SIZE), &event_queue, MASTER_CANARY, allocator);
+        const new_buffer = try allocator.alloc(u8, fsm.CLIENT_BUFFER_SIZE);
+        master_server_fsm = fsm.FSM{ .global_data = &global_data, .type = .{ .connection = .{
+            .fd = master_fd,
+            .buffer = new_buffer,
+            .peer_type = .MASTER,
+            .state = .waiting_for_command,
+            .allocator = allocator,
+        } } };
+        const command_received_event = Event{
+            .type = .{ .recv = .{ .fd = master_fd, .buffer = new_buffer } },
+            .user_data = &master_server_fsm.?,
+        };
+        try event_queue.addAsyncEvent(command_received_event);
     }
-
-    config.deinit();
-
-    var slaves = std.AutoHashMap(posix.socket_t, usize).init(allocator);
-    defer slaves.deinit();
-
-    var pending_waits = std.PriorityQueue(*PendingWait, void, compareWaits).init(allocator, undefined);
-    defer pending_waits.deinit();
 
     event_loop: while (true) {
         try stdout.print("Waiting for something to come through...\n", .{});
-        const event = try event_queue.next();
-        try stdout.print("Event fd/type/ptr: {} {} {*}\n", .{ event.fd, event.ty, event });
-        switch (event.ty) {
-            .CONNECTION => {
-                const connection_socket = event.async_result.?;
+        const completed_event = try event_queue.next();
+        const event_fsm: *fsm.FSM = completed_event.awaited_event.user_data;
+        try stdout.print("New event: {any}\n", .{completed_event});
+        switch (completed_event.awaited_event.type) {
+            .accept => {
+                if (event_fsm.type != .server) {
+                    @panic("Something is very wrong");
+                }
+                const connection_socket: posix.socket_t = completed_event.async_result;
                 try stdout.print("accepted new connection\n", .{});
-                try addReceiveCommandEvent(connection_socket, try allocator.alloc(u8, CLIENT_BUFFER_SIZE), &event_queue, null, allocator);
-                try event_queue.addAsyncEvent(&connection_event, false);
-            },
-            .RECEIVE_COMMAND => {
-                const buffer = event.buffer.?;
-                const return_value = event.async_result.?;
+                var new_connection_fsm = try allocator.create(fsm.FSM);
+                new_connection_fsm.type = .{ .connection = try fsm.Connection.init(allocator, connection_socket) };
+                new_connection_fsm.global_data = &global_data;
 
-                if (return_value == 0) { // Connection closed
-                    _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
-                    // TODO: Make optional so the codecrafters test can pass
-                    // if (instance.master) |master_fd| {
-                    //     if (event.fd == master_fd) {
-                    //         std.debug.print("Master died, shutting down...\n", .{});
-                    //         destroyEvent(event, allocator);
-                    //         break;
-                    //     }
-                    // }
-                    destroyEvent(event, allocator);
-                    continue;
-                }
-
-                if (return_value < 0) {
-                    std.debug.print("Error: {} {d}\n", .{ linux.E.init(@intCast(@as(u32, @bitCast(return_value)))), return_value });
-                    _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
-                    destroyEvent(event, allocator);
-                    continue;
-                }
-
-                const recv_return_value = @as(usize, @intCast(@as(u32, @bitCast(return_value))));
-
-                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
-                defer temp_allocator.deinit();
-
-                var replies = std.ArrayList(u8).init(temp_allocator.allocator());
-
-                var n: usize = 0;
-                var requeue = true;
-
-                while (recv_return_value - n != 0) {
-                    const command, const bytes_parsed = Command.parse(buffer[n..], temp_allocator.allocator()) catch |err| {
-                        std.debug.print("Error while parsing command: {}\n", .{err});
-                        std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ buffer, recv_return_value });
-                        resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
-                        event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator())});
-                        event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-                        try event_queue.addAsyncEvent(event, true);
-                        _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
-                        continue :event_loop;
-                    };
-
-                    // TODO: Why the weird logic? To make Codecrafters tests pass really
-                    if (command == .wait and command.wait.num_replicas != 0 and instance.repl_offset > 0) {
-                        requeue = false;
-                        var count: usize = 0;
-                        const num_replicas_threshold = command.wait.num_replicas;
-                        const timeout_ms = command.wait.timeout_ms;
-
-                        const timeout_timestamp = std.time.milliTimestamp() + @as(i64, @bitCast(timeout_ms));
-
-                        const timeout_fd = try posix.timerfd_create(posix.timerfd_clockid_t.REALTIME, linux.TFD{});
-
-                        const time_to_wait = @as(isize, @bitCast(timeout_ms)) * 1_000_000;
-                        const timeout = linux.itimerspec{
-                            .it_interval = linux.timespec{
-                                .sec = 0,
-                                .nsec = 0,
-                            },
-                            .it_value = linux.timespec{ .sec = @divFloor(time_to_wait, 1_000_000_000), .nsec = @rem(time_to_wait, 1_000_000_000) },
-                        };
-
-                        try posix.timerfd_settime(timeout_fd, linux.TFD.TIMER{}, &timeout, null);
-
-                        var slaves_it = slaves.iterator();
-                        var block = true;
-                        while (slaves_it.next()) |slave| {
-                            if (slave.value_ptr.* >= instance.repl_offset) {
-                                count += 1;
-                                if (count >= num_replicas_threshold) {
-                                    block = false;
-                                    try replies.appendSlice(try resp.Integer(@bitCast(count)).encode(temp_allocator.allocator()));
-                                    break;
-                                }
-                            }
-                        }
-                        slaves_it = slaves.iterator();
-                        if (block) {
-                            while (slaves_it.next()) |slave| {
-                                var send_get_ack_request_event = try allocator.create(eq.Event);
-                                send_get_ack_request_event.ty = eq.EVENT_TYPE.SEND_GETACK;
-                                send_get_ack_request_event.fd = slave.key_ptr.*;
-                                send_get_ack_request_event.buffer = try allocator.alloc(u8, GETACK_BUFFER_SIZE);
-                                const ack_request = resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("GETACK"), resp.BulkString("*") });
-                                send_get_ack_request_event.buffer = try std.fmt.bufPrint(send_get_ack_request_event.buffer.?, "{s}", .{try ack_request.encode(temp_allocator.allocator())});
-                                send_get_ack_request_event.canary = null;
-                                try event_queue.addAsyncEvent(send_get_ack_request_event, true);
-                            }
-
-                            const pending_wait = try allocator.create(PendingWait);
-                            pending_wait.timeout = timeout_timestamp;
-                            pending_wait.client_event = event;
-                            pending_wait.threshold_offset = instance.repl_offset;
-                            pending_wait.expected_n_replicas = num_replicas_threshold;
-                            pending_wait.actual_n_replicas = count;
-
-                            try pending_waits.add(pending_wait);
-
-                            var timeout_event = try allocator.create(eq.Event);
-                            timeout_event.ty = eq.EVENT_TYPE.TIMEOUT;
-                            timeout_event.fd = timeout_fd;
-                            // Using the client buffer instead of allocating a
-                            // new one. Should not be destroyed in case of
-                            // timeout
-                            timeout_event.buffer = event.buffer;
-                            timeout_event.canary = null;
-                            timeout_event.pending_wait = pending_wait;
-                            try event_queue.addAsyncEvent(timeout_event, true);
-                        }
-                    } else {
-                        if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
-                            instance.repl_offset += bytes_parsed; // propagated command from master
-                        }
-                        if (command == .psync) {
-                            const reply = try instance.executeCommand(temp_allocator.allocator(), &command);
-                            event.ty = .FULL_SYNC;
-                            resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
-                            event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
-
-                            try event_queue.addAsyncEvent(event, true);
-                            continue :event_loop;
-                        }
-                        const reply = instance.executeCommand(temp_allocator.allocator(), &command) catch {
-                            // TODO: better error handling
-                            event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-                            resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
-                            event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator())});
-                            try event_queue.addAsyncEvent(event, true);
-                            continue :event_loop;
-                        };
-
-                        if (instance.master == null and command.shouldPropagate())
-                            instance.repl_offset += bytes_parsed; // Updating the master's counter
-
-                        if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
-                            if (command == .replconf and command.replconf == .getack) {
-                                try replies.appendSlice(try reply.encode(temp_allocator.allocator()));
-                            }
-                        } else {
-                            try replies.appendSlice(try reply.encode(temp_allocator.allocator()));
-                        }
-
-                        if (command.shouldPropagate()) {
-                            var slaves_it = slaves.keyIterator();
-                            while (slaves_it.next()) |slave| {
-                                var propagation_event = try allocator.create(eq.Event);
-                                propagation_event.ty = eq.EVENT_TYPE.PROPAGATE_COMMAND;
-                                propagation_event.fd = slave.*;
-                                propagation_event.buffer = try allocator.alloc(u8, n + bytes_parsed);
-                                propagation_event.canary = null;
-                                @memcpy(propagation_event.buffer.?, buffer[n..][0..bytes_parsed]);
-                                try event_queue.addAsyncEvent(propagation_event, true);
-                            }
-                        }
-                    }
-
-                    n += bytes_parsed;
-                }
-
-                const reply = try replies.toOwnedSlice();
-
-                if (reply.len > 0) {
-                    event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-                    resizeBuffer(&event.buffer.?, reply.len);
-                    @memcpy(event.buffer.?, reply);
-                    try event_queue.addAsyncEvent(event, true);
-                } else if (requeue) {
-                    resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
-                    event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
-                    @memset(event.buffer.?, 0);
-                    try event_queue.addAsyncEvent(event, true);
-                }
-            },
-            .FULL_SYNC => {
-                resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
-                const dump_size = try instance.dumpToBuffer(event.buffer.?);
-                const n_digits = if (dump_size == 0) 1 else std.math.log10_int(dump_size) + 1;
-                std.mem.copyBackwards(u8, event.buffer.?[1 + n_digits + 2 ..], event.buffer.?[0..dump_size]);
-                const preamble = try std.fmt.bufPrint(event.buffer.?, "${d}\r\n", .{dump_size});
-                resizeBuffer(&event.buffer.?, preamble.len + dump_size);
-                event.ty = eq.EVENT_TYPE.SENT_DUMP;
-                try event_queue.addAsyncEvent(event, true);
-            },
-            .SENT_RESPONSE, .SENT_DUMP => {
-                resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
-                if (event.ty == .SENT_DUMP) {
-                    try slaves.put(event.fd, 0);
-                    instance.n_slaves += 1;
-                    if (event.buffer) |buffer| {
-                        allocator.free(buffer);
-                    }
-                    allocator.destroy(event);
-                    continue;
-                }
-                event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
-                @memset(event.buffer.?, 0);
-                try event_queue.addAsyncEvent(event, true);
-            },
-            .PROPAGATE_COMMAND => {
-                allocator.free(event.buffer.?);
-                allocator.destroy(event);
-            },
-            .SEND_GETACK => {
-                resizeBuffer(&event.buffer.?, GETACK_BUFFER_SIZE);
-                @memset(event.buffer.?, 0);
-                event.ty = .RECEIVED_ACK;
-                try event_queue.addAsyncEvent(event, true);
-            },
-            .RECEIVED_ACK => {
-                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
-                defer temp_allocator.deinit();
-
-                if (event.async_result.? == 0) {
-                    //destroyEvent(event, allocator);
-                    continue;
-                }
-
-                const response, _ = resp.Value.parse(event.buffer.?, temp_allocator.allocator()) catch {
-                    std.debug.print("{?x}\n", .{event.buffer});
-                    std.debug.print("{?d}\n", .{event.async_result});
-                    @panic("TODO");
+                const new_command_event = Event{
+                    .type = .{ .recv = .{ .fd = new_connection_fsm.type.connection.fd, .buffer = new_connection_fsm.type.connection.buffer } },
+                    .user_data = new_connection_fsm,
                 };
 
-                if (response != .array)
-                    @panic("TODO");
-
-                const new_offset = try std.fmt.parseInt(usize, response.array[2].bulk_string, 10);
-
-                const old_offset = slaves.get(event.fd);
-                if (old_offset.? < new_offset) {
-                    try slaves.put(event.fd, new_offset);
-                }
-
-                var new_pending_waits = std.PriorityQueue(*PendingWait, void, compareWaits).init(allocator, undefined);
-                while (pending_waits.removeOrNull()) |pending_wait| {
-                    if (pending_wait.threshold_offset > old_offset.? and pending_wait.threshold_offset <= new_offset) {
-                        pending_wait.actual_n_replicas += 1;
-                        if (pending_wait.actual_n_replicas >= pending_wait.expected_n_replicas) {
-                            const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
-                            resizeBuffer(&pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
-                            pending_wait.client_event.buffer = try std.fmt.bufPrint(pending_wait.client_event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
-                            pending_wait.client_event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-                            try event_queue.addAsyncEvent(pending_wait.client_event, true);
-                            allocator.destroy(pending_wait);
-                        } else {
-                            try new_pending_waits.add(pending_wait);
+                try event_queue.addAsyncEvent(new_command_event);
+                try event_queue.addAsyncEvent(new_connection_event);
+            },
+            .recv => {
+                switch (event_fsm.type) {
+                    .server => @panic("Not ready yet"),
+                    .connection => |*connection_fsm| {
+                        if (connection_fsm.state != .waiting_for_command)
+                            @panic("Not ready yet");
+                        if (completed_event.async_result == 0) { // connection closed
+                            // TODO: remove slave from global data
+                            connection_fsm.deinit();
+                            allocator.destroy(event_fsm);
+                            continue :event_loop;
                         }
-                    } else {
-                        try new_pending_waits.add(pending_wait);
-                    }
+
+                        var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+                        defer temp_allocator.deinit();
+
+                        const command, _ = Command.parse(connection_fsm.buffer, temp_allocator.allocator()) catch |err| {
+                            std.debug.print("Error while parsing command: {}\n", .{err});
+                            std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ connection_fsm.buffer, completed_event.async_result });
+                            resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
+                            connection_fsm.buffer = try std.fmt.bufPrint(connection_fsm.buffer, "{s}", .{try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator())});
+                            connection_fsm.state = .sending_response;
+                            const response_sent_event = Event{
+                                .type = .{ .send = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
+                                .user_data = event_fsm,
+                            };
+                            try event_queue.addAsyncEvent(response_sent_event);
+                            continue :event_loop;
+                        };
+
+                        const reply = instance.executeCommand(temp_allocator.allocator(), &command) catch {
+                            resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
+                            connection_fsm.buffer = try std.fmt.bufPrint(connection_fsm.buffer, "{s}", .{try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator())});
+                            connection_fsm.state = .sending_response;
+                            const response_sent_event = Event{
+                                .type = .{ .send = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
+                                .user_data = event_fsm,
+                            };
+                            try event_queue.addAsyncEvent(response_sent_event);
+                            continue :event_loop;
+                        };
+
+                        resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
+                        connection_fsm.buffer = try std.fmt.bufPrint(connection_fsm.buffer, "{s}", .{try reply.encode(temp_allocator.allocator())});
+                        connection_fsm.state = .sending_response;
+                        const response_sent_event = Event{
+                            .type = .{ .send = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
+                            .user_data = event_fsm,
+                        };
+                        try event_queue.addAsyncEvent(response_sent_event);
+                    },
                 }
-
-                pending_waits.deinit();
-                pending_waits = new_pending_waits;
-
-                allocator.destroy(event);
-                allocator.free(event.buffer.?);
             },
-            .TIMEOUT => {
-                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
-                defer temp_allocator.deinit();
+            .send => {
+                switch (event_fsm.type) {
+                    .server => @panic("Not ready yet"),
+                    .connection => |*connection_fsm| {
+                        if (connection_fsm.state != .sending_response)
+                            @panic("Invalid state transition");
+                        resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
+                        @memset(connection_fsm.buffer, 0);
+                        connection_fsm.state = .waiting_for_command;
+                        const new_command_event = Event{
+                            .type = .{ .recv = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
+                            .user_data = event_fsm,
+                        };
 
-                const pending_wait = event.pending_wait.?;
-                var pending_wait_it = pending_waits.iterator();
-                var maybe_index: ?usize = null;
-                var i: usize = 0;
-                while (pending_wait_it.next()) |pw| : (i += 1) {
-                    if (pw == event.pending_wait.?) {
-                        maybe_index = i;
-                        break;
-                    }
+                        try event_queue.addAsyncEvent(new_command_event);
+                    },
                 }
-                if (maybe_index) |index| {
-                    _ = pending_waits.removeIndex(index);
-
-                    const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
-                    resizeBuffer(&pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
-                    pending_wait.client_event.buffer = try std.fmt.bufPrint(pending_wait.client_event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
-                    pending_wait.client_event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
-                    try event_queue.addAsyncEvent(pending_wait.client_event, true);
-                }
-
-                allocator.destroy(pending_wait);
-                posix.close(event.fd); // the timerfd
-                // not destroying the event buffer because it's the client's
-                // event buffer (will be destroyed on client connection closed)
-                allocator.destroy(event);
             },
-            .SIGTERM => {
+            .pollin => {
+                if (event_fsm.type != .server)
+                    @panic("Wtf");
                 std.debug.print("Gracefully shutting down...\n", .{});
                 break;
             },
+            .read => {
+                @panic("Not now Jin Yiang");
+            },
+            // .send: EventWithBuffer,
+            // .recv: EventWithBuffer,
+            // .read: EventWithBuffer,
+            // .CONNECTION => {
+            //     const connection_socket = event.async_result.?;
+            //     try stdout.print("accepted new connection\n", .{});
+            //     try addReceiveCommandEvent(connection_socket, try allocator.alloc(u8, CLIENT_BUFFER_SIZE), &event_queue, null, allocator);
+            //     try event_queue.addAsyncEvent(&connection_event, false);
+            // },
+            // .RECEIVE_COMMAND => {
+            //     const buffer = event.buffer.?;
+            //     const return_value = event.async_result.?;
+            //
+            //     if (return_value == 0) { // Connection closed
+            //         _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
+            //         // TODO: Make optional so the codecrafters test can pass
+            //         // if (instance.master) |master_fd| {
+            //         //     if (event.fd == master_fd) {
+            //         //         std.debug.print("Master died, shutting down...\n", .{});
+            //         //         destroyEvent(event, allocator);
+            //         //         break;
+            //         //     }
+            //         // }
+            //         destroyEvent(event, allocator);
+            //         continue;
+            //     }
+            //
+            //     if (return_value < 0) {
+            //         std.debug.print("Error: {} {d}\n", .{ linux.E.init(@intCast(@as(u32, @bitCast(return_value)))), return_value });
+            //         _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
+            //         destroyEvent(event, allocator);
+            //         continue;
+            //     }
+            //
+            //     const recv_return_value = @as(usize, @intCast(@as(u32, @bitCast(return_value))));
+            //
+            //     var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+            //     defer temp_allocator.deinit();
+            //
+            //     var replies = std.ArrayList(u8).init(temp_allocator.allocator());
+            //
+            //     var n: usize = 0;
+            //     var requeue = true;
+            //
+            //     while (recv_return_value - n != 0) {
+            //         const command, const bytes_parsed = Command.parse(buffer[n..], temp_allocator.allocator()) catch |err| {
+            //             std.debug.print("Error while parsing command: {}\n", .{err});
+            //             std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ buffer, recv_return_value });
+            //             resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
+            //             event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator())});
+            //             event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+            //             try event_queue.addAsyncEvent(event, true);
+            //             _ = slaves.remove(event.fd); // Might be a slave, doesn't hurt if not
+            //             continue :event_loop;
+            //         };
+            //
+            //         // TODO: Why the weird logic? To make Codecrafters tests pass really
+            //         if (command == .wait and command.wait.num_replicas != 0 and instance.repl_offset > 0) {
+            //             requeue = false;
+            //             var count: usize = 0;
+            //             const num_replicas_threshold = command.wait.num_replicas;
+            //             const timeout_ms = command.wait.timeout_ms;
+            //
+            //             const timeout_timestamp = std.time.milliTimestamp() + @as(i64, @bitCast(timeout_ms));
+            //
+            //             const timeout_fd = try posix.timerfd_create(posix.timerfd_clockid_t.REALTIME, linux.TFD{});
+            //
+            //             const time_to_wait = @as(isize, @bitCast(timeout_ms)) * 1_000_000;
+            //             const timeout = linux.itimerspec{
+            //                 .it_interval = linux.timespec{
+            //                     .sec = 0,
+            //                     .nsec = 0,
+            //                 },
+            //                 .it_value = linux.timespec{ .sec = @divFloor(time_to_wait, 1_000_000_000), .nsec = @rem(time_to_wait, 1_000_000_000) },
+            //             };
+            //
+            //             try posix.timerfd_settime(timeout_fd, linux.TFD.TIMER{}, &timeout, null);
+            //
+            //             var slaves_it = slaves.iterator();
+            //             var block = true;
+            //             while (slaves_it.next()) |slave| {
+            //                 if (slave.value_ptr.* >= instance.repl_offset) {
+            //                     count += 1;
+            //                     if (count >= num_replicas_threshold) {
+            //                         block = false;
+            //                         try replies.appendSlice(try resp.Integer(@bitCast(count)).encode(temp_allocator.allocator()));
+            //                         break;
+            //                     }
+            //                 }
+            //             }
+            //             slaves_it = slaves.iterator();
+            //             if (block) {
+            //                 while (slaves_it.next()) |slave| {
+            //                     var send_get_ack_request_event = try allocator.create(eq.Event);
+            //                     send_get_ack_request_event.ty = eq.EVENT_TYPE.SEND_GETACK;
+            //                     send_get_ack_request_event.fd = slave.key_ptr.*;
+            //                     send_get_ack_request_event.buffer = try allocator.alloc(u8, GETACK_BUFFER_SIZE);
+            //                     const ack_request = resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("GETACK"), resp.BulkString("*") });
+            //                     send_get_ack_request_event.buffer = try std.fmt.bufPrint(send_get_ack_request_event.buffer.?, "{s}", .{try ack_request.encode(temp_allocator.allocator())});
+            //                     send_get_ack_request_event.canary = null;
+            //                     try event_queue.addAsyncEvent(send_get_ack_request_event, true);
+            //                 }
+            //
+            //                 const pending_wait = try allocator.create(PendingWait);
+            //                 pending_wait.timeout = timeout_timestamp;
+            //                 pending_wait.client_event = event;
+            //                 pending_wait.threshold_offset = instance.repl_offset;
+            //                 pending_wait.expected_n_replicas = num_replicas_threshold;
+            //                 pending_wait.actual_n_replicas = count;
+            //
+            //                 try pending_waits.add(pending_wait);
+            //
+            //                 var timeout_event = try allocator.create(eq.Event);
+            //                 timeout_event.ty = eq.EVENT_TYPE.TIMEOUT;
+            //                 timeout_event.fd = timeout_fd;
+            //                 // Using the client buffer instead of allocating a
+            //                 // new one. Should not be destroyed in case of
+            //                 // timeout
+            //                 timeout_event.buffer = event.buffer;
+            //                 timeout_event.canary = null;
+            //                 timeout_event.pending_wait = pending_wait;
+            //                 try event_queue.addAsyncEvent(timeout_event, true);
+            //             }
+            //         } else {
+            //             if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
+            //                 instance.repl_offset += bytes_parsed; // propagated command from master
+            //             }
+            //             if (command == .psync) {
+            //                 const reply = try instance.executeCommand(temp_allocator.allocator(), &command);
+            //                 event.ty = .FULL_SYNC;
+            //                 resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
+            //                 event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
+            //
+            //                 try event_queue.addAsyncEvent(event, true);
+            //                 continue :event_loop;
+            //             }
+            //             const reply = instance.executeCommand(temp_allocator.allocator(), &command) catch {
+            //                 // TODO: better error handling
+            //                 event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+            //                 resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
+            //                 event.buffer = try std.fmt.bufPrint(event.buffer.?, "{s}", .{try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator())});
+            //                 try event_queue.addAsyncEvent(event, true);
+            //                 continue :event_loop;
+            //             };
+            //
+            //             if (instance.master == null and command.shouldPropagate())
+            //                 instance.repl_offset += bytes_parsed; // Updating the master's counter
+            //
+            //             if (instance.master != null and event.canary != null and event.canary.? == MASTER_CANARY) {
+            //                 if (command == .replconf and command.replconf == .getack) {
+            //                     try replies.appendSlice(try reply.encode(temp_allocator.allocator()));
+            //                 }
+            //             } else {
+            //                 try replies.appendSlice(try reply.encode(temp_allocator.allocator()));
+            //             }
+            //
+            //             if (command.shouldPropagate()) {
+            //                 var slaves_it = slaves.keyIterator();
+            //                 while (slaves_it.next()) |slave| {
+            //                     var propagation_event = try allocator.create(eq.Event);
+            //                     propagation_event.ty = eq.EVENT_TYPE.PROPAGATE_COMMAND;
+            //                     propagation_event.fd = slave.*;
+            //                     propagation_event.buffer = try allocator.alloc(u8, n + bytes_parsed);
+            //                     propagation_event.canary = null;
+            //                     @memcpy(propagation_event.buffer.?, buffer[n..][0..bytes_parsed]);
+            //                     try event_queue.addAsyncEvent(propagation_event, true);
+            //                 }
+            //             }
+            //         }
+            //
+            //         n += bytes_parsed;
+            //     }
+            //
+            //     const reply = try replies.toOwnedSlice();
+            //
+            //     if (reply.len > 0) {
+            //         event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+            //         resizeBuffer(&event.buffer.?, reply.len);
+            //         @memcpy(event.buffer.?, reply);
+            //         try event_queue.addAsyncEvent(event, true);
+            //     } else if (requeue) {
+            //         resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
+            //         event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
+            //         @memset(event.buffer.?, 0);
+            //         try event_queue.addAsyncEvent(event, true);
+            //     }
+            // },
+            // .FULL_SYNC => {
+            //     resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
+            //     const dump_size = try instance.dumpToBuffer(event.buffer.?);
+            //     const n_digits = if (dump_size == 0) 1 else std.math.log10_int(dump_size) + 1;
+            //     std.mem.copyBackwards(u8, event.buffer.?[1 + n_digits + 2 ..], event.buffer.?[0..dump_size]);
+            //     const preamble = try std.fmt.bufPrint(event.buffer.?, "${d}\r\n", .{dump_size});
+            //     resizeBuffer(&event.buffer.?, preamble.len + dump_size);
+            //     event.ty = eq.EVENT_TYPE.SENT_DUMP;
+            //     try event_queue.addAsyncEvent(event, true);
+            // },
+            // .SENT_RESPONSE, .SENT_DUMP => {
+            //     resizeBuffer(&event.buffer.?, CLIENT_BUFFER_SIZE);
+            //     if (event.ty == .SENT_DUMP) {
+            //         try slaves.put(event.fd, 0);
+            //         instance.n_slaves += 1;
+            //         if (event.buffer) |buffer| {
+            //             allocator.free(buffer);
+            //         }
+            //         allocator.destroy(event);
+            //         continue;
+            //     }
+            //     event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
+            //     @memset(event.buffer.?, 0);
+            //     try event_queue.addAsyncEvent(event, true);
+            // },
+            // .PROPAGATE_COMMAND => {
+            //     allocator.free(event.buffer.?);
+            //     allocator.destroy(event);
+            // },
+            // .SEND_GETACK => {
+            //     resizeBuffer(&event.buffer.?, GETACK_BUFFER_SIZE);
+            //     @memset(event.buffer.?, 0);
+            //     event.ty = .RECEIVED_ACK;
+            //     try event_queue.addAsyncEvent(event, true);
+            // },
+            // .RECEIVED_ACK => {
+            //     var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+            //     defer temp_allocator.deinit();
+            //
+            //     if (event.async_result.? == 0) {
+            //         //destroyEvent(event, allocator);
+            //         continue;
+            //     }
+            //
+            //     const response, _ = resp.Value.parse(event.buffer.?, temp_allocator.allocator()) catch {
+            //         std.debug.print("{?x}\n", .{event.buffer});
+            //         std.debug.print("{?d}\n", .{event.async_result});
+            //         @panic("TODO");
+            //     };
+            //
+            //     if (response != .array)
+            //         @panic("TODO");
+            //
+            //     const new_offset = try std.fmt.parseInt(usize, response.array[2].bulk_string, 10);
+            //
+            //     const old_offset = slaves.get(event.fd);
+            //     if (old_offset.? < new_offset) {
+            //         try slaves.put(event.fd, new_offset);
+            //     }
+            //
+            //     var new_pending_waits = std.PriorityQueue(*PendingWait, void, compareWaits).init(allocator, undefined);
+            //     while (pending_waits.removeOrNull()) |pending_wait| {
+            //         if (pending_wait.threshold_offset > old_offset.? and pending_wait.threshold_offset <= new_offset) {
+            //             pending_wait.actual_n_replicas += 1;
+            //             if (pending_wait.actual_n_replicas >= pending_wait.expected_n_replicas) {
+            //                 const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
+            //                 resizeBuffer(&pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
+            //                 pending_wait.client_event.buffer = try std.fmt.bufPrint(pending_wait.client_event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
+            //                 pending_wait.client_event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+            //                 try event_queue.addAsyncEvent(pending_wait.client_event, true);
+            //                 allocator.destroy(pending_wait);
+            //             } else {
+            //                 try new_pending_waits.add(pending_wait);
+            //             }
+            //         } else {
+            //             try new_pending_waits.add(pending_wait);
+            //         }
+            //     }
+            //
+            //     pending_waits.deinit();
+            //     pending_waits = new_pending_waits;
+            //
+            //     allocator.destroy(event);
+            //     allocator.free(event.buffer.?);
+            // },
+            // .TIMEOUT => {
+            //     var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+            //     defer temp_allocator.deinit();
+            //
+            //     const pending_wait = event.pending_wait.?;
+            //     var pending_wait_it = pending_waits.iterator();
+            //     var maybe_index: ?usize = null;
+            //     var i: usize = 0;
+            //     while (pending_wait_it.next()) |pw| : (i += 1) {
+            //         if (pw == event.pending_wait.?) {
+            //             maybe_index = i;
+            //             break;
+            //         }
+            //     }
+            //     if (maybe_index) |index| {
+            //         _ = pending_waits.removeIndex(index);
+            //
+            //         const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
+            //         resizeBuffer(&pending_wait.client_event.buffer.?, CLIENT_BUFFER_SIZE);
+            //         pending_wait.client_event.buffer = try std.fmt.bufPrint(pending_wait.client_event.buffer.?, "{s}", .{try reply.encode(temp_allocator.allocator())});
+            //         pending_wait.client_event.ty = eq.EVENT_TYPE.SENT_RESPONSE;
+            //         try event_queue.addAsyncEvent(pending_wait.client_event, true);
+            //     }
+            //
+            //     allocator.destroy(pending_wait);
+            //     posix.close(event.fd); // the timerfd
+            //     // not destroying the event buffer because it's the client's
+            //     // event buffer (will be destroyed on client connection closed)
+            //     allocator.destroy(event);
+            // },
+            // .SIGTERM => {
+            //     std.debug.print("Gracefully shutting down...\n", .{});
+            //     break;
+            // },
         }
     }
 }

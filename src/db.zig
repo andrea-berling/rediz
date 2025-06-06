@@ -69,7 +69,6 @@ pub const Instance = struct {
 
         if (config) |pairs| {
             for (pairs) |config_pair| {
-                if (std.mem.eql(u8, config_pair[0], "END")) break;
                 try instance.config.put(
                     try instance.dupe(config_pair[0]),
                     try instance.dupe(config_pair[1]),
