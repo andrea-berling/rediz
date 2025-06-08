@@ -17,22 +17,36 @@ const stdout = std.io.getStdOut().writer();
 
 const IO_URING_ENTRIES = 100;
 
-inline fn addReceiveCommandEvent(fd: linux.socket_t, buffer: []u8, event_queue: *eq.EventQueue, canary: ?u64, allocator: Allocator) !void {
-    var receive_command_event = try allocator.create(eq.Event);
-    @memset(buffer, 0);
-    receive_command_event.ty = eq.EVENT_TYPE.RECEIVE_COMMAND;
-    receive_command_event.fd = fd;
-    receive_command_event.buffer = buffer;
-    receive_command_event.canary = canary;
-    try event_queue.addAsyncEvent(receive_command_event, true);
+const EventQueue = eq.EventQueue(fsm.FSM);
+const Event = eq.Event(fsm.FSM);
+
+fn respondWith(response: []const u8, finite_state_machine: *fsm.FSM, event_queue: *EventQueue, new_state: struct { new_state: @TypeOf(finite_state_machine.type.connection.state) = .sending_response }) !void {
+    if (finite_state_machine.type != .connection)
+        return error.InvalidFSM;
+    const connection_fsm = &finite_state_machine.type.connection;
+    resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
+    connection_fsm.buffer = try std.fmt.bufPrint(connection_fsm.buffer, "{s}", .{response});
+    connection_fsm.state = new_state.new_state;
+    const response_sent_event = Event{
+        .type = .{ .send = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
+        .user_data = finite_state_machine,
+    };
+    try event_queue.addAsyncEvent(response_sent_event);
 }
 
-fn destroyEvent(event: *eq.Event, allocator: Allocator) void {
-    posix.close(event.fd);
-    if (event.buffer) |event_buffer| {
-        allocator.free(event_buffer);
-    }
-    allocator.destroy(event);
+fn waitForCommand(finite_state_machine: *fsm.FSM, event_queue: *EventQueue) !void {
+    if (finite_state_machine.type != .connection)
+        return error.InvalidFSM;
+    const connection_fsm = &finite_state_machine.type.connection;
+    resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
+    @memset(connection_fsm.buffer, 0);
+    connection_fsm.state = .waiting_for_commands;
+    const new_command_event = Event{
+        .type = .{ .recv = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
+        .user_data = finite_state_machine,
+    };
+
+    try event_queue.addAsyncEvent(new_command_event);
 }
 
 pub fn main() !void {
@@ -122,25 +136,23 @@ pub fn main() !void {
     var global_data = fsm.GlobalData.init(allocator);
     defer global_data.deinit();
 
-    var server_fsm = fsm.FSM{ .global_data = &global_data, .type = .{ .server = fsm.Server{
+    const server_fsm = try allocator.create(fsm.FSM);
+    server_fsm.* = fsm.FSM{ .global_data = &global_data, .type = .{ .server = fsm.Server{
         .socket = listener.stream.handle,
         .state = .waiting,
     } } };
-
-    const EventQueue = eq.EventQueue(fsm.FSM);
-    const Event = eq.Event(fsm.FSM);
 
     // INFO: Event queue init
 
     var event_queue = try EventQueue.init(allocator, IO_URING_ENTRIES);
 
-    defer event_queue.destroy() catch {
+    defer event_queue.destroy(.{ .user_data_allocator = allocator }) catch {
         @panic("Failed destroying the event queue");
     };
 
-    const new_connection_event = Event{ .type = .{ .accept = server_fsm.type.server.socket }, .user_data = &server_fsm };
+    const new_connection_event = Event{ .type = .{ .accept = server_fsm.type.server.socket }, .user_data = server_fsm };
 
-    const termination_event = Event{ .type = .{ .pollin = sfd }, .user_data = &server_fsm };
+    const termination_event = Event{ .type = .{ .pollin = sfd }, .user_data = server_fsm };
 
     try event_queue.addAsyncEvent(termination_event);
     try event_queue.addAsyncEvent(new_connection_event);
@@ -151,20 +163,15 @@ pub fn main() !void {
     defer instance.destroy(allocator);
     allocator.free(db_config);
 
-    var master_server_fsm: ?fsm.FSM = null;
+    var master_server_fsm: ?*fsm.FSM = null;
 
     if (instance.master) |master_fd| {
         const new_buffer = try allocator.alloc(u8, fsm.CLIENT_BUFFER_SIZE);
-        master_server_fsm = fsm.FSM{ .global_data = &global_data, .type = .{ .connection = .{
-            .fd = master_fd,
-            .buffer = new_buffer,
-            .peer_type = .MASTER,
-            .state = .waiting_for_command,
-            .allocator = allocator,
-        } } };
+        master_server_fsm = try allocator.create(fsm.FSM);
+        master_server_fsm.?.* = fsm.FSM{ .global_data = &global_data, .type = .{ .connection = .{ .fd = master_fd, .buffer = new_buffer, .peer_type = .MASTER, .new_commands_notification_fd = try posix.eventfd(0, linux.EFD.SEMAPHORE), .notification_val = 0, .state = .waiting_for_commands, .allocator = allocator, .commands_to_execute = std.DoublyLinkedList(Command){} } } };
         const command_received_event = Event{
             .type = .{ .recv = .{ .fd = master_fd, .buffer = new_buffer } },
-            .user_data = &master_server_fsm.?,
+            .user_data = master_server_fsm.?,
         };
         try event_queue.addAsyncEvent(command_received_event);
     }
@@ -181,6 +188,8 @@ pub fn main() !void {
                 }
                 const connection_socket: posix.socket_t = completed_event.async_result;
                 try stdout.print("accepted new connection\n", .{});
+                // TODO: fetch user data from pending events to destroy FSMs in
+                // the signal handling code
                 var new_connection_fsm = try allocator.create(fsm.FSM);
                 new_connection_fsm.type = .{ .connection = try fsm.Connection.init(allocator, connection_socket) };
                 new_connection_fsm.global_data = &global_data;
@@ -197,52 +206,62 @@ pub fn main() !void {
                 switch (event_fsm.type) {
                     .server => @panic("Not ready yet"),
                     .connection => |*connection_fsm| {
-                        if (connection_fsm.state != .waiting_for_command)
-                            @panic("Not ready yet");
+                        if (connection_fsm.state != .waiting_for_commands)
+                            @panic("Bad");
                         if (completed_event.async_result == 0) { // connection closed
-                            // TODO: remove slave from global data
+                            if (connection_fsm.peer_type == .SLAVE) {
+                                _ = event_fsm.global_data.slaves.remove(event_fsm);
+                            }
                             connection_fsm.deinit();
-                            allocator.destroy(event_fsm);
+                            if (master_server_fsm == null or (master_server_fsm != null and event_fsm != master_server_fsm.?))
+                                allocator.destroy(event_fsm);
                             continue :event_loop;
                         }
 
-                        var temp_allocator = std.heap.ArenaAllocator.init(allocator);
-                        defer temp_allocator.deinit();
+                        if (completed_event.async_result < 0) { // error
+                            std.debug.print("Error: {} {d}\n", .{ linux.E.init(@intCast(@as(u32, @bitCast(completed_event.async_result)))), completed_event.async_result });
+                            _ = event_fsm.global_data.slaves.remove(event_fsm);
+                            connection_fsm.deinit();
+                            if (master_server_fsm != null and event_fsm != master_server_fsm.?)
+                                allocator.destroy(event_fsm);
+                            continue;
+                        }
 
-                        const command, _ = Command.parse(connection_fsm.buffer, temp_allocator.allocator()) catch |err| {
-                            std.debug.print("Error while parsing command: {}\n", .{err});
-                            std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ connection_fsm.buffer, completed_event.async_result });
-                            resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
-                            connection_fsm.buffer = try std.fmt.bufPrint(connection_fsm.buffer, "{s}", .{try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator())});
-                            connection_fsm.state = .sending_response;
-                            const response_sent_event = Event{
-                                .type = .{ .send = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
-                                .user_data = event_fsm,
-                            };
-                            try event_queue.addAsyncEvent(response_sent_event);
-                            continue :event_loop;
-                        };
-
-                        const reply = instance.executeCommand(temp_allocator.allocator(), &command) catch {
-                            resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
-                            connection_fsm.buffer = try std.fmt.bufPrint(connection_fsm.buffer, "{s}", .{try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator())});
-                            connection_fsm.state = .sending_response;
-                            const response_sent_event = Event{
-                                .type = .{ .send = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
-                                .user_data = event_fsm,
-                            };
-                            try event_queue.addAsyncEvent(response_sent_event);
-                            continue :event_loop;
-                        };
-
-                        resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
-                        connection_fsm.buffer = try std.fmt.bufPrint(connection_fsm.buffer, "{s}", .{try reply.encode(temp_allocator.allocator())});
-                        connection_fsm.state = .sending_response;
-                        const response_sent_event = Event{
-                            .type = .{ .send = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
+                        var n: usize = 0;
+                        const buffer_size = @as(usize, @intCast(completed_event.async_result));
+                        var notify_fsm_about_new_commands = false;
+                        const notify_fsm_event = Event{
+                            .type = .{ .notify = connection_fsm.new_commands_notification_fd },
                             .user_data = event_fsm,
                         };
-                        try event_queue.addAsyncEvent(response_sent_event);
+
+                        while (buffer_size - n > 0) {
+                            const command, const parsed_bytes = Command.parse(connection_fsm.buffer[n..], allocator) catch |err| {
+                                std.debug.print("Error while parsing command: {}\n", .{err});
+                                std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ connection_fsm.buffer, completed_event.async_result });
+
+                                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+                                defer temp_allocator.deinit();
+
+                                if (notify_fsm_about_new_commands) {
+                                    try event_queue.addAsyncEvent(notify_fsm_event);
+                                }
+                                try respondWith(try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                                continue :event_loop;
+                            };
+
+                            var new_command = try allocator.create(std.DoublyLinkedList(Command).Node);
+                            new_command.data = command;
+                            connection_fsm.commands_to_execute.append(new_command);
+                            instance.repl_offset += parsed_bytes;
+                            notify_fsm_about_new_commands = true;
+                            n += parsed_bytes;
+                        }
+
+                        if (notify_fsm_about_new_commands) {
+                            connection_fsm.state = .executing_commands;
+                            try event_queue.addAsyncEvent(notify_fsm_event);
+                        }
                     },
                 }
             },
@@ -250,17 +269,23 @@ pub fn main() !void {
                 switch (event_fsm.type) {
                     .server => @panic("Not ready yet"),
                     .connection => |*connection_fsm| {
-                        if (connection_fsm.state != .sending_response)
-                            @panic("Invalid state transition");
-                        resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
-                        @memset(connection_fsm.buffer, 0);
-                        connection_fsm.state = .waiting_for_command;
-                        const new_command_event = Event{
-                            .type = .{ .recv = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
-                            .user_data = event_fsm,
-                        };
-
-                        try event_queue.addAsyncEvent(new_command_event);
+                        switch (connection_fsm.state) {
+                            .sending_response => {
+                                if (connection_fsm.commands_to_execute.first != null) {
+                                    // There are commands to execute, go work on those
+                                    const notify_fsm_event = Event{
+                                        .type = .{ .notify = connection_fsm.new_commands_notification_fd },
+                                        .user_data = event_fsm,
+                                    };
+                                    connection_fsm.state = .executing_commands;
+                                    try event_queue.addAsyncEvent(notify_fsm_event);
+                                } else try waitForCommand(event_fsm, &event_queue);
+                            },
+                            .sending_dump, .propagating_command => {
+                                connection_fsm.state = .in_sync;
+                            },
+                            else => @panic("Invalid state transition"),
+                        }
                     },
                 }
             },
@@ -271,7 +296,77 @@ pub fn main() !void {
                 break;
             },
             .read => {
-                @panic("Not now Jin Yiang");
+                if (event_fsm.type != .connection) {
+                    @panic("Something is very wrong");
+                }
+
+                const connection_fsm = &event_fsm.type.connection;
+
+                if (connection_fsm.state != .executing_commands) {
+                    std.debug.print("Maybe I'm replying, come back later\n", .{});
+                    try event_queue.addAsyncEvent(completed_event.awaited_event);
+                    continue :event_loop;
+                }
+
+                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+                defer temp_allocator.deinit();
+                if (connection_fsm.commands_to_execute.pop()) |new_command_node| {
+                    // TODO: destroy arrays allocated by the command, if any
+                    var command = new_command_node.data;
+                    defer command.destroy(allocator);
+                    allocator.destroy(new_command_node);
+                    switch (command) {
+                        .psync => {
+                            connection_fsm.peer_type = .SLAVE;
+                            try event_fsm.global_data.slaves.put(event_fsm, undefined);
+                            var dump = [_]u8{0} ** fsm.CLIENT_BUFFER_SIZE;
+                            const dump_size = try instance.dumpToBuffer(&dump);
+                            // Why 0 for the repl_offset? Codecrafters really
+                            try respondWith(try std.fmt.allocPrint(temp_allocator.allocator(), "+FULLRESYNC {[replid]s} {[repl_offset]d}\r\n${[dump_size]d}\r\n{[dump]s}", .{ .replid = instance.replid, .repl_offset = 0, .dump_size = dump_size, .dump = dump[0..dump_size] }), event_fsm, &event_queue, .{ .new_state = .sending_dump });
+                        },
+                        else => {
+                            const reply = instance.executeCommand(temp_allocator.allocator(), &command) catch {
+                                try respondWith(try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                                continue :event_loop;
+                            };
+
+                            if (command.shouldPropagate() and instance.master == null) {
+                                var slaves_it = event_fsm.global_data.slaves.keyIterator();
+                                while (slaves_it.next()) |slave_fsm| {
+                                    const slave_connection = &slave_fsm.*.type.connection;
+                                    slave_connection.state = .propagating_command;
+                                    slave_connection.buffer = try std.fmt.bufPrint(slave_connection.buffer, "{s}", .{try command.encode(temp_allocator.allocator())});
+                                    const propagation_event = Event{
+                                        .type = .{ .send = .{ .fd = slave_connection.fd, .buffer = slave_connection.buffer } },
+                                        .user_data = slave_fsm.*,
+                                    };
+                                    try event_queue.addAsyncEvent(propagation_event);
+                                }
+                            }
+
+                            if (connection_fsm.peer_type == .MASTER and (command != .replconf or command.replconf != .getack)) {
+                                try waitForCommand(event_fsm, &event_queue);
+                                continue :event_loop;
+                            }
+
+                            try respondWith(try reply.encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                        },
+                    }
+                } else try waitForCommand(event_fsm, &event_queue);
+            },
+            .notify => {
+                if (event_fsm.type != .connection) {
+                    @panic("Something is very wrong");
+                }
+
+                const connection_fsm = &event_fsm.type.connection;
+                const wakeup_event = Event{
+                    .type = .{ .read = .{ .fd = connection_fsm.new_commands_notification_fd, .buffer = std.mem.asBytes(&connection_fsm.notification_val) } },
+                    .user_data = event_fsm,
+                };
+
+                connection_fsm.state = .executing_commands;
+                try event_queue.addAsyncEvent(wakeup_event);
             },
             // .send: EventWithBuffer,
             // .recv: EventWithBuffer,

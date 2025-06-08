@@ -199,7 +199,7 @@ pub const Command = union(enum) {
                 }
             },
             k2idx("info") => {
-                if (array.len != 2 and k2idx(array[1]) != k2idx("replication"))
+                if (array.len != 2 or k2idx(array[1]) != k2idx("replication"))
                     return Error.InvalidCommand;
                 break :blk Self{ .info = .replication };
             },
@@ -216,7 +216,7 @@ pub const Command = union(enum) {
                 } else if (std.ascii.eqlIgnoreCase(array[1], "capa")) {
                     if (array.len < 3)
                         return Error.MissingArgument;
-                    replconf_command = ReplicaConfigCommand{ .capabilities = array[2..] };
+                    replconf_command = ReplicaConfigCommand{ .capabilities = try allocator.dupe([]const u8, array[2..]) };
                 } else if (std.ascii.eqlIgnoreCase(array[1], "getack")) {
                     if (array.len != 3)
                         return Error.InvalidCommand;
@@ -269,6 +269,117 @@ pub const Command = union(enum) {
             .set, .xadd => return true,
         }
     }
+
+    pub fn encode(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
+        var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+        defer temp_allocator.deinit();
+        var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+        switch (self.*) {
+            .ping => try response.append(resp.BulkString("PONG")),
+            .echo => |string| try response.appendSlice(&[_]resp.Value{ resp.BulkString("ECHO"), resp.BulkString(string) }),
+            .get => |key| try response.appendSlice(&[_]resp.Value{ resp.BulkString("GET"), resp.BulkString(key) }),
+            .set => |set_command| {
+                try response.appendSlice(&[_]resp.Value{ resp.BulkString("SET"), resp.BulkString(set_command.key), resp.BulkString(set_command.value) });
+                if (set_command.expire_at_ms) |expiration| {
+                    try response.appendSlice(&[_]resp.Value{ resp.BulkString("PXAT"), resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{expiration})) });
+                }
+            },
+            .keys => |pattern| try response.appendSlice(&[_]resp.Value{ resp.BulkString("KEYS"), resp.BulkString(pattern) }),
+            .xadd => |stream_add_command| {
+                try response.appendSlice(&[_]resp.Value{ resp.BulkString("XADD"), resp.BulkString(stream_add_command.stream_key), resp.BulkString(try std.fmt.allocPrint(allocator, "{}", .{stream_add_command.entry_id})) });
+                for (stream_add_command.key_value_pairs) |pair| {
+                    try response.append(resp.BulkString(pair.key));
+                    try response.append(resp.BulkString(pair.value));
+                }
+            },
+            .xrange => |stream_range_command| {
+                try response.append(resp.BulkString("XRANGE"));
+                try response.append(resp.BulkString(stream_range_command.stream_key));
+                try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{}", .{stream_range_command.start_entry_id})));
+                try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{}", .{stream_range_command.end_entry_id})));
+            },
+            .xread => |stream_read_requests| {
+                try response.append(resp.BulkString("XREAD"));
+                try response.append(resp.BulkString("streams"));
+                for (stream_read_requests) |request| {
+                    try response.append(resp.BulkString(request.stream_key));
+                }
+                for (stream_read_requests) |request| {
+                    try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{}", .{request.start_entry_id})));
+                }
+            },
+            .config => |config_command| {
+                try response.append(resp.BulkString("CONFIG"));
+                switch (config_command) {
+                    .get => |option| {
+                        try response.append(resp.BulkString("GET"));
+                        try response.append(resp.BulkString(option));
+                    },
+                    .set => |set_command| {
+                        try response.append(resp.BulkString("SET"));
+                        try response.append(resp.BulkString(set_command.option));
+                        try response.append(resp.BulkString(set_command.value));
+                    },
+                }
+            },
+            .info => |info_command| {
+                try response.append(resp.BulkString("CONFIG"));
+                switch (info_command) {
+                    .replication => {
+                        try response.append(resp.BulkString("REPLICATION"));
+                    },
+                }
+            },
+            .replconf => |replica_config_command| {
+                try response.append(resp.BulkString("REPLCONF"));
+                switch (replica_config_command) {
+                    .getack => {
+                        try response.append(resp.BulkString("GETACK"));
+                        try response.append(resp.BulkString("*"));
+                    },
+                    .capabilities => |capabilities| {
+                        try response.append(resp.BulkString("capa"));
+                        for (capabilities) |capability| {
+                            try response.append(resp.BulkString(capability));
+                        }
+                    },
+                    .listening_port => |listening_port| {
+                        try response.append(resp.BulkString("listening-port"));
+                        try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{listening_port})));
+                    },
+                }
+            },
+            .wait => {
+                try response.append(resp.BulkString("WAIT"));
+            },
+            .type => |key| {
+                try response.append(resp.BulkString("TYPE"));
+                try response.append(resp.BulkString(key));
+            },
+            else => {
+                return error.InvalidCommand;
+            },
+        }
+        return try resp.Array(try response.toOwnedSlice()).encode(allocator);
+    }
+
+    pub fn destroy(self: *Command, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type => {},
+            .xadd => |stream_add_command| {
+                allocator.free(stream_add_command.key_value_pairs);
+            },
+            .xread => |stream_read_requests| {
+                allocator.free(stream_read_requests);
+            },
+            .replconf => |replica_config_command| {
+                if (replica_config_command == .capabilities) {
+                    allocator.free(replica_config_command.capabilities);
+                }
+            },
+        }
+        self.* = undefined;
+    }
 };
 
 pub const SetCommand = struct { key: []const u8, value: []const u8, expire_at_ms: ?i64 = null };
@@ -279,7 +390,22 @@ pub const StreamAddCommand = struct {
     key_value_pairs: []struct { key: []const u8, value: []const u8 },
 };
 
-pub const StreamRangeBound = union(enum) { entry_id: db.StreamEntryID, plus, minus };
+pub const StreamRangeBound = union(enum) {
+    entry_id: db.StreamEntryID,
+    plus,
+    minus,
+
+    pub fn format(value: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+
+        switch (value) {
+            .entry_id => try std.fmt.format(writer, "{}", .{value.entry_id}),
+            .plus => _ = try writer.write("+"),
+            .minus => _ = try writer.write("-"),
+        }
+    }
+};
 
 pub const StreamRangeCommand = struct {
     stream_key: []const u8,

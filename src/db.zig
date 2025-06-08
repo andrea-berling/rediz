@@ -22,6 +22,12 @@ pub const StreamEntryID = packed struct(u64) {
     pub fn isLessThanOrEqual(self: Self, other: Self) bool {
         return self.timestamp < other.timestamp or (self.timestamp == other.timestamp and self.sequence_number <= other.sequence_number);
     }
+
+    pub fn format(value: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try std.fmt.format(writer, "{d}-{d}", .{ value.timestamp, value.sequence_number });
+    }
 };
 
 const Stream = std.AutoArrayHashMap(StreamEntryID, std.StringHashMap([]u8));
@@ -264,7 +270,7 @@ pub const Instance = struct {
                 for (stream_add_command.key_value_pairs) |pair|
                     try stream_entry.value_ptr.put(try self.dupe(pair.key), try self.dupe(pair.value));
 
-                return resp.BulkString(try std.fmt.allocPrint(allocator, "{d}-{d}", .{ request_entry_id.timestamp, request_entry_id.sequence_number }));
+                return resp.BulkString(try std.fmt.allocPrint(allocator, "{}", .{request_entry_id}));
             },
             .xrange => |stream_range_command| {
                 if (self.data.get(stream_range_command.stream_key)) |datum| {
@@ -278,6 +284,7 @@ pub const Instance = struct {
                                 },
                                 .entry_id => |entry_id| {
                                     var i: usize = 0;
+                                    // TODO: bisect
                                     while (!entry_id.isLessThanOrEqual(stream_keys[i]) and i < stream_keys.len) : (i += 1) {}
                                     break :blk i;
                                 },
@@ -317,7 +324,7 @@ pub const Instance = struct {
                                 }
 
                                 var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
-                                tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ stream_keys[index].timestamp, stream_keys[index].sequence_number }));
+                                tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{}", .{stream_keys[index]}));
                                 tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
                                 try response.append(resp.Array(tmp_array));
                             }
@@ -359,7 +366,7 @@ pub const Instance = struct {
                                     }
 
                                     var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
-                                    tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{d}-{d}", .{ stream_keys[index].timestamp, stream_keys[index].sequence_number }));
+                                    tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{}", .{stream_keys[index]}));
                                     tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
                                     try stream_entries.append(resp.Array(tmp_array));
                                 }
@@ -396,7 +403,7 @@ pub const Instance = struct {
                         var response = std.ArrayList(u8).init(temp_allocator.allocator());
                         try response.appendSlice(if (self.master) |_| "role:slave\n" else "role:master\n");
                         try std.fmt.format(response.writer(), "master_replid:{s}\n", .{self.replid});
-                        try std.fmt.format(response.writer(), "master_repl_offset:{d}\n", .{self.repl_offset});
+                        try std.fmt.format(response.writer(), "master_repl_offset:{d}\n", .{if (self.master) |_| self.repl_offset else 0});
                         return resp.BulkString(try response.toOwnedSlice());
                     },
                 }
@@ -407,7 +414,9 @@ pub const Instance = struct {
                         return resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("ACK"), resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{self.repl_offset})) });
                     },
                     .capabilities => |capabilities| {
-                        std.debug.print("Slave advertised the following capabilities: {s}\n", .{capabilities});
+                        var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
+                        defer temp_allocator.deinit();
+                        std.debug.print("Slave advertised the following capabilities: {s}\n", .{try std.mem.join(temp_allocator.allocator(), ",", capabilities)});
                         return resp.Ok;
                     },
                     .listening_port => |listening_port| {
@@ -415,9 +424,6 @@ pub const Instance = struct {
                         return resp.Ok;
                     },
                 }
-            },
-            .psync => {
-                return resp.SimpleString(try std.fmt.allocPrint(allocator, "FULLRESYNC {s} {d}", .{ self.replid, self.repl_offset }));
             },
             .wait => {
                 return resp.Integer(self.n_slaves);
@@ -433,6 +439,9 @@ pub const Instance = struct {
                         },
                     }
                 } else return resp.SimpleString("none");
+            },
+            else => {
+                return error.InvalidCommand;
             },
         }
     }
