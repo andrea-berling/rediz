@@ -206,12 +206,12 @@ pub fn EventQueue(comptime T: type) type {
             return completed_event;
         }
 
-        pub fn destroy(self: *Self, opts: struct { user_data_allocator: ?std.mem.Allocator = null }) !void {
+        pub fn destroy(self: *Self, opts: struct { user_data_destroyer: ?fn (*T) void = null }) !void {
             try self.cancelAllPendingOps();
             var pending_events_it = self.pending_events.keyIterator();
             while (pending_events_it.next()) |pending_event| {
-                if (opts.user_data_allocator) |allocator| {
-                    allocator.destroy(pending_event.*.user_data);
+                if (opts.user_data_destroyer) |destroyer| {
+                    destroyer(pending_event.*.user_data);
                 }
                 self.allocator.destroy(pending_event.*);
             }

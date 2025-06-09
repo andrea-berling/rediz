@@ -24,35 +24,79 @@ pub const Connection = struct {
         generic_client,
     } = .generic_client,
     state: union(enum) { in_sync, sending_response, waiting_for_commands, executing_commands, sending_dump, propagating_command, sending_getack, waiting_for_ack, blocked: *PendingWait } = .waiting_for_commands,
-    allocator: ?Allocator = null,
+    allocator: Allocator,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, fd: posix.socket_t) !Self {
-        return Self{
-            .fd = fd,
-            .buffer = try allocator.alloc(u8, CLIENT_BUFFER_SIZE),
-            .allocator = allocator,
-            .commands_to_execute = std.DoublyLinkedList(cmd.Command){},
-            .new_commands_notification_fd = try posix.eventfd(0, linux.EFD.SEMAPHORE),
-            .notification_val = 0,
-        };
+    pub fn init(allocator: Allocator, fd: posix.socket_t, peer_type: @FieldType(Connection, "peer_type")) !Self {
+        return Self{ .fd = fd, .buffer = try allocator.alloc(u8, CLIENT_BUFFER_SIZE), .commands_to_execute = std.DoublyLinkedList(cmd.Command){}, .new_commands_notification_fd = try posix.eventfd(0, linux.EFD.SEMAPHORE), .notification_val = 0, .peer_type = peer_type, .allocator = allocator };
     }
 
-    pub fn deinit(self: *Self) void {
-        posix.close(self.fd);
-        const maybe_allocator = self.allocator;
-        if (maybe_allocator) |allocator| {
-            util.resizeBuffer(&self.buffer, CLIENT_BUFFER_SIZE);
-            allocator.free(self.buffer);
+    pub fn addCommand(self: *Self, command: cmd.Command) !void {
+        var new_command = try self.allocator.create(std.DoublyLinkedList(cmd.Command).Node);
+        new_command.data = command;
+        self.commands_to_execute.append(new_command);
+    }
+
+    pub fn popCommand(self: *Self) ?cmd.Command {
+        if (self.hasCommands()) {
+            const node = self.commands_to_execute.popFirst().?;
+            const command = node.data;
+            self.allocator.destroy(node);
+            return command;
+        } else {
+            return null;
         }
+    }
+
+    pub inline fn hasCommands(self: *Self) bool {
+        return self.commands_to_execute.len > 0;
+    }
+
+    pub fn deinit(self: *Self, allocator: Allocator) void {
+        posix.close(self.fd);
+        util.resizeBuffer(&self.buffer, CLIENT_BUFFER_SIZE);
+        allocator.free(self.buffer);
     }
 };
 
-pub const FSM = struct { type: union(enum) {
-    server: Server,
-    connection: Connection,
-}, global_data: *GlobalData };
+pub const FSM = struct {
+    type: union(enum) {
+        server: Server,
+        connection: Connection,
+    },
+    global_data: *GlobalData,
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    pub fn newServer(allocator: std.mem.Allocator, server_socket: posix.socket_t, global_data: *GlobalData) !*Self {
+        const server_fsm = try allocator.create(FSM);
+        server_fsm.* = FSM{ .global_data = global_data, .type = .{
+            .server = Server{
+                .socket = server_socket,
+                .state = .waiting,
+            },
+        }, .allocator = allocator };
+        return server_fsm;
+    }
+
+    pub fn newConnection(allocator: std.mem.Allocator, peer_socket: posix.socket_t, peer_type: @FieldType(Connection, "peer_type"), global_data: *GlobalData) !*Self {
+        const connection_fsm = try allocator.create(FSM);
+        connection_fsm.* = FSM{ .global_data = global_data, .type = .{ .connection = try Connection.init(allocator, peer_socket, peer_type) }, .allocator = allocator };
+        return connection_fsm;
+    }
+
+    pub fn deinit(self: *Self) void {
+        switch (self.type) {
+            .server => {},
+            .connection => |*fsm| {
+                fsm.deinit(self.allocator);
+            },
+        }
+        self.allocator.destroy(self);
+    }
+};
 
 pub const GlobalData = struct {
     slaves: std.AutoHashMap(*FSM, void),

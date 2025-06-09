@@ -49,6 +49,11 @@ fn waitForCommand(finite_state_machine: *fsm.FSM, event_queue: *EventQueue) !voi
     try event_queue.addAsyncEvent(new_command_event);
 }
 
+fn FSMdestroyer(finite_state_machine: *fsm.FSM) void {
+    if (finite_state_machine.type != .connection or finite_state_machine.type.connection.peer_type != .slave)
+        finite_state_machine.deinit();
+}
+
 pub fn main() !void {
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -136,17 +141,13 @@ pub fn main() !void {
     var global_data = fsm.GlobalData.init(allocator);
     defer global_data.deinit();
 
-    const server_fsm = try allocator.create(fsm.FSM);
-    server_fsm.* = fsm.FSM{ .global_data = &global_data, .type = .{ .server = fsm.Server{
-        .socket = listener.stream.handle,
-        .state = .waiting,
-    } } };
+    const server_fsm = try fsm.FSM.newServer(allocator, listener.stream.handle, &global_data);
 
     // INFO: Event queue init
 
     var event_queue = try EventQueue.init(allocator, IO_URING_ENTRIES);
 
-    defer event_queue.destroy(.{ .user_data_allocator = allocator }) catch {
+    defer event_queue.destroy(.{ .user_data_destroyer = FSMdestroyer }) catch {
         @panic("Failed destroying the event queue");
     };
 
@@ -166,11 +167,9 @@ pub fn main() !void {
     var master_server_fsm: ?*fsm.FSM = null;
 
     if (instance.master) |master_fd| {
-        const new_buffer = try allocator.alloc(u8, fsm.CLIENT_BUFFER_SIZE);
-        master_server_fsm = try allocator.create(fsm.FSM);
-        master_server_fsm.?.* = fsm.FSM{ .global_data = &global_data, .type = .{ .connection = .{ .fd = master_fd, .buffer = new_buffer, .peer_type = .master, .new_commands_notification_fd = try posix.eventfd(0, linux.EFD.SEMAPHORE), .notification_val = 0, .state = .waiting_for_commands, .allocator = allocator, .commands_to_execute = std.DoublyLinkedList(Command){} } } };
+        master_server_fsm = try fsm.FSM.newConnection(allocator, master_fd, .master, &global_data);
         const command_received_event = Event{
-            .type = .{ .recv = .{ .fd = master_fd, .buffer = new_buffer } },
+            .type = .{ .recv = .{ .fd = master_fd, .buffer = master_server_fsm.?.type.connection.buffer } },
             .user_data = master_server_fsm.?,
         };
         try event_queue.addAsyncEvent(command_received_event);
@@ -190,16 +189,9 @@ pub fn main() !void {
                 try stdout.print("accepted new connection\n", .{});
                 // TODO: fetch user data from pending events to destroy FSMs in
                 // the signal handling code
-                var new_connection_fsm = try allocator.create(fsm.FSM);
-                new_connection_fsm.type = .{ .connection = try fsm.Connection.init(allocator, connection_socket) };
-                new_connection_fsm.global_data = &global_data;
+                const new_connection_fsm = try fsm.FSM.newConnection(allocator, connection_socket, .generic_client, &global_data);
+                try waitForCommand(new_connection_fsm, &event_queue);
 
-                const new_command_event = Event{
-                    .type = .{ .recv = .{ .fd = new_connection_fsm.type.connection.fd, .buffer = new_connection_fsm.type.connection.buffer } },
-                    .user_data = new_connection_fsm,
-                };
-
-                try event_queue.addAsyncEvent(new_command_event);
                 try event_queue.addAsyncEvent(new_connection_event);
             },
             .recv => {
@@ -207,22 +199,17 @@ pub fn main() !void {
                     .server => @panic("Not ready yet"),
                     .connection => |*connection_fsm| {
                         if (completed_event.async_result == 0) { // connection closed
-                            if (connection_fsm.peer_type == .slave) {
-                                if (event_fsm.global_data.slaves.remove(event_fsm)) {
-                                    connection_fsm.deinit();
-                                }
-                            } else connection_fsm.deinit();
-                            if (master_server_fsm == null or (master_server_fsm != null and event_fsm != master_server_fsm.?))
-                                allocator.destroy(event_fsm);
+                            if (connection_fsm.peer_type != .slave or event_fsm.global_data.slaves.remove(event_fsm)) {
+                                event_fsm.deinit();
+                            }
                             continue :event_loop;
                         }
 
                         if (completed_event.async_result < 0) { // error
                             std.debug.print("Error: {} {d}\n", .{ linux.E.init(@intCast(@as(u32, @bitCast(completed_event.async_result)))), completed_event.async_result });
-                            _ = event_fsm.global_data.slaves.remove(event_fsm);
-                            connection_fsm.deinit();
-                            if (master_server_fsm != null and event_fsm != master_server_fsm.?)
-                                allocator.destroy(event_fsm);
+                            if (connection_fsm.peer_type != .slave or event_fsm.global_data.slaves.remove(event_fsm)) {
+                                event_fsm.deinit();
+                            }
                             continue;
                         }
 
@@ -293,9 +280,7 @@ pub fn main() !void {
                                 continue :event_loop;
                             };
 
-                            var new_command = try allocator.create(std.DoublyLinkedList(Command).Node);
-                            new_command.data = command;
-                            connection_fsm.commands_to_execute.append(new_command);
+                            try connection_fsm.addCommand(command);
                             n_new_commands += 1;
                             notify_fsm_event.type.notify.n = n_new_commands;
                             n += parsed_bytes;
@@ -347,6 +332,10 @@ pub fn main() !void {
                 switch (event_fsm.type) {
                     .server => {
                         std.debug.print("Gracefully shutting down...\n", .{});
+                        var slaves_it = event_fsm.global_data.slaves.keyIterator();
+                        while (slaves_it.next()) |slave_fsm| {
+                            slave_fsm.*.deinit();
+                        }
                         break;
                     },
                     .connection => |*connection_fsm| { // WAIT timeout
@@ -401,11 +390,8 @@ pub fn main() !void {
 
                 var temp_allocator = std.heap.ArenaAllocator.init(allocator);
                 defer temp_allocator.deinit();
-                if (connection_fsm.commands_to_execute.popFirst()) |new_command_node| {
-                    // TODO: destroy arrays allocated by the command, if any
-                    var command = new_command_node.data;
-                    defer command.deinit();
-                    allocator.destroy(new_command_node);
+                if (connection_fsm.popCommand()) |*command| {
+                    defer @constCast(command).deinit();
                     switch (command.type) {
                         .wait => |wait_command| {
                             if (wait_command.num_replicas == 0) {
@@ -463,8 +449,6 @@ pub fn main() !void {
                                 pending_wait.actual_n_replicas = count;
                                 pending_wait.timerfd = timeout_fd;
 
-                                std.debug.print("This pending wait: {0} ({0*}) is associated with this timeout: {1}\n", .{ pending_wait, timeout });
-
                                 connection_fsm.state = .{ .blocked = pending_wait };
 
                                 try event_fsm.global_data.pending_waits.add(pending_wait);
@@ -485,7 +469,7 @@ pub fn main() !void {
                         else => {
                             if (connection_fsm.peer_type == .master or (command.shouldPropagate() and instance.master == null))
                                 instance.repl_offset += command.bytes.len;
-                            const reply = instance.executeCommand(temp_allocator.allocator(), &command) catch {
+                            const reply = instance.executeCommand(temp_allocator.allocator(), command) catch {
                                 try respondWith(try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
                                 continue :event_loop;
                             };

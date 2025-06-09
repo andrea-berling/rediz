@@ -136,13 +136,16 @@ pub const Instance = struct {
         _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{resp.BulkString("PING")}).encode(temp_allocator.allocator()));
         const buffer = try temp_allocator.allocator().alloc(u8, 1024);
         var n = try tcp_stream.read(buffer);
-        std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+PONG\r\n"));
+        var response, _ = try resp.Value.parse(buffer, temp_allocator.allocator());
+        std.debug.assert(response == .simple_string and std.ascii.eqlIgnoreCase(response.simple_string, "PONG"));
         _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("listening-port"), resp.BulkString(self.config.get("listening-port").?) }).encode(temp_allocator.allocator()));
         n = try tcp_stream.read(buffer);
-        std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
+        response, _ = try resp.Value.parse(buffer, temp_allocator.allocator());
+        std.debug.assert(response == .simple_string and std.ascii.eqlIgnoreCase(response.simple_string, "OK"));
         _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("capa"), resp.BulkString("psync2") }).encode(temp_allocator.allocator()));
         n = try tcp_stream.read(buffer);
-        std.debug.assert(std.ascii.eqlIgnoreCase(buffer[0..n], "+OK\r\n"));
+        response, _ = try resp.Value.parse(buffer, temp_allocator.allocator());
+        std.debug.assert(response == .simple_string and std.ascii.eqlIgnoreCase(response.simple_string, "OK"));
         _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{ resp.BulkString("PSYNC"), resp.BulkString("?"), resp.BulkString("-1") }).encode(temp_allocator.allocator()));
 
         var timeout = posix.timeval{
