@@ -46,7 +46,6 @@ pub const Instance = struct {
     master: ?posix.socket_t = null,
     replid: []const u8,
     repl_offset: usize,
-    n_slaves: i64,
     rng: std.Random.DefaultPrng,
 
     inline fn dupe(self: *Instance, bytes: []const u8) ![]u8 {
@@ -61,7 +60,6 @@ pub const Instance = struct {
         instance.config = std.StringHashMap([]u8).init(instance.arena_allocator.allocator());
         instance.master = null;
         instance.repl_offset = 0;
-        instance.n_slaves = 0;
         instance.rng = std.Random.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
 
         const config_defaults = [_]struct { []const u8, []const u8 }{.{ "dbfilename", "dump.rdb" }};
@@ -177,7 +175,7 @@ pub const Instance = struct {
         while (n > parsed_bytes) {
             const command, const command_bytes = try Command.parse(buffer[parsed_bytes..], temp_allocator.allocator());
             const reply = try self.executeCommand(temp_allocator.allocator(), &command);
-            if (command == .replconf and command.replconf == .getack) {
+            if (command.type == .replconf and command.type.replconf == .getack) {
                 _ = try tcp_stream.write(try reply.encode(temp_allocator.allocator()));
             }
             parsed_bytes += command_bytes;
@@ -195,7 +193,7 @@ pub const Instance = struct {
     /// Arrays returned are dynamicall allocated and should be freed by the
     /// called, strings should not, as they point to the given command
     pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: *const Command) !resp.Value {
-        switch (command.*) {
+        switch (command.type) {
             .ping => return resp.SimpleString("PONG"),
             .echo => |string| return resp.SimpleString(string),
             .get => |key| {
@@ -411,7 +409,7 @@ pub const Instance = struct {
             .replconf => |replica_config_command| {
                 switch (replica_config_command) {
                     .getack => {
-                        return resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("ACK"), resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{self.repl_offset})) });
+                        return resp.Array(try allocator.dupe(resp.Value, &[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("ACK"), resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{self.repl_offset})) }));
                     },
                     .capabilities => |capabilities| {
                         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
@@ -424,9 +422,6 @@ pub const Instance = struct {
                         return resp.Ok;
                     },
                 }
-            },
-            .wait => {
-                return resp.Integer(self.n_slaves);
             },
             .type => |key| {
                 if (self.data.get(key)) |data| {

@@ -4,26 +4,30 @@ const resp = @import("resp.zig");
 
 pub const Error = error{ InvalidArgument, InvalidCommand, InvalidInput, InvalidStreamID, MissingArgument, NotEnoughArguments, UnsupportedCommand, WrongNumberOfArguments };
 
-pub const Command = union(enum) {
-    ping,
-    echo: []const u8,
-    get: []const u8,
-    set: SetCommand,
-    keys: []const u8,
-    xadd: StreamAddCommand,
-    xrange: StreamRangeCommand,
-    xread: []const StreamReadRequest,
-    config: ConfigCommand,
-    info: InfoCommand,
-    replconf: ReplicaConfigCommand,
-    psync: PsyncConfigCommand,
-    wait: WaitCommand,
-    type: []const u8,
+pub const Command = struct {
+    bytes: []u8,
+    type: union(enum) {
+        ping,
+        echo: []const u8,
+        get: []const u8,
+        set: SetCommand,
+        keys: []const u8,
+        xadd: StreamAddCommand,
+        xrange: StreamRangeCommand,
+        xread: []const StreamReadRequest,
+        config: ConfigCommand,
+        info: InfoCommand,
+        replconf: ReplicaConfigCommand,
+        psync: PsyncConfigCommand,
+        wait: WaitCommand,
+        type: []const u8,
+    },
+    allocator: std.mem.Allocator,
 
     const Self = @This();
 
     fn keywordToIndex(string: []const u8) isize {
-        const type_info = @typeInfo(@This());
+        const type_info = @typeInfo(@FieldType(@This(), "type"));
         const fields_info = comptime type_info.@"union".fields;
         const other_keywords = [_][]const u8{ "px", "pxat", "ex", "exat", "streams", "replication" };
         var keywords: [fields_info.len + other_keywords.len][]const u8 = undefined;
@@ -51,18 +55,22 @@ pub const Command = union(enum) {
             return Error.InvalidInput;
         }
 
+        var command: Command = undefined;
+        command.allocator = allocator;
+        command.bytes = try allocator.dupe(u8, bytes[0..parsed_bytes]);
+
         var array = try temp_allocator.allocator().alloc([]const u8, value.array.len);
 
         for (0..value.array.len) |i| {
             switch (value.array[i]) {
                 .null => array[i] = "-1"[0..],
-                .bulk_string => |string| array[i] = string,
+                .bulk_string => |string| array[i] = (command.bytes.ptr + (string.ptr - bytes.ptr))[0..string.len],
                 else => return Error.InvalidInput,
             }
         }
 
         const k2idx = keywordToIndex;
-        const command: Command = blk: switch (k2idx(array[0])) {
+        command.type = blk: switch (k2idx(array[0])) {
             k2idx("ping") => {
                 break :blk .ping;
             },
@@ -112,7 +120,7 @@ pub const Command = union(enum) {
                     }
                 }
 
-                break :blk Self{ .set = set_command };
+                break :blk .{ .set = set_command };
             },
             k2idx("keys") => {
                 if (array.len == 1)
@@ -121,7 +129,7 @@ pub const Command = union(enum) {
                     return Error.WrongNumberOfArguments;
                 if (!std.mem.eql(u8, array[1], "*")) // only pattern we support for now
                     return Error.InvalidArgument;
-                break :blk Self{ .keys = array[1] };
+                break :blk .{ .keys = array[1] };
             },
             k2idx("xadd") => {
                 if (array.len < 5)
@@ -137,7 +145,7 @@ pub const Command = union(enum) {
                 for (0..(array.len - 3) / 2) |i| {
                     stream_add_command.key_value_pairs[i] = .{ .key = array[2 * i + 3], .value = array[2 * i + 4] };
                 }
-                break :blk Self{ .xadd = stream_add_command };
+                break :blk .{ .xadd = stream_add_command };
             },
             k2idx("xrange") => {
                 if (array.len != 4)
@@ -150,7 +158,7 @@ pub const Command = union(enum) {
                 stream_range_command.end_entry_id = if (std.mem.eql(u8, array[3], "+")) .plus else StreamRangeBound{ .entry_id = parseStreamEntryId(array[3]) catch {
                     return Error.InvalidStreamID;
                 } };
-                break :blk Self{ .xrange = stream_range_command };
+                break :blk .{ .xrange = stream_range_command };
             },
             k2idx("xread") => {
                 if (array.len < 4)
@@ -178,7 +186,7 @@ pub const Command = union(enum) {
                     };
                 }
 
-                break :blk Self{ .xread = stream_read_requests };
+                break :blk .{ .xread = stream_read_requests };
             },
             k2idx("config") => {
                 if (array.len < 2)
@@ -187,13 +195,13 @@ pub const Command = union(enum) {
                     k2idx("get") => {
                         if (array.len != 3)
                             return Error.WrongNumberOfArguments;
-                        break :blk Self{ .config = ConfigCommand{ .get = array[2] } };
+                        break :blk .{ .config = ConfigCommand{ .get = array[2] } };
                     },
 
                     k2idx("set") => {
                         if (array.len != 4)
                             return Error.WrongNumberOfArguments;
-                        break :blk Self{ .config = ConfigCommand{ .set = .{ .option = array[2], .value = array[3] } } };
+                        break :blk .{ .config = ConfigCommand{ .set = .{ .option = array[2], .value = array[3] } } };
                     },
                     else => return Error.InvalidCommand,
                 }
@@ -201,7 +209,7 @@ pub const Command = union(enum) {
             k2idx("info") => {
                 if (array.len != 2 or k2idx(array[1]) != k2idx("replication"))
                     return Error.InvalidCommand;
-                break :blk Self{ .info = .replication };
+                break :blk .{ .info = .replication };
             },
             k2idx("replconf") => {
                 if (array.len < 2)
@@ -224,36 +232,30 @@ pub const Command = union(enum) {
                 } else {
                     return Error.InvalidCommand;
                 }
-                break :blk Self{ .replconf = replconf_command };
+                break :blk .{ .replconf = replconf_command };
             },
             k2idx("psync") => {
                 if (array.len != 3)
                     return Error.InvalidCommand;
-                var command = Self{ .psync = undefined };
-                command.psync.replication_id = array[1];
-                command.psync.offset = std.fmt.parseInt(i64, array[2], 10) catch {
+                break :blk .{ .psync = .{ .replication_id = array[1], .offset = std.fmt.parseInt(i64, array[2], 10) catch {
                     return Error.InvalidArgument;
-                };
-                break :blk command;
+                } } };
             },
             k2idx("wait") => {
                 if (array.len != 3)
                     return Error.InvalidCommand;
-                var command = Self{ .wait = undefined };
-                command.wait.num_replicas = std.fmt.parseInt(usize, array[1], 10) catch {
+                break :blk .{ .wait = .{ .num_replicas = std.fmt.parseInt(usize, array[1], 10) catch {
                     return Error.InvalidArgument;
-                };
-                command.wait.timeout_ms = std.fmt.parseInt(usize, array[2], 10) catch {
+                }, .timeout_ms = std.fmt.parseInt(usize, array[2], 10) catch {
                     return Error.InvalidArgument;
-                };
-                break :blk command;
+                } } };
             },
             k2idx("type") => {
                 if (array.len < 2)
                     return Error.MissingArgument;
                 if (array.len != 2)
                     return Error.WrongNumberOfArguments;
-                break :blk Self{ .type = array[1] };
+                break :blk .{ .type = array[1] };
             },
             else => {
                 return Error.UnsupportedCommand;
@@ -264,7 +266,7 @@ pub const Command = union(enum) {
     }
 
     pub fn shouldPropagate(self: *const Self) bool {
-        switch (self.*) {
+        switch (self.*.type) {
             .ping, .echo, .get, .keys, .xrange, .xread, .config, .info, .replconf, .psync, .wait, .type => return false,
             .set, .xadd => return true,
         }
@@ -274,7 +276,7 @@ pub const Command = union(enum) {
         var temp_allocator = std.heap.ArenaAllocator.init(allocator);
         defer temp_allocator.deinit();
         var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
-        switch (self.*) {
+        switch (self.*.type) {
             .ping => try response.append(resp.BulkString("PONG")),
             .echo => |string| try response.appendSlice(&[_]resp.Value{ resp.BulkString("ECHO"), resp.BulkString(string) }),
             .get => |key| try response.appendSlice(&[_]resp.Value{ resp.BulkString("GET"), resp.BulkString(key) }),
@@ -363,21 +365,22 @@ pub const Command = union(enum) {
         return try resp.Array(try response.toOwnedSlice()).encode(allocator);
     }
 
-    pub fn destroy(self: *Command, allocator: std.mem.Allocator) void {
-        switch (self.*) {
+    pub fn deinit(self: *Command) void {
+        switch (self.*.type) {
             .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type => {},
             .xadd => |stream_add_command| {
-                allocator.free(stream_add_command.key_value_pairs);
+                self.allocator.free(stream_add_command.key_value_pairs);
             },
             .xread => |stream_read_requests| {
-                allocator.free(stream_read_requests);
+                self.allocator.free(stream_read_requests);
             },
             .replconf => |replica_config_command| {
                 if (replica_config_command == .capabilities) {
-                    allocator.free(replica_config_command.capabilities);
+                    self.allocator.free(replica_config_command.capabilities);
                 }
             },
         }
+        self.allocator.free(self.bytes);
         self.* = undefined;
     }
 };

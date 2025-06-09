@@ -32,7 +32,7 @@ pub fn Event(comptime T: type) type {
             send: EventWithBuffer,
             recv: EventWithBuffer,
             read: EventWithBuffer,
-            notify: posix.fd_t,
+            notify: struct { fd: posix.fd_t, n: u64 = 1 },
             accept: posix.socket_t,
             pollin: posix.socket_t,
         },
@@ -65,9 +65,8 @@ pub fn CompletedEvent(comptime T: type) type {
                     try writer.writeAll("read on fd ");
                     try std.fmt.formatInt(ev.fd, 10, .lower, options, writer);
                 },
-                .notify => |fd| {
-                    try writer.writeAll("notify on fd ");
-                    try std.fmt.formatInt(fd, 10, .lower, options, writer);
+                .notify => |notification| {
+                    try std.fmt.format(writer, "notify +{} on fd {}", .{ notification.n, notification.fd });
                 },
                 .accept => |fd| {
                     try writer.writeAll("accept on fd ");
@@ -108,7 +107,8 @@ pub fn EventQueue(comptime T: type) type {
         sqring: SQRing,
         cqring: CQRing,
         pending_events: std.AutoHashMap(*const Event(T), void),
-        notification_value: u64,
+        // Goddamn write to eventfd needing a buffer
+        notification_values: [10]u64,
 
         const Self = @This();
 
@@ -140,7 +140,7 @@ pub fn EventQueue(comptime T: type) type {
                 .cqes = @as([*]linux.io_uring_cqe, @alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.cqes])))[0..params.cq_entries],
             };
 
-            return .{ .allocator = allocator, .io_uring_fd = io_uring_fd, .params = params, .sqring = sqring, .cqring = cqring, .pending_events = std.AutoHashMap(*const Event(T), void).init(allocator), .notification_value = 1 };
+            return .{ .allocator = allocator, .io_uring_fd = io_uring_fd, .params = params, .sqring = sqring, .cqring = cqring, .pending_events = std.AutoHashMap(*const Event(T), void).init(allocator), .notification_values = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 } };
         }
 
         pub fn addAsyncEvent(self: *Self, event: Event(T)) !void {
@@ -157,8 +157,8 @@ pub fn EventQueue(comptime T: type) type {
                 .read => |read_event| {
                     sqe.prep_read(read_event.fd, read_event.buffer, 0);
                 },
-                .notify => |event_fd| {
-                    sqe.prep_write(event_fd, std.mem.asBytes(&self.notification_value), 0);
+                .notify => |notification| {
+                    sqe.prep_write(notification.fd, std.mem.asBytes(&self.notification_values[notification.n]), 0);
                 },
                 .accept => |fd| {
                     sqe.prep_accept(fd, null, null, 0);
