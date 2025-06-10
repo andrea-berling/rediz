@@ -14,10 +14,7 @@ pub const Command = struct {
         keys: []const u8,
         xadd: StreamAddCommand,
         xrange: StreamRangeCommand,
-        xread: struct {
-            block_timeout_ms: ?usize,
-            requests: []const StreamReadRequest,
-        },
+        xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest },
         config: ConfigCommand,
         info: InfoCommand,
         replconf: ReplicaConfigCommand,
@@ -183,18 +180,18 @@ pub const Command = struct {
                 var stream_read_requests = try allocator.alloc(StreamReadRequest, (n_args) / 2);
 
                 var first_range_index: usize = streams_index + 1;
-                // Basically Zig's is_err()
+                // Basically Zig's .is_err()
                 // https://ziggit.dev/t/more-syntactically-cleaner-way-to-check-if-a-something-is-an-error-from-an-error-union/4312/3
-                while (if (parseStreamEntryId(array[first_range_index])) |_| false else |_| true) : (first_range_index += 1) {}
+                while (if (parseStreamEntryId(array[first_range_index])) |_| false else |_| if (std.mem.eql(u8, array[first_range_index], "$")) false else true) : (first_range_index += 1) {}
 
                 const offset = first_range_index - streams_index - 1;
 
                 for (0..(n_args) / 2) |i| {
                     stream_read_requests[i] = StreamReadRequest{
                         .stream_key = array[i + streams_index + 1],
-                        .start_entry_id = parseStreamEntryId(array[i + streams_index + 1 + offset]) catch {
+                        .start_entry_id = if (std.mem.eql(u8, array[i + streams_index + 1 + offset], "$")) .new_data else .{ .entry_id = parseStreamEntryId(array[i + streams_index + 1 + offset]) catch {
                             return Error.InvalidStreamID;
-                        },
+                        } },
                     };
                 }
 
@@ -428,7 +425,7 @@ pub const StreamRangeCommand = struct {
     end_entry_id: StreamRangeBound,
 };
 
-pub const StreamReadRequest = struct { stream_key: []const u8, start_entry_id: db.StreamEntryID };
+pub const StreamReadRequest = struct { stream_key: []const u8, start_entry_id: union(enum) { entry_id: db.StreamEntryID, new_data } };
 
 pub const ConfigCommand = union(enum) {
     get: []const u8,

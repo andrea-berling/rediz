@@ -345,6 +345,9 @@ pub const Instance = struct {
                 var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
                 var available_data = false;
                 for (stream_read_request.requests) |request| {
+                    if (request.start_entry_id == .new_data) {
+                        return resp.Null;
+                    }
                     if (self.data.get(request.stream_key)) |datum| {
                         switch (datum.value) {
                             .stream => |stream| {
@@ -355,7 +358,7 @@ pub const Instance = struct {
 
                                 const stream_keys = stream.keys();
 
-                                const request_entry_id = request.start_entry_id;
+                                const request_entry_id = request.start_entry_id.entry_id;
                                 var start_index: usize = 0;
                                 while (start_index < stream_keys.len and (!request_entry_id.isLessThanOrEqual(stream_keys[start_index]) or request_entry_id == stream_keys[start_index])) : (start_index += 1) {}
 
