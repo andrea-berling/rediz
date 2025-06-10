@@ -338,27 +338,29 @@ pub const Instance = struct {
                     }
                 } else return resp.Null;
             },
-            .xread => |stream_read_requests| {
+            .xread => |stream_read_request| {
                 var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
                 defer temp_allocator.deinit();
 
                 var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
-                for (stream_read_requests) |stream_read_request| {
-                    if (self.data.get(stream_read_request.stream_key)) |datum| {
+                var available_data = false;
+                for (stream_read_request.requests) |request| {
+                    if (self.data.get(request.stream_key)) |datum| {
                         switch (datum.value) {
                             .stream => |stream| {
                                 var new_response_entry = std.ArrayList(resp.Value).init(temp_allocator.allocator());
-                                try new_response_entry.append(resp.BulkString(stream_read_request.stream_key));
+                                try new_response_entry.append(resp.BulkString(request.stream_key));
 
                                 var stream_entries = std.ArrayList(resp.Value).init(temp_allocator.allocator());
 
                                 const stream_keys = stream.keys();
 
-                                const request_entry_id = stream_read_request.start_entry_id;
+                                const request_entry_id = request.start_entry_id;
                                 var start_index: usize = 0;
-                                while ((!request_entry_id.isLessThanOrEqual(stream_keys[start_index]) or request_entry_id == stream_keys[start_index]) and start_index < stream_keys.len) : (start_index += 1) {}
+                                while (start_index < stream_keys.len and (!request_entry_id.isLessThanOrEqual(stream_keys[start_index]) or request_entry_id == stream_keys[start_index])) : (start_index += 1) {}
 
                                 for (start_index..stream_keys.len) |index| {
+                                    available_data = true;
                                     var entry_entries_it = stream.get(stream_keys[index]).?.iterator();
                                     var entry_elements = std.ArrayList(resp.Value).init(temp_allocator.allocator());
                                     while (entry_entries_it.next()) |keyval_pair| {
@@ -375,12 +377,16 @@ pub const Instance = struct {
                                 try response.append(resp.Array(try new_response_entry.toOwnedSlice()));
                             },
                             else => {
-                                return resp.SimpleError(try std.fmt.allocPrint(temp_allocator.allocator(), "{s} does not denote a stream", .{stream_read_request.stream_key}));
+                                return resp.SimpleError(try std.fmt.allocPrint(temp_allocator.allocator(), "{s} does not denote a stream", .{request.stream_key}));
                             },
                         }
                     } else return resp.Null;
                 }
-                return resp.Array(try response.toOwnedSlice());
+                if (available_data) {
+                    return resp.Array(try response.toOwnedSlice());
+                } else {
+                    return resp.Null;
+                }
             },
             .config => |config_command| {
                 switch (config_command) {

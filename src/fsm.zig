@@ -23,7 +23,7 @@ pub const Connection = struct {
         master,
         generic_client,
     } = .generic_client,
-    state: union(enum) { in_sync, sending_response, waiting_for_commands, executing_commands, sending_dump, propagating_command, sending_getack, waiting_for_ack, blocked: *PendingWait } = .waiting_for_commands,
+    state: union(enum) { in_sync, sending_response, waiting_for_commands, executing_commands, sending_dump, propagating_command, sending_getack, waiting_for_ack, blocked: *PendingWait, waiting_for_new_data_on_stream: *BlockedStreamRead } = .waiting_for_commands,
     allocator: Allocator,
 
     const Self = @This();
@@ -101,17 +101,19 @@ pub const FSM = struct {
 pub const GlobalData = struct {
     slaves: std.AutoHashMap(*FSM, void),
     pending_waits: std.PriorityQueue(*PendingWait, void, PendingWait.order),
+    blocked_xreads: std.StringHashMap(*std.AutoArrayHashMap(*BlockedStreamRead, void)),
     allocator: Allocator,
 
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
-        return Self{ .pending_waits = std.PriorityQueue(*PendingWait, void, PendingWait.order).init(allocator, undefined), .slaves = std.AutoHashMap(*FSM, void).init(allocator), .allocator = allocator };
+        return Self{ .pending_waits = std.PriorityQueue(*PendingWait, void, PendingWait.order).init(allocator, undefined), .blocked_xreads = std.StringHashMap(*std.AutoArrayHashMap(*BlockedStreamRead, void)).init(allocator), .slaves = std.AutoHashMap(*FSM, void).init(allocator), .allocator = allocator };
     }
 
     pub fn deinit(self: *Self) void {
         self.slaves.deinit();
         self.pending_waits.deinit();
+        self.blocked_xreads.deinit();
     }
 };
 
@@ -126,5 +128,35 @@ pub const PendingWait = struct {
     pub fn order(context: void, a: *PendingWait, b: *PendingWait) std.math.Order {
         _ = context;
         return std.math.order(a.timeout, b.timeout);
+    }
+};
+
+pub const BlockedStreamRead = struct {
+    client_connection_fsm: *FSM,
+    streams: std.ArrayList([]const u8),
+    timerfd: ?posix.fd_t,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, client_connection_fsm: *FSM, timerfd: ?posix.fd_t) Self {
+        std.debug.assert(client_connection_fsm.type == .connection);
+        return Self{
+            .client_connection_fsm = client_connection_fsm,
+            .streams = std.ArrayList([]const u8).init(allocator),
+            .timerfd = timerfd,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn addStream(self: *Self, stream: []const u8) !void {
+        try self.streams.append(try self.allocator.dupe(u8, stream));
+    }
+
+    pub fn deinit(self: *Self) void {
+        for (self.streams.items) |stream| {
+            self.allocator.free(stream);
+        }
+        self.streams.deinit();
     }
 };

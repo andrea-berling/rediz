@@ -14,7 +14,10 @@ pub const Command = struct {
         keys: []const u8,
         xadd: StreamAddCommand,
         xrange: StreamRangeCommand,
-        xread: []const StreamReadRequest,
+        xread: struct {
+            block_timeout_ms: ?usize,
+            requests: []const StreamReadRequest,
+        },
         config: ConfigCommand,
         info: InfoCommand,
         replconf: ReplicaConfigCommand,
@@ -29,7 +32,7 @@ pub const Command = struct {
     fn keywordToIndex(string: []const u8) isize {
         const type_info = @typeInfo(@FieldType(@This(), "type"));
         const fields_info = comptime type_info.@"union".fields;
-        const other_keywords = [_][]const u8{ "px", "pxat", "ex", "exat", "streams", "replication" };
+        const other_keywords = [_][]const u8{ "px", "pxat", "ex", "exat", "streams", "replication", "block" };
         var keywords: [fields_info.len + other_keywords.len][]const u8 = undefined;
         @setEvalBranchQuota(2000);
         inline for (fields_info, 0..) |field, i| {
@@ -163,30 +166,39 @@ pub const Command = struct {
             k2idx("xread") => {
                 if (array.len < 4)
                     return Error.NotEnoughArguments;
-                if (k2idx(array[1]) != k2idx("streams"))
+                var streams_index: usize = 1;
+                var block_timeout_ms: ?usize = null;
+                if (k2idx(array[1]) == k2idx("block")) {
+                    block_timeout_ms = std.fmt.parseInt(usize, array[2], 10) catch {
+                        return Error.InvalidArgument;
+                    };
+                    streams_index += 2;
+                }
+                if (k2idx(array[streams_index]) != k2idx("streams"))
                     return Error.InvalidCommand;
-                if ((array.len - 2) % 2 != 0)
+                const n_args = array.len - streams_index - 1;
+                if (n_args % 2 != 0)
                     return Error.WrongNumberOfArguments;
 
-                var stream_read_requests = try allocator.alloc(StreamReadRequest, (array.len - 2) / 2);
+                var stream_read_requests = try allocator.alloc(StreamReadRequest, (n_args) / 2);
 
-                var first_range_index: usize = 2;
+                var first_range_index: usize = streams_index + 1;
                 // Basically Zig's is_err()
                 // https://ziggit.dev/t/more-syntactically-cleaner-way-to-check-if-a-something-is-an-error-from-an-error-union/4312/3
                 while (if (parseStreamEntryId(array[first_range_index])) |_| false else |_| true) : (first_range_index += 1) {}
 
-                const offset = first_range_index - 2;
+                const offset = first_range_index - streams_index - 1;
 
-                for (0..(array.len - 2) / 2) |i| {
+                for (0..(n_args) / 2) |i| {
                     stream_read_requests[i] = StreamReadRequest{
-                        .stream_key = array[i + 2],
-                        .start_entry_id = parseStreamEntryId(array[i + 2 + offset]) catch {
+                        .stream_key = array[i + streams_index + 1],
+                        .start_entry_id = parseStreamEntryId(array[i + streams_index + 1 + offset]) catch {
                             return Error.InvalidStreamID;
                         },
                     };
                 }
 
-                break :blk .{ .xread = stream_read_requests };
+                break :blk .{ .xread = .{ .block_timeout_ms = block_timeout_ms, .requests = stream_read_requests } };
             },
             k2idx("config") => {
                 if (array.len < 2)
@@ -372,7 +384,7 @@ pub const Command = struct {
                 self.allocator.free(stream_add_command.key_value_pairs);
             },
             .xread => |stream_read_requests| {
-                self.allocator.free(stream_read_requests);
+                self.allocator.free(stream_read_requests.requests);
             },
             .replconf => |replica_config_command| {
                 if (replica_config_command == .capabilities) {

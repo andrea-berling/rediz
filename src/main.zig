@@ -54,6 +54,23 @@ fn FSMdestroyer(finite_state_machine: *fsm.FSM) void {
         finite_state_machine.deinit();
 }
 
+fn setupTimer(timeout_ms: usize) !posix.fd_t {
+    const timeout_fd = try posix.timerfd_create(posix.timerfd_clockid_t.REALTIME, linux.TFD{});
+
+    const time_to_wait = @as(isize, @bitCast(timeout_ms)) * 1_000_000;
+    const timeout = linux.itimerspec{
+        .it_interval = linux.timespec{
+            .sec = 0,
+            .nsec = 0,
+        },
+        .it_value = linux.timespec{ .sec = @divFloor(time_to_wait, 1_000_000_000), .nsec = @rem(time_to_wait, 1_000_000_000) },
+    };
+
+    try posix.timerfd_settime(timeout_fd, linux.TFD.TIMER{}, &timeout, null);
+
+    return timeout_fd;
+}
+
 pub fn main() !void {
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -202,6 +219,7 @@ pub fn main() !void {
                             if (connection_fsm.peer_type != .slave or event_fsm.global_data.slaves.remove(event_fsm)) {
                                 event_fsm.deinit();
                             }
+                            try event_queue.removePendingEvents(event_fsm);
                             continue :event_loop;
                         }
 
@@ -210,6 +228,7 @@ pub fn main() !void {
                             if (connection_fsm.peer_type != .slave or event_fsm.global_data.slaves.remove(event_fsm)) {
                                 event_fsm.deinit();
                             }
+                            try event_queue.removePendingEvents(event_fsm);
                             continue;
                         }
 
@@ -338,11 +357,12 @@ pub fn main() !void {
                         }
                         break;
                     },
-                    .connection => |*connection_fsm| { // WAIT timeout
-                        var pending_wait_it = event_fsm.global_data.pending_waits.iterator();
-
+                    .connection => |*connection_fsm| { // Blocked XREAD or WAIT timeout
                         var temp_allocator = std.heap.ArenaAllocator.init(allocator);
                         defer temp_allocator.deinit();
+
+                        // Is it a pending wait?
+                        var pending_wait_it = event_fsm.global_data.pending_waits.iterator();
 
                         var maybe_index: ?usize = null;
                         var i: usize = 0;
@@ -370,6 +390,55 @@ pub fn main() !void {
                             try respondWith(try reply.encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
                             allocator.destroy(pending_wait);
                             posix.close(completed_event.awaited_event.type.pollin); // the timerfd
+                            continue :event_loop;
+                        }
+
+                        if (indicesToRemove.items.len > 0)
+                            continue :event_loop; // it was a pending wait, go ahead
+
+                        // Is it a blocked xread?
+                        if (connection_fsm.state == .waiting_for_new_data_on_stream) {
+                            const blocked_xread = connection_fsm.state.waiting_for_new_data_on_stream;
+                            defer allocator.destroy(blocked_xread);
+                            defer blocked_xread.deinit();
+                            for (blocked_xread.streams.items) |stream| {
+                                if (event_fsm.global_data.blocked_xreads.getKey(stream)) |stream_key| {
+                                    var blocked_reads = event_fsm.global_data.blocked_xreads.get(stream_key).?;
+                                    _ = blocked_reads.swapRemove(blocked_xread);
+                                    if (blocked_reads.count() == 0) {
+                                        blocked_reads.deinit();
+                                        allocator.destroy(blocked_reads);
+                                        allocator.free(stream_key);
+                                    }
+                                }
+                            }
+                            try respondWith(try resp.Null.encode(temp_allocator.allocator()), blocked_xread.client_connection_fsm, &event_queue, .{});
+                        } else {
+                            var blocked_xreads_it = event_fsm.global_data.blocked_xreads.iterator();
+                            var streams_to_remove = std.ArrayList([]const u8).init(temp_allocator.allocator());
+                            while (blocked_xreads_it.next()) |blocked_xread| {
+                                const stream = blocked_xread.key_ptr.*;
+                                const stream_blocked_reads = blocked_xread.value_ptr.*;
+                                var keys_to_remove = std.ArrayList(*fsm.BlockedStreamRead).init(temp_allocator.allocator());
+                                for (stream_blocked_reads.keys()) |read| {
+                                    if (read.client_connection_fsm == event_fsm and read.timerfd != null and read.timerfd == timerfd) {
+                                        try keys_to_remove.append(read);
+                                    }
+                                }
+                                for (keys_to_remove.items) |key| {
+                                    _ = stream_blocked_reads.swapRemove(key);
+                                }
+                                if (stream_blocked_reads.count() == 0) {
+                                    stream_blocked_reads.deinit();
+                                    allocator.destroy(stream_blocked_reads);
+                                    try streams_to_remove.append(stream);
+                                }
+                            }
+                            for (streams_to_remove.items) |stream| {
+                                const stream_key = event_fsm.global_data.blocked_xreads.getKey(stream).?;
+                                _ = event_fsm.global_data.blocked_xreads.remove(stream_key);
+                                allocator.free(stream_key);
+                            }
                         }
                     },
                 }
@@ -399,22 +468,9 @@ pub fn main() !void {
                             } else {
                                 var count: usize = 0;
                                 const num_replicas_threshold = command.type.wait.num_replicas;
-                                const timeout_ms = command.type.wait.timeout_ms;
+                                const timeout_timestamp = std.time.milliTimestamp() + @as(i64, @bitCast(command.type.wait.timeout_ms));
 
-                                const timeout_timestamp = std.time.milliTimestamp() + @as(i64, @bitCast(timeout_ms));
-
-                                const timeout_fd = try posix.timerfd_create(posix.timerfd_clockid_t.REALTIME, linux.TFD{});
-
-                                const time_to_wait = @as(isize, @bitCast(timeout_ms)) * 1_000_000;
-                                const timeout = linux.itimerspec{
-                                    .it_interval = linux.timespec{
-                                        .sec = 0,
-                                        .nsec = 0,
-                                    },
-                                    .it_value = linux.timespec{ .sec = @divFloor(time_to_wait, 1_000_000_000), .nsec = @rem(time_to_wait, 1_000_000_000) },
-                                };
-
-                                try posix.timerfd_settime(timeout_fd, linux.TFD.TIMER{}, &timeout, null);
+                                const timeout_fd = try setupTimer(command.type.wait.timeout_ms);
 
                                 var slaves_it = event_fsm.global_data.slaves.iterator();
                                 while (slaves_it.next()) |slave| {
@@ -473,6 +529,70 @@ pub fn main() !void {
                                 try respondWith(try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
                                 continue :event_loop;
                             };
+
+                            if (command.type == .xread and command.type.xread.block_timeout_ms != null and std.meta.eql(reply, resp.Null)) {
+                                var timerfd: ?posix.fd_t = null;
+                                if (command.type.xread.block_timeout_ms) |timeout_ms| {
+                                    timerfd = try setupTimer(timeout_ms);
+                                }
+                                var blocked_stream_read = try allocator.create(fsm.BlockedStreamRead);
+                                blocked_stream_read.* = fsm.BlockedStreamRead.init(allocator, event_fsm, timerfd);
+                                for (command.type.xread.requests) |request| {
+                                    try blocked_stream_read.addStream(request.stream_key);
+                                }
+
+                                for (command.type.xread.requests) |request| {
+                                    const blocked_stream_read_queue = try event_fsm.global_data.blocked_xreads.getOrPut(try allocator.dupe(u8, request.stream_key));
+                                    if (!blocked_stream_read_queue.found_existing) {
+                                        blocked_stream_read_queue.value_ptr.* = try allocator.create(std.AutoArrayHashMap(*fsm.BlockedStreamRead, void));
+                                        blocked_stream_read_queue.value_ptr.*.* = std.AutoArrayHashMap(*fsm.BlockedStreamRead, void).init(allocator);
+                                    }
+
+                                    try blocked_stream_read_queue.value_ptr.*.put(blocked_stream_read, {});
+                                }
+
+                                connection_fsm.state = .{ .waiting_for_new_data_on_stream = blocked_stream_read };
+
+                                if (timerfd) |fd| {
+                                    const timeout_event = Event{ .type = .{ .pollin = fd }, .user_data = event_fsm };
+
+                                    try event_queue.addAsyncEvent(timeout_event);
+                                }
+
+                                continue :event_loop;
+                            }
+
+                            if (command.type == .xadd) {
+                                const xadd_command = command.type.xadd;
+                                if (event_fsm.global_data.blocked_xreads.get(xadd_command.stream_key)) |blocked_stream_reads| {
+                                    for (blocked_stream_reads.keys()) |blocked_stream_read| {
+                                        defer allocator.destroy(blocked_stream_read);
+                                        defer blocked_stream_read.deinit();
+
+                                        var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+                                        try response.append(resp.BulkString(xadd_command.stream_key));
+                                        var entry_elements = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+                                        for (xadd_command.key_value_pairs) |pair| {
+                                            try entry_elements.append(resp.BulkString(pair.key));
+                                            try entry_elements.append(resp.BulkString(pair.value));
+                                        }
+
+                                        var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
+                                        tmp_array[0] = reply;
+                                        tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
+                                        try response.append(resp.Array(&[_]resp.Value{resp.Array(tmp_array)}));
+
+                                        try respondWith(try resp.Array(&[_]resp.Value{resp.Array(try response.toOwnedSlice())}).encode(temp_allocator.allocator()), blocked_stream_read.client_connection_fsm, &event_queue, .{});
+                                    }
+
+                                    if (event_fsm.global_data.blocked_xreads.getKey(xadd_command.stream_key)) |stream_key| {
+                                        event_fsm.global_data.blocked_xreads.get(xadd_command.stream_key).?.deinit();
+                                        allocator.destroy(event_fsm.global_data.blocked_xreads.get(xadd_command.stream_key).?);
+                                        _ = event_fsm.global_data.blocked_xreads.remove(stream_key);
+                                        allocator.free(stream_key);
+                                    }
+                                }
+                            }
 
                             if (command.shouldPropagate() and instance.master == null) {
                                 var slaves_it = event_fsm.global_data.slaves.keyIterator();

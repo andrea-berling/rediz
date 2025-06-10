@@ -208,16 +208,41 @@ pub fn EventQueue(comptime T: type) type {
 
         pub fn destroy(self: *Self, opts: struct { user_data_destroyer: ?fn (*T) void = null }) !void {
             try self.cancelAllPendingOps();
+
+            var temp_allocator = std.heap.ArenaAllocator.init(self.allocator);
+            defer temp_allocator.deinit();
+
             var pending_events_it = self.pending_events.keyIterator();
+            var already_destroyed_user_data = std.AutoHashMap(*const T, void).init(temp_allocator.allocator());
+
             while (pending_events_it.next()) |pending_event| {
                 if (opts.user_data_destroyer) |destroyer| {
-                    destroyer(pending_event.*.user_data);
+                    if (!already_destroyed_user_data.contains(pending_event.*.user_data)) {
+                        destroyer(pending_event.*.user_data);
+                        try already_destroyed_user_data.put(pending_event.*.user_data, {});
+                    }
                 }
                 self.allocator.destroy(pending_event.*);
             }
             self.pending_events.deinit();
             self.allocator.destroy(self.params);
             posix.close(self.io_uring_fd);
+        }
+
+        pub fn removePendingEvents(self: *Self, user_data: *const T) !void {
+            var event_it = self.pending_events.keyIterator();
+            var temp_allocator = std.heap.ArenaAllocator.init(self.allocator);
+            defer temp_allocator.deinit();
+            var events_to_remove = std.ArrayList(*const Event(T)).init(temp_allocator.allocator());
+            while (event_it.next()) |event| {
+                if (event.*.user_data == user_data) {
+                    try events_to_remove.append(event.*);
+                }
+            }
+
+            for (events_to_remove.items) |event| {
+                _ = self.pending_events.remove(event);
+            }
         }
     };
 }
