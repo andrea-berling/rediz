@@ -21,6 +21,7 @@ pub const Command = struct {
         psync: PsyncConfigCommand,
         wait: WaitCommand,
         type: []const u8,
+        incr: []const u8,
     },
     allocator: std.mem.Allocator,
 
@@ -266,6 +267,13 @@ pub const Command = struct {
                     return Error.WrongNumberOfArguments;
                 break :blk .{ .type = array[1] };
             },
+            k2idx("incr") => {
+                if (array.len < 2)
+                    return Error.MissingArgument;
+                if (array.len != 2)
+                    return Error.WrongNumberOfArguments;
+                break :blk .{ .incr = array[1] };
+            },
             else => {
                 return Error.UnsupportedCommand;
             },
@@ -277,7 +285,7 @@ pub const Command = struct {
     pub fn shouldPropagate(self: *const Self) bool {
         switch (self.*.type) {
             .ping, .echo, .get, .keys, .xrange, .xread, .config, .info, .replconf, .psync, .wait, .type => return false,
-            .set, .xadd => return true,
+            .set, .xadd, .incr => return true,
         }
     }
 
@@ -376,7 +384,7 @@ pub const Command = struct {
 
     pub fn deinit(self: *Command) void {
         switch (self.*.type) {
-            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type => {},
+            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr => {},
             .xadd => |stream_add_command| {
                 self.allocator.free(stream_add_command.key_value_pairs);
             },

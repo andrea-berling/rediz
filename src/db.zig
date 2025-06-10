@@ -447,6 +447,25 @@ pub const Instance = struct {
                     }
                 } else return resp.SimpleString("none");
             },
+            .incr => |key| {
+                if (self.data.getEntry(key)) |data| {
+                    switch (data.value_ptr.value) {
+                        .string => |s| {
+                            const n: i64 = std.fmt.parseInt(i64, s, 10) catch {
+                                return resp.SimpleError("value is not an integer or out of range");
+                            };
+                            self.arena_allocator.allocator().free(data.value_ptr.value.string);
+                            data.value_ptr.value = .{ .string = try std.fmt.allocPrint(self.arena_allocator.allocator(), "{}", .{n + 1}) };
+                            return resp.Integer(n + 1);
+                        },
+                        else => return resp.SimpleError("value is not an integer or out of range"),
+                    }
+                } else {
+                    const datum: Datum = .{ .value = .{ .string = try self.dupe("1") } };
+                    try self.data.put(try self.dupe(key), datum);
+                    return resp.Integer(1);
+                }
+            },
             else => {
                 return error.InvalidCommand;
             },
