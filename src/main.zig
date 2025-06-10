@@ -595,7 +595,8 @@ pub fn main() !void {
                     .user_data = event_fsm,
                 };
 
-                connection_fsm.state = .executing_commands;
+                if (connection_fsm.state != .executing_transaction)
+                    connection_fsm.state = .executing_commands;
                 try event_queue.addAsyncEvent(wakeup_event);
             },
             .pollin => |timerfd| {
