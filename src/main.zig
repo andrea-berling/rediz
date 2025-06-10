@@ -34,13 +34,13 @@ fn respondWith(response: []const u8, finite_state_machine: *fsm.FSM, event_queue
     try event_queue.addAsyncEvent(response_sent_event);
 }
 
-fn waitForCommand(finite_state_machine: *fsm.FSM, event_queue: *EventQueue) !void {
+fn waitForCommand(finite_state_machine: *fsm.FSM, event_queue: *EventQueue, new_state: struct { new_state: @TypeOf(finite_state_machine.type.connection.state) = .waiting_for_commands }) !void {
     if (finite_state_machine.type != .connection)
         return error.InvalidFSM;
     const connection_fsm = &finite_state_machine.type.connection;
     resizeBuffer(&connection_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
     @memset(connection_fsm.buffer, 0);
-    connection_fsm.state = .waiting_for_commands;
+    connection_fsm.state = new_state.new_state;
     const new_command_event = Event{
         .type = .{ .recv = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
         .user_data = finite_state_machine,
@@ -194,7 +194,7 @@ pub fn main() !void {
 
     event_loop: while (true) {
         try stdout.print("Waiting for something to come through...\n", .{});
-        var completed_event = try event_queue.next();
+        const completed_event = try event_queue.next();
         const event_fsm: *fsm.FSM = completed_event.awaited_event.user_data;
         try stdout.print("New event: {any}\n", .{completed_event});
         switch (completed_event.awaited_event.type) {
@@ -207,7 +207,7 @@ pub fn main() !void {
                 // TODO: fetch user data from pending events to destroy FSMs in
                 // the signal handling code
                 const new_connection_fsm = try fsm.FSM.newConnection(allocator, connection_socket, .generic_client, &global_data);
-                try waitForCommand(new_connection_fsm, &event_queue);
+                try waitForCommand(new_connection_fsm, &event_queue, .{});
 
                 try event_queue.addAsyncEvent(new_connection_event);
             },
@@ -273,7 +273,7 @@ pub fn main() !void {
                             connection_fsm.state = .in_sync;
                             continue :event_loop;
                         }
-                        if (connection_fsm.state != .waiting_for_commands)
+                        if (connection_fsm.state != .waiting_for_commands and connection_fsm.state != .executing_transaction)
                             @panic("Bad");
 
                         var n: usize = 0;
@@ -284,13 +284,13 @@ pub fn main() !void {
                             .user_data = event_fsm,
                         };
 
+                        var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+                        defer temp_allocator.deinit();
+
                         while (buffer_size - n > 0) {
                             const command, const parsed_bytes = Command.parse(connection_fsm.buffer[n..], allocator) catch |err| {
                                 std.debug.print("Error while parsing command: {}\n", .{err});
                                 std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ connection_fsm.buffer, completed_event.async_result });
-
-                                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
-                                defer temp_allocator.deinit();
 
                                 if (n_new_commands > 0) {
                                     try event_queue.addAsyncEvent(notify_fsm_event);
@@ -299,17 +299,251 @@ pub fn main() !void {
                                 continue :event_loop;
                             };
 
+                            if (command.type == .exec) {
+                                if (connection_fsm.state != .executing_transaction) {
+                                    try respondWith(try resp.SimpleError("EXEC without MULTI").encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+
+                                    continue :event_loop;
+                                }
+
+                                notify_fsm_event.type.notify.n = 1;
+                                try event_queue.addAsyncEvent(notify_fsm_event);
+                                continue :event_loop;
+                            }
+
+                            if (command.type == .discard) {
+                                if (connection_fsm.state != .executing_transaction) {
+                                    try respondWith(try resp.SimpleError("DISCARD without MULTI").encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                                    continue :event_loop;
+                                }
+                                connection_fsm.flushCommandsQueue();
+                                try respondWith(try resp.Ok.encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                                continue :event_loop;
+                            }
+
                             try connection_fsm.addCommand(command);
                             n_new_commands += 1;
                             notify_fsm_event.type.notify.n = n_new_commands;
                             n += parsed_bytes;
                         }
 
-                        if (n_new_commands > 0) {
+                        std.debug.assert(n_new_commands > 0);
+                        if (connection_fsm.state != .executing_transaction) {
                             connection_fsm.state = .executing_commands;
                             try event_queue.addAsyncEvent(notify_fsm_event);
+                        } else {
+                            try respondWith(try resp.SimpleString("QUEUED").encode(temp_allocator.allocator()), event_fsm, &event_queue, .{ .new_state = .executing_transaction });
                         }
                     },
+                }
+            },
+            .read => {
+                if (event_fsm.type != .connection) {
+                    @panic("Something is very wrong");
+                }
+
+                const connection_fsm = &event_fsm.type.connection;
+
+                if (connection_fsm.state != .executing_commands and connection_fsm.state != .executing_transaction) {
+                    std.debug.print("Maybe I'm replying, come back later\n", .{});
+                    const notify_fsm_event = Event{
+                        .type = .{ .notify = .{ .fd = connection_fsm.new_commands_notification_fd, .n = 1 } },
+                        .user_data = event_fsm,
+                    };
+                    try event_queue.addAsyncEvent(notify_fsm_event);
+                    continue :event_loop;
+                }
+
+                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+                defer temp_allocator.deinit();
+
+                switch (connection_fsm.state) {
+                    .executing_commands => {
+                        if (connection_fsm.popCommand()) |*command| {
+                            defer @constCast(command).deinit();
+                            switch (command.type) {
+                                .wait => |wait_command| {
+                                    if (wait_command.num_replicas == 0) {
+                                        try respondWith(try resp.Integer(event_fsm.global_data.slaves.count()).encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                                    } else {
+                                        var count: usize = 0;
+                                        const num_replicas_threshold = command.type.wait.num_replicas;
+                                        const timeout_timestamp = std.time.milliTimestamp() + @as(i64, @bitCast(command.type.wait.timeout_ms));
+
+                                        const timeout_fd = try setupTimer(command.type.wait.timeout_ms);
+
+                                        var slaves_it = event_fsm.global_data.slaves.iterator();
+                                        while (slaves_it.next()) |slave| {
+                                            const slave_repl_offset = slave.key_ptr.*.type.connection.peer_type.slave.repl_offset;
+                                            if (slave_repl_offset >= instance.repl_offset) {
+                                                count += 1;
+                                            }
+                                        }
+
+                                        if (count >= num_replicas_threshold) {
+                                            try respondWith(try resp.Integer(@bitCast(count)).encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                                            continue :event_loop;
+                                        }
+
+                                        // We didn't exit early, we must ask the slaves for their offset and block
+                                        slaves_it = event_fsm.global_data.slaves.iterator();
+                                        while (slaves_it.next()) |slave| {
+                                            const ack_request = resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("GETACK"), resp.BulkString("*") });
+                                            const slave_fsm = &slave.key_ptr.*.type.connection;
+                                            resizeBuffer(&slave_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
+                                            slave_fsm.buffer = try std.fmt.bufPrint(slave_fsm.buffer, "{s}", .{try ack_request.encode(temp_allocator.allocator())});
+                                            const getack_event = Event{ .type = .{ .send = .{ .buffer = slave_fsm.buffer, .fd = slave_fsm.fd } }, .user_data = slave.key_ptr.* };
+                                            slave_fsm.state = .sending_getack;
+                                            try event_queue.addAsyncEvent(getack_event);
+                                        }
+
+                                        const pending_wait = try allocator.create(fsm.PendingWait);
+                                        pending_wait.timeout = timeout_timestamp;
+                                        pending_wait.client_connection_fsm = event_fsm;
+                                        pending_wait.threshold_offset = instance.repl_offset;
+                                        pending_wait.expected_n_replicas = num_replicas_threshold;
+                                        pending_wait.actual_n_replicas = count;
+                                        pending_wait.timerfd = timeout_fd;
+
+                                        connection_fsm.state = .{ .blocked = pending_wait };
+
+                                        try event_fsm.global_data.pending_waits.add(pending_wait);
+
+                                        const timeout_event = Event{ .type = .{ .pollin = timeout_fd }, .user_data = event_fsm };
+
+                                        try event_queue.addAsyncEvent(timeout_event);
+                                    }
+                                },
+                                .psync => {
+                                    connection_fsm.peer_type = .{ .slave = .{ .repl_offset = 0 } };
+                                    try event_fsm.global_data.slaves.put(event_fsm, undefined);
+                                    var dump = [_]u8{0} ** fsm.CLIENT_BUFFER_SIZE;
+                                    const dump_size = try instance.dumpToBuffer(&dump);
+                                    // Why 0 for the repl_offset? Codecrafters really
+                                    try respondWith(try std.fmt.allocPrint(temp_allocator.allocator(), "+FULLRESYNC {[replid]s} {[repl_offset]d}\r\n${[dump_size]d}\r\n{[dump]s}", .{ .replid = instance.replid, .repl_offset = 0, .dump_size = dump_size, .dump = dump[0..dump_size] }), event_fsm, &event_queue, .{ .new_state = .sending_dump });
+                                },
+                                .multi => {
+                                    try respondWith(try resp.Ok.encode(temp_allocator.allocator()), event_fsm, &event_queue, .{ .new_state = .executing_transaction });
+                                    continue :event_loop;
+                                },
+                                else => {
+                                    if (connection_fsm.peer_type == .master or (command.shouldPropagate() and instance.master == null))
+                                        instance.repl_offset += command.bytes.len;
+                                    const reply = instance.executeCommand(temp_allocator.allocator(), command) catch {
+                                        try respondWith(try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                                        continue :event_loop;
+                                    };
+
+                                    if (command.type == .xread and command.type.xread.block_timeout_ms != null and std.meta.eql(reply, resp.Null)) {
+                                        var timerfd: ?posix.fd_t = null;
+                                        if (command.type.xread.block_timeout_ms) |timeout_ms| {
+                                            timerfd = try setupTimer(timeout_ms);
+                                        }
+                                        var blocked_stream_read = try allocator.create(fsm.BlockedStreamRead);
+                                        blocked_stream_read.* = fsm.BlockedStreamRead.init(allocator, event_fsm, timerfd);
+                                        for (command.type.xread.requests) |request| {
+                                            try blocked_stream_read.addStream(request.stream_key);
+                                        }
+
+                                        for (command.type.xread.requests) |request| {
+                                            const blocked_stream_read_queue = try event_fsm.global_data.blocked_xreads.getOrPut(try allocator.dupe(u8, request.stream_key));
+                                            if (!blocked_stream_read_queue.found_existing) {
+                                                blocked_stream_read_queue.value_ptr.* = try allocator.create(std.AutoArrayHashMap(*fsm.BlockedStreamRead, void));
+                                                blocked_stream_read_queue.value_ptr.*.* = std.AutoArrayHashMap(*fsm.BlockedStreamRead, void).init(allocator);
+                                            }
+
+                                            try blocked_stream_read_queue.value_ptr.*.put(blocked_stream_read, {});
+                                        }
+
+                                        connection_fsm.state = .{ .waiting_for_new_data_on_stream = blocked_stream_read };
+
+                                        if (timerfd) |fd| {
+                                            const timeout_event = Event{ .type = .{ .pollin = fd }, .user_data = event_fsm };
+
+                                            try event_queue.addAsyncEvent(timeout_event);
+                                        }
+
+                                        continue :event_loop;
+                                    }
+
+                                    if (command.type == .xadd) {
+                                        const xadd_command = command.type.xadd;
+                                        if (event_fsm.global_data.blocked_xreads.get(xadd_command.stream_key)) |blocked_stream_reads| {
+                                            for (blocked_stream_reads.keys()) |blocked_stream_read| {
+                                                defer allocator.destroy(blocked_stream_read);
+                                                defer blocked_stream_read.deinit();
+
+                                                var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+                                                try response.append(resp.BulkString(xadd_command.stream_key));
+                                                var entry_elements = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+                                                for (xadd_command.key_value_pairs) |pair| {
+                                                    try entry_elements.append(resp.BulkString(pair.key));
+                                                    try entry_elements.append(resp.BulkString(pair.value));
+                                                }
+
+                                                var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
+                                                tmp_array[0] = reply;
+                                                tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
+                                                try response.append(resp.Array(&[_]resp.Value{resp.Array(tmp_array)}));
+
+                                                try respondWith(try resp.Array(&[_]resp.Value{resp.Array(try response.toOwnedSlice())}).encode(temp_allocator.allocator()), blocked_stream_read.client_connection_fsm, &event_queue, .{});
+                                            }
+
+                                            if (event_fsm.global_data.blocked_xreads.getKey(xadd_command.stream_key)) |stream_key| {
+                                                event_fsm.global_data.blocked_xreads.get(xadd_command.stream_key).?.deinit();
+                                                allocator.destroy(event_fsm.global_data.blocked_xreads.get(xadd_command.stream_key).?);
+                                                _ = event_fsm.global_data.blocked_xreads.remove(stream_key);
+                                                allocator.free(stream_key);
+                                            }
+                                        }
+                                    }
+
+                                    if (command.shouldPropagate() and instance.master == null) {
+                                        var slaves_it = event_fsm.global_data.slaves.keyIterator();
+                                        while (slaves_it.next()) |slave_fsm| {
+                                            const slave_connection = &slave_fsm.*.type.connection;
+                                            slave_connection.state = .propagating_command;
+                                            resizeBuffer(&slave_connection.buffer, fsm.CLIENT_BUFFER_SIZE);
+                                            slave_connection.buffer = try std.fmt.bufPrint(slave_connection.buffer, "{s}", .{command.bytes});
+                                            const propagation_event = Event{
+                                                .type = .{ .send = .{ .fd = slave_connection.fd, .buffer = slave_connection.buffer } },
+                                                .user_data = slave_fsm.*,
+                                            };
+                                            try event_queue.addAsyncEvent(propagation_event);
+                                        }
+                                    }
+
+                                    if (connection_fsm.peer_type == .master and (command.type != .replconf or command.type.replconf != .getack)) {
+                                        if (connection_fsm.commands_to_execute.len == 0) {
+                                            try waitForCommand(event_fsm, &event_queue, .{});
+                                        } else {
+                                            const wakeup_event = Event{
+                                                .type = .{ .read = .{ .fd = connection_fsm.new_commands_notification_fd, .buffer = std.mem.asBytes(&connection_fsm.notification_val) } },
+                                                .user_data = event_fsm,
+                                            };
+                                            try event_queue.addAsyncEvent(wakeup_event);
+                                        }
+                                        continue :event_loop;
+                                    }
+
+                                    try respondWith(try reply.encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                                },
+                            }
+                        } else try waitForCommand(event_fsm, &event_queue, .{});
+                    },
+                    .executing_transaction => {
+                        var replies = std.ArrayList(resp.Value).init(temp_allocator.allocator());
+                        while (connection_fsm.popCommand()) |*command| {
+                            defer @constCast(command).deinit();
+                            const reply = instance.executeCommand(temp_allocator.allocator(), command) catch {
+                                try respondWith(try resp.SimpleError("Some error occurred during transaction execution").encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                                continue :event_loop;
+                            };
+                            try replies.append(reply);
+                        }
+                        try respondWith(try resp.Array(try replies.toOwnedSlice()).encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
+                    },
+                    else => unreachable,
                 }
             },
             .send => {
@@ -337,15 +571,32 @@ pub fn main() !void {
                                     };
                                     connection_fsm.state = .executing_commands;
                                     try event_queue.addAsyncEvent(notify_fsm_event);
-                                } else try waitForCommand(event_fsm, &event_queue);
+                                } else try waitForCommand(event_fsm, &event_queue, .{});
                             },
                             .sending_dump, .propagating_command => {
                                 connection_fsm.state = .in_sync;
+                            },
+                            .executing_transaction => {
+                                try waitForCommand(event_fsm, &event_queue, .{ .new_state = .executing_transaction });
                             },
                             else => @panic("Invalid state transition"),
                         }
                     },
                 }
+            },
+            .notify => {
+                if (event_fsm.type != .connection) {
+                    @panic("Something is very wrong");
+                }
+
+                const connection_fsm = &event_fsm.type.connection;
+                const wakeup_event = Event{
+                    .type = .{ .read = .{ .fd = connection_fsm.new_commands_notification_fd, .buffer = std.mem.asBytes(&connection_fsm.notification_val) } },
+                    .user_data = event_fsm,
+                };
+
+                connection_fsm.state = .executing_commands;
+                try event_queue.addAsyncEvent(wakeup_event);
             },
             .pollin => |timerfd| {
                 switch (event_fsm.type) {
@@ -442,204 +693,6 @@ pub fn main() !void {
                         }
                     },
                 }
-            },
-            .read => {
-                if (event_fsm.type != .connection) {
-                    @panic("Something is very wrong");
-                }
-
-                const connection_fsm = &event_fsm.type.connection;
-
-                if (connection_fsm.state != .executing_commands) {
-                    std.debug.print("Maybe I'm replying, come back later\n", .{});
-                    completed_event.awaited_event.type.notify.n = 1;
-                    try event_queue.addAsyncEvent(completed_event.awaited_event);
-                    continue :event_loop;
-                }
-
-                var temp_allocator = std.heap.ArenaAllocator.init(allocator);
-                defer temp_allocator.deinit();
-                if (connection_fsm.popCommand()) |*command| {
-                    defer @constCast(command).deinit();
-                    switch (command.type) {
-                        .wait => |wait_command| {
-                            if (wait_command.num_replicas == 0) {
-                                try respondWith(try resp.Integer(event_fsm.global_data.slaves.count()).encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
-                            } else {
-                                var count: usize = 0;
-                                const num_replicas_threshold = command.type.wait.num_replicas;
-                                const timeout_timestamp = std.time.milliTimestamp() + @as(i64, @bitCast(command.type.wait.timeout_ms));
-
-                                const timeout_fd = try setupTimer(command.type.wait.timeout_ms);
-
-                                var slaves_it = event_fsm.global_data.slaves.iterator();
-                                while (slaves_it.next()) |slave| {
-                                    const slave_repl_offset = slave.key_ptr.*.type.connection.peer_type.slave.repl_offset;
-                                    if (slave_repl_offset >= instance.repl_offset) {
-                                        count += 1;
-                                    }
-                                }
-
-                                if (count >= num_replicas_threshold) {
-                                    try respondWith(try resp.Integer(@bitCast(count)).encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
-                                    continue :event_loop;
-                                }
-
-                                // We didn't exit early, we must ask the slaves for their offset and block
-                                slaves_it = event_fsm.global_data.slaves.iterator();
-                                while (slaves_it.next()) |slave| {
-                                    const ack_request = resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("GETACK"), resp.BulkString("*") });
-                                    const slave_fsm = &slave.key_ptr.*.type.connection;
-                                    resizeBuffer(&slave_fsm.buffer, fsm.CLIENT_BUFFER_SIZE);
-                                    slave_fsm.buffer = try std.fmt.bufPrint(slave_fsm.buffer, "{s}", .{try ack_request.encode(temp_allocator.allocator())});
-                                    const getack_event = Event{ .type = .{ .send = .{ .buffer = slave_fsm.buffer, .fd = slave_fsm.fd } }, .user_data = slave.key_ptr.* };
-                                    slave_fsm.state = .sending_getack;
-                                    try event_queue.addAsyncEvent(getack_event);
-                                }
-
-                                const pending_wait = try allocator.create(fsm.PendingWait);
-                                pending_wait.timeout = timeout_timestamp;
-                                pending_wait.client_connection_fsm = event_fsm;
-                                pending_wait.threshold_offset = instance.repl_offset;
-                                pending_wait.expected_n_replicas = num_replicas_threshold;
-                                pending_wait.actual_n_replicas = count;
-                                pending_wait.timerfd = timeout_fd;
-
-                                connection_fsm.state = .{ .blocked = pending_wait };
-
-                                try event_fsm.global_data.pending_waits.add(pending_wait);
-
-                                const timeout_event = Event{ .type = .{ .pollin = timeout_fd }, .user_data = event_fsm };
-
-                                try event_queue.addAsyncEvent(timeout_event);
-                            }
-                        },
-                        .psync => {
-                            connection_fsm.peer_type = .{ .slave = .{ .repl_offset = 0 } };
-                            try event_fsm.global_data.slaves.put(event_fsm, undefined);
-                            var dump = [_]u8{0} ** fsm.CLIENT_BUFFER_SIZE;
-                            const dump_size = try instance.dumpToBuffer(&dump);
-                            // Why 0 for the repl_offset? Codecrafters really
-                            try respondWith(try std.fmt.allocPrint(temp_allocator.allocator(), "+FULLRESYNC {[replid]s} {[repl_offset]d}\r\n${[dump_size]d}\r\n{[dump]s}", .{ .replid = instance.replid, .repl_offset = 0, .dump_size = dump_size, .dump = dump[0..dump_size] }), event_fsm, &event_queue, .{ .new_state = .sending_dump });
-                        },
-                        else => {
-                            if (connection_fsm.peer_type == .master or (command.shouldPropagate() and instance.master == null))
-                                instance.repl_offset += command.bytes.len;
-                            const reply = instance.executeCommand(temp_allocator.allocator(), command) catch {
-                                try respondWith(try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
-                                continue :event_loop;
-                            };
-
-                            if (command.type == .xread and command.type.xread.block_timeout_ms != null and std.meta.eql(reply, resp.Null)) {
-                                var timerfd: ?posix.fd_t = null;
-                                if (command.type.xread.block_timeout_ms) |timeout_ms| {
-                                    timerfd = try setupTimer(timeout_ms);
-                                }
-                                var blocked_stream_read = try allocator.create(fsm.BlockedStreamRead);
-                                blocked_stream_read.* = fsm.BlockedStreamRead.init(allocator, event_fsm, timerfd);
-                                for (command.type.xread.requests) |request| {
-                                    try blocked_stream_read.addStream(request.stream_key);
-                                }
-
-                                for (command.type.xread.requests) |request| {
-                                    const blocked_stream_read_queue = try event_fsm.global_data.blocked_xreads.getOrPut(try allocator.dupe(u8, request.stream_key));
-                                    if (!blocked_stream_read_queue.found_existing) {
-                                        blocked_stream_read_queue.value_ptr.* = try allocator.create(std.AutoArrayHashMap(*fsm.BlockedStreamRead, void));
-                                        blocked_stream_read_queue.value_ptr.*.* = std.AutoArrayHashMap(*fsm.BlockedStreamRead, void).init(allocator);
-                                    }
-
-                                    try blocked_stream_read_queue.value_ptr.*.put(blocked_stream_read, {});
-                                }
-
-                                connection_fsm.state = .{ .waiting_for_new_data_on_stream = blocked_stream_read };
-
-                                if (timerfd) |fd| {
-                                    const timeout_event = Event{ .type = .{ .pollin = fd }, .user_data = event_fsm };
-
-                                    try event_queue.addAsyncEvent(timeout_event);
-                                }
-
-                                continue :event_loop;
-                            }
-
-                            if (command.type == .xadd) {
-                                const xadd_command = command.type.xadd;
-                                if (event_fsm.global_data.blocked_xreads.get(xadd_command.stream_key)) |blocked_stream_reads| {
-                                    for (blocked_stream_reads.keys()) |blocked_stream_read| {
-                                        defer allocator.destroy(blocked_stream_read);
-                                        defer blocked_stream_read.deinit();
-
-                                        var response = std.ArrayList(resp.Value).init(temp_allocator.allocator());
-                                        try response.append(resp.BulkString(xadd_command.stream_key));
-                                        var entry_elements = std.ArrayList(resp.Value).init(temp_allocator.allocator());
-                                        for (xadd_command.key_value_pairs) |pair| {
-                                            try entry_elements.append(resp.BulkString(pair.key));
-                                            try entry_elements.append(resp.BulkString(pair.value));
-                                        }
-
-                                        var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
-                                        tmp_array[0] = reply;
-                                        tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
-                                        try response.append(resp.Array(&[_]resp.Value{resp.Array(tmp_array)}));
-
-                                        try respondWith(try resp.Array(&[_]resp.Value{resp.Array(try response.toOwnedSlice())}).encode(temp_allocator.allocator()), blocked_stream_read.client_connection_fsm, &event_queue, .{});
-                                    }
-
-                                    if (event_fsm.global_data.blocked_xreads.getKey(xadd_command.stream_key)) |stream_key| {
-                                        event_fsm.global_data.blocked_xreads.get(xadd_command.stream_key).?.deinit();
-                                        allocator.destroy(event_fsm.global_data.blocked_xreads.get(xadd_command.stream_key).?);
-                                        _ = event_fsm.global_data.blocked_xreads.remove(stream_key);
-                                        allocator.free(stream_key);
-                                    }
-                                }
-                            }
-
-                            if (command.shouldPropagate() and instance.master == null) {
-                                var slaves_it = event_fsm.global_data.slaves.keyIterator();
-                                while (slaves_it.next()) |slave_fsm| {
-                                    const slave_connection = &slave_fsm.*.type.connection;
-                                    slave_connection.state = .propagating_command;
-                                    resizeBuffer(&slave_connection.buffer, fsm.CLIENT_BUFFER_SIZE);
-                                    slave_connection.buffer = try std.fmt.bufPrint(slave_connection.buffer, "{s}", .{command.bytes});
-                                    const propagation_event = Event{
-                                        .type = .{ .send = .{ .fd = slave_connection.fd, .buffer = slave_connection.buffer } },
-                                        .user_data = slave_fsm.*,
-                                    };
-                                    try event_queue.addAsyncEvent(propagation_event);
-                                }
-                            }
-
-                            if (connection_fsm.peer_type == .master and (command.type != .replconf or command.type.replconf != .getack)) {
-                                if (connection_fsm.commands_to_execute.len == 0) {
-                                    try waitForCommand(event_fsm, &event_queue);
-                                } else {
-                                    const wakeup_event = Event{
-                                        .type = .{ .read = .{ .fd = connection_fsm.new_commands_notification_fd, .buffer = std.mem.asBytes(&connection_fsm.notification_val) } },
-                                        .user_data = event_fsm,
-                                    };
-                                    try event_queue.addAsyncEvent(wakeup_event);
-                                }
-                                continue :event_loop;
-                            }
-
-                            try respondWith(try reply.encode(temp_allocator.allocator()), event_fsm, &event_queue, .{});
-                        },
-                    }
-                } else try waitForCommand(event_fsm, &event_queue);
-            },
-            .notify => {
-                if (event_fsm.type != .connection) {
-                    @panic("Something is very wrong");
-                }
-
-                const connection_fsm = &event_fsm.type.connection;
-                const wakeup_event = Event{
-                    .type = .{ .read = .{ .fd = connection_fsm.new_commands_notification_fd, .buffer = std.mem.asBytes(&connection_fsm.notification_val) } },
-                    .user_data = event_fsm,
-                };
-
-                connection_fsm.state = .executing_commands;
-                try event_queue.addAsyncEvent(wakeup_event);
             },
         }
     }

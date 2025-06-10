@@ -23,7 +23,7 @@ pub const Connection = struct {
         master,
         generic_client,
     } = .generic_client,
-    state: union(enum) { in_sync, sending_response, waiting_for_commands, executing_commands, sending_dump, propagating_command, sending_getack, waiting_for_ack, blocked: *PendingWait, waiting_for_new_data_on_stream: *BlockedStreamRead } = .waiting_for_commands,
+    state: union(enum) { in_sync, sending_response, waiting_for_commands, executing_commands, sending_dump, propagating_command, sending_getack, waiting_for_ack, blocked: *PendingWait, waiting_for_new_data_on_stream: *BlockedStreamRead, executing_transaction } = .waiting_for_commands,
     allocator: Allocator,
 
     const Self = @This();
@@ -36,6 +36,12 @@ pub const Connection = struct {
         var new_command = try self.allocator.create(std.DoublyLinkedList(cmd.Command).Node);
         new_command.data = command;
         self.commands_to_execute.append(new_command);
+    }
+
+    pub fn flushCommandsQueue(self: *Self) void {
+        while (self.popCommand()) |*command| {
+            @constCast(command).deinit();
+        }
     }
 
     pub fn popCommand(self: *Self) ?cmd.Command {

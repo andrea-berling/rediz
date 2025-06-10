@@ -6,23 +6,7 @@ pub const Error = error{ InvalidArgument, InvalidCommand, InvalidInput, InvalidS
 
 pub const Command = struct {
     bytes: []u8,
-    type: union(enum) {
-        ping,
-        echo: []const u8,
-        get: []const u8,
-        set: SetCommand,
-        keys: []const u8,
-        xadd: StreamAddCommand,
-        xrange: StreamRangeCommand,
-        xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest },
-        config: ConfigCommand,
-        info: InfoCommand,
-        replconf: ReplicaConfigCommand,
-        psync: PsyncConfigCommand,
-        wait: WaitCommand,
-        type: []const u8,
-        incr: []const u8,
-    },
+    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard },
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -274,6 +258,15 @@ pub const Command = struct {
                     return Error.WrongNumberOfArguments;
                 break :blk .{ .incr = array[1] };
             },
+            k2idx("multi") => {
+                break :blk .multi;
+            },
+            k2idx("exec") => {
+                break :blk .exec;
+            },
+            k2idx("discard") => {
+                break :blk .discard;
+            },
             else => {
                 return Error.UnsupportedCommand;
             },
@@ -285,7 +278,7 @@ pub const Command = struct {
     pub fn shouldPropagate(self: *const Self) bool {
         switch (self.*.type) {
             .ping, .echo, .get, .keys, .xrange, .xread, .config, .info, .replconf, .psync, .wait, .type => return false,
-            .set, .xadd, .incr => return true,
+            .set, .xadd, .incr, .multi, .discard, .exec => return true,
         }
     }
 
@@ -384,7 +377,7 @@ pub const Command = struct {
 
     pub fn deinit(self: *Command) void {
         switch (self.*.type) {
-            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr => {},
+            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr, .multi, .exec, .discard => {},
             .xadd => |stream_add_command| {
                 self.allocator.free(stream_add_command.key_value_pairs);
             },
