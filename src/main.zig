@@ -5,7 +5,6 @@ const cmd = @import("command.zig");
 const fsm = @import("fsm.zig");
 const Command = cmd.Command;
 const db = @import("db.zig");
-const clap = @import("clap");
 const resizeBuffer = @import("util.zig").resizeBuffer;
 
 const net = std.net;
@@ -71,12 +70,147 @@ fn setupTimer(timeout_ms: usize) !posix.fd_t {
     return timeout_fd;
 }
 
+// The caller owns the resulting slice that was allocated with the given allocator
+// Slices of strings in the options point to argv
+fn parseCommandLineArguments(allocator: std.mem.Allocator) ![]db.ConfigOption {
+    var config = std.ArrayList(struct { []const u8, []const u8 }).init(allocator);
+    errdefer config.deinit();
+    const arg_type = enum { STRING, U16 };
+    const available_options: struct { short: []const ?u8, long: []const ?[]const u8, description: []const []const u8, arg_type: []const ?arg_type } = .{
+        .short = &[_]?u8{ 'h', null, null, 'p', null },
+        .long = &[_]?[]const u8{ "help", "dir", "dbfilename", "port", "replicaof" },
+        .description = &[_][]const u8{ "Display this help and exit", "Directory where dbfilename can be found", "The name of a .rdb file to load on startup", "The port to listen on", "The master instance for this replica (e.g. \"127.0.0.1 6379\")" },
+        .arg_type = &[_]?arg_type{ null, .STRING, .STRING, .U16, .STRING },
+    };
+
+    var args_it = std.process.ArgIterator.init();
+    const program_name = args_it.next().?;
+
+    var temp_allocator = std.heap.ArenaAllocator.init(allocator);
+    defer temp_allocator.deinit();
+
+    var help_message = std.ArrayList(u8).init(temp_allocator.allocator());
+    const help_message_writer = help_message.writer();
+
+    try std.fmt.format(help_message_writer, "Usage: {s} [options..]\n", .{program_name});
+    for (0..available_options.short.len) |i| {
+        if (available_options.short[i] != null and available_options.long[i] != null) {
+            try std.fmt.format(help_message_writer, "\t-{c}, --{s}", .{ available_options.short[i].?, available_options.long[i].? });
+        } else if (available_options.short[i] != null) {
+            try std.fmt.format(help_message_writer, "\t-{}", .{available_options.short[i].?});
+        } else {
+            try std.fmt.format(help_message_writer, "\t--{s}", .{available_options.long[i].?});
+        }
+        if (available_options.arg_type[i]) |arg| {
+            switch (arg) {
+                .U16 => try std.fmt.format(help_message_writer, " <0-65535>", .{}),
+                .STRING => try std.fmt.format(help_message_writer, " <str>", .{}),
+            }
+        }
+        if (i <= 1) try std.fmt.format(help_message_writer, "\t", .{}); // dirty trick to align descriptions, might use line length in the future to choose how many tabs to use
+        try std.fmt.format(help_message_writer, "\t{s}\n", .{available_options.description[i]});
+    }
+    const stderr = std.io.getStdErr();
+
+    var options = std.ArrayList(@typeInfo(@typeInfo(@typeInfo(@TypeOf(parseCommandLineArguments)).@"fn".return_type.?).error_union.payload).pointer.child).init(allocator);
+    errdefer options.deinit();
+
+    while (args_it.next()) |arg| {
+        var n_dashes: u8 = 0;
+        var optname = arg[0..];
+        if (arg[n_dashes] != '-') {
+            _ = try stderr.write(help_message.items);
+            return error.PositionalArgument;
+        }
+        while (arg[n_dashes] == '-') : (n_dashes += 1) {}
+        optname = optname[n_dashes..];
+        var optidx: ?usize = null;
+        switch (n_dashes) {
+            1 => {
+                inline for (available_options.short, 0..) |maybe_option, i| {
+                    if (maybe_option) |option| {
+                        if (optname[0] == option) {
+                            optidx = i;
+                            break;
+                        }
+                    }
+                }
+            },
+            2 => {
+                inline for (available_options.long, 0..) |maybe_option, i| {
+                    if (maybe_option) |option| {
+                        if (std.mem.eql(u8, option, optname)) {
+                            optidx = i;
+                            break;
+                        }
+                    }
+                }
+            },
+            else => return error.InvalidOption,
+        }
+        if (optidx == null) {
+            _ = try stderr.write(help_message.items);
+            return error.InvalidOption;
+        }
+
+        switch (optidx.?) {
+            0 => {
+                _ = try stderr.write(help_message.items);
+                return error.Help;
+            }, // help
+            1 => { // dir
+                const next_arg = args_it.next() orelse {
+                    _ = try stderr.write(help_message.items);
+                    return error.MissingArgument;
+                };
+                if (next_arg[0] == '-') {
+                    _ = try stderr.write(help_message.items);
+                    return error.InvalidArgument;
+                }
+                try options.append(.{ .name = optname, .value = next_arg[0..] });
+            },
+            2 => {
+                const next_arg = args_it.next() orelse {
+                    _ = try stderr.write(help_message.items);
+                    return error.MissingArgument;
+                };
+                if (next_arg[0] == '-') {
+                    _ = try stderr.write(help_message.items);
+                    return error.InvalidArgument;
+                }
+                try options.append(.{ .name = optname, .value = next_arg[0..] });
+            }, // dbfilename
+            3 => {
+                const next_arg = args_it.next() orelse {
+                    _ = try stderr.write(help_message.items);
+                    return error.MissingArgument;
+                };
+                _ = std.fmt.parseInt(u16, next_arg[0..], 10) catch {
+                    _ = try stderr.write(help_message.items);
+                    return error.InvalidArgument;
+                };
+                try options.append(.{ .name = "listening-port", .value = next_arg[0..] });
+            }, // port
+            4 => { // replicaof
+                const next_arg = args_it.next() orelse {
+                    _ = try stderr.write(help_message.items);
+                    return error.MissingArgument;
+                };
+                if (next_arg[0] == '-') {
+                    _ = try stderr.write(help_message.items);
+                    return error.InvalidArgument;
+                }
+                try options.append(.{ .name = "master", .value = next_arg[0..] });
+            },
+            else => unreachable,
+        }
+    }
+    return try options.toOwnedSlice();
+}
+
 pub fn main() !void {
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
-
-    try stdout.print("Logs from your program will appear here!\n", .{});
-    std.debug.print("My PID is {}\n", .{linux.getpid()});
 
     // INFO: Allocator set up
 
@@ -85,55 +219,40 @@ pub fn main() !void {
     var allocator = gpa.allocator();
 
     // INFO: Config parsing
-
-    var config = std.ArrayList(struct { []const u8, []const u8 }).init(allocator);
-
-    // TODO: I don't need a full data model for my options, a list of string pairs
-    //  will suffice. I can take the parser out of clap and just use that part
-    // First we specify what parameters our program can take.
-    // We can use `parseParamsComptime` to parse a string into an array of `Param(Help)`.
-    const params = comptime clap.parseParamsComptime(
-        \\-h, --help             Display this help and exit.
-        \\--dir <str>   Directory where dbfilename can be found
-        \\--dbfilename <str>  The name of a .rdb file to load on startup
-        \\-p, --port <u16>  The port to listen on
-        \\--replicaof <str>  The master instance for this replica
-        \\
-    );
-
-    // Initialize our diagnostics, which can be used for reporting useful errors.
-    // This is optional. You can also pass `.{}` to `clap.parse` if you don't
-    // care about the extra information `Diagnostics` provides.
-    var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
-        .diagnostic = &diag,
-        .allocator = gpa.allocator(),
-    }) catch |err| {
-        // Report useful error and exit.
-        diag.report(std.io.getStdErr().writer(), err) catch {};
-        return err;
+    const stderr = std.io.getStdErr();
+    const config = parseCommandLineArguments(allocator) catch |err| {
+        switch (err) {
+            error.Help => return,
+            error.PositionalArgument => {
+                _ = try stderr.write("ERROR: positional arguments are not supported\n");
+                posix.exit(1);
+            },
+            error.InvalidOption => {
+                _ = try stderr.write("ERROR: an invalid option was provided\n");
+                posix.exit(1);
+            },
+            error.MissingArgument => {
+                _ = try stderr.write("ERROR: a required option argument was not provided\n");
+                posix.exit(1);
+            },
+            error.InvalidArgument => {
+                _ = try stderr.write("ERROR: an invalid option argument was provided\n");
+                posix.exit(1);
+            },
+            else => unreachable,
+        }
     };
-    defer res.deinit();
 
-    if (res.args.dir) |dir| {
-        try config.append(.{ "dir", dir });
-    }
+    try stdout.print("Logs from your program will appear here!\n", .{});
+    std.debug.print("My PID is {}\n", .{linux.getpid()});
 
-    if (res.args.dbfilename) |dbfilename| {
-        try config.append(.{ "dbfilename", dbfilename });
-    }
-
-    if (res.args.replicaof) |replicaof| {
-        try config.append(.{ "master", replicaof });
-    }
-
-    // INFO: address binding and socket listening
-
-    var listening_port = [_]u8{0} ** 5;
-
-    try config.append(.{ "listening-port", try std.fmt.bufPrint(&listening_port, "{d}", .{res.args.port orelse 6379}) });
-
-    const port = res.args.port orelse 6379;
+    const port = for (config) |opt| {
+        if (std.mem.eql(u8, opt.name, "listening-port")) {
+            break try std.fmt.parseInt(u16, opt.value, 10);
+        }
+    } else blk: {
+        break :blk 6379;
+    };
 
     const address = try net.Address.resolveIp("127.0.0.1", port);
 
@@ -176,10 +295,9 @@ pub fn main() !void {
     try event_queue.addAsyncEvent(new_connection_event);
 
     // INFO: DB init
-    const db_config = try config.toOwnedSlice();
-    var instance = try db.Instance.init(allocator, db_config);
+    var instance = try db.Instance.init(allocator, config);
     defer instance.destroy(allocator);
-    allocator.free(db_config);
+    allocator.free(config);
 
     var master_server_fsm: ?*fsm.FSM = null;
 

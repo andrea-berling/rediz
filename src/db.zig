@@ -39,6 +39,8 @@ pub const Datum = struct {
     expire_at_ms: ?i64 = null,
 };
 
+pub const ConfigOption = struct { name: []const u8, value: []const u8 };
+
 pub const Instance = struct {
     arena_allocator: *std.heap.ArenaAllocator,
     data: std.StringHashMap(Datum),
@@ -52,7 +54,7 @@ pub const Instance = struct {
         return try self.arena_allocator.allocator().dupe(u8, bytes);
     }
 
-    pub fn init(allocator: std.mem.Allocator, config: ?[]struct { []const u8, []const u8 }) !Instance {
+    pub fn init(allocator: std.mem.Allocator, init_config: ?[]ConfigOption) !Instance {
         var instance: Instance = undefined;
         instance.arena_allocator = try allocator.create(std.heap.ArenaAllocator);
         instance.arena_allocator.* = std.heap.ArenaAllocator.init(allocator);
@@ -62,20 +64,20 @@ pub const Instance = struct {
         instance.repl_offset = 0;
         instance.rng = std.Random.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
 
-        const config_defaults = [_]struct { []const u8, []const u8 }{.{ "dbfilename", "dump.rdb" }};
+        const config_defaults = [_]ConfigOption{.{ .name = "dbfilename", .value = "dump.rdb" }};
 
         for (config_defaults) |config_pair| {
             try instance.config.put(
-                try instance.dupe(config_pair[0]),
-                try instance.dupe(config_pair[1]),
+                try instance.dupe(config_pair.name),
+                try instance.dupe(config_pair.value),
             );
         }
 
-        if (config) |pairs| {
+        if (init_config) |pairs| {
             for (pairs) |config_pair| {
                 try instance.config.put(
-                    try instance.dupe(config_pair[0]),
-                    try instance.dupe(config_pair[1]),
+                    try instance.dupe(config_pair.name),
+                    try instance.dupe(config_pair.value),
                 );
             }
         }
@@ -132,6 +134,7 @@ pub const Instance = struct {
     fn handshake_and_sync(self: *Instance, address: []const u8, port: u16) !struct { posix.socket_t, []u8 } {
         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
         defer temp_allocator.deinit();
+        // TODO: catch and return proper error back up to main
         var tcp_stream = try std.net.tcpConnectToHost(temp_allocator.allocator(), address, port);
         _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{resp.BulkString("PING")}).encode(temp_allocator.allocator()));
         const buffer = try temp_allocator.allocator().alloc(u8, 1024);
