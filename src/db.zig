@@ -49,6 +49,7 @@ pub const Instance = struct {
     replid: []const u8,
     repl_offset: usize,
     rng: std.Random.DefaultPrng,
+    diewithmaster: bool,
 
     inline fn dupe(self: *Instance, bytes: []const u8) ![]u8 {
         return try self.arena_allocator.allocator().dupe(u8, bytes);
@@ -63,6 +64,7 @@ pub const Instance = struct {
         instance.master = null;
         instance.repl_offset = 0;
         instance.rng = std.Random.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
+        instance.diewithmaster = false;
 
         const config_defaults = [_]ConfigOption{.{ .name = "dbfilename", .value = "dump.rdb" }};
 
@@ -75,6 +77,10 @@ pub const Instance = struct {
 
         if (init_config) |pairs| {
             for (pairs) |config_pair| {
+                if (std.mem.eql(u8, config_pair.name, "diewithmaster")) {
+                    instance.diewithmaster = true;
+                    continue;
+                }
                 try instance.config.put(
                     try instance.dupe(config_pair.name),
                     try instance.dupe(config_pair.value),

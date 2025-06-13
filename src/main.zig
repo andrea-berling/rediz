@@ -77,10 +77,10 @@ fn parseCommandLineArguments(allocator: std.mem.Allocator) ![]db.ConfigOption {
     errdefer config.deinit();
     const arg_type = enum { STRING, U16 };
     const available_options: struct { short: []const ?u8, long: []const ?[]const u8, description: []const []const u8, arg_type: []const ?arg_type } = .{
-        .short = &[_]?u8{ 'h', null, null, 'p', null },
-        .long = &[_]?[]const u8{ "help", "dir", "dbfilename", "port", "replicaof" },
-        .description = &[_][]const u8{ "Display this help and exit", "Directory where dbfilename can be found", "The name of a .rdb file to load on startup", "The port to listen on", "The master instance for this replica (e.g. \"127.0.0.1 6379\")" },
-        .arg_type = &[_]?arg_type{ null, .STRING, .STRING, .U16, .STRING },
+        .short = &[_]?u8{ 'h', null, null, 'p', null, null },
+        .long = &[_]?[]const u8{ "help", "dir", "dbfilename", "port", "replicaof", "diewithmaster" },
+        .description = &[_][]const u8{ "Display this help and exit", "Directory where dbfilename can be found", "The name of a .rdb file to load on startup", "The port to listen on", "The master instance for this replica (e.g. \"127.0.0.1 6379\")", "If this instance is a slave and its master disconnects, exit out" },
+        .arg_type = &[_]?arg_type{ null, .STRING, .STRING, .U16, .STRING, null },
     };
 
     var args_it = std.process.ArgIterator.init();
@@ -93,22 +93,23 @@ fn parseCommandLineArguments(allocator: std.mem.Allocator) ![]db.ConfigOption {
     const help_message_writer = help_message.writer();
 
     try std.fmt.format(help_message_writer, "Usage: {s} [options..]\n", .{program_name});
+    try std.fmt.format(help_message_writer, "Options:\n", .{});
     for (0..available_options.short.len) |i| {
+        var arg_column = std.ArrayList(u8).init(temp_allocator.allocator());
         if (available_options.short[i] != null and available_options.long[i] != null) {
-            try std.fmt.format(help_message_writer, "\t-{c}, --{s}", .{ available_options.short[i].?, available_options.long[i].? });
+            try std.fmt.format(arg_column.writer(), "-{c}, --{s}", .{ available_options.short[i].?, available_options.long[i].? });
         } else if (available_options.short[i] != null) {
-            try std.fmt.format(help_message_writer, "\t-{}", .{available_options.short[i].?});
+            try std.fmt.format(arg_column.writer(), "-{}", .{available_options.short[i].?});
         } else {
-            try std.fmt.format(help_message_writer, "\t--{s}", .{available_options.long[i].?});
+            try std.fmt.format(arg_column.writer(), "--{s}", .{available_options.long[i].?});
         }
         if (available_options.arg_type[i]) |arg| {
             switch (arg) {
-                .U16 => try std.fmt.format(help_message_writer, " <0-65535>", .{}),
-                .STRING => try std.fmt.format(help_message_writer, " <str>", .{}),
+                .U16 => try std.fmt.format(arg_column.writer(), " <0-65535>", .{}),
+                .STRING => try std.fmt.format(arg_column.writer(), " <str>", .{}),
             }
         }
-        if (i <= 1) try std.fmt.format(help_message_writer, "\t", .{}); // dirty trick to align descriptions, might use line length in the future to choose how many tabs to use
-        try std.fmt.format(help_message_writer, "\t{s}\n", .{available_options.description[i]});
+        try std.fmt.format(help_message_writer, "\t{s: <20}\t{s}\n", .{ arg_column.items, available_options.description[i] });
     }
     const stderr = std.io.getStdErr();
 
@@ -202,13 +203,16 @@ fn parseCommandLineArguments(allocator: std.mem.Allocator) ![]db.ConfigOption {
                 }
                 try options.append(.{ .name = "master", .value = next_arg[0..] });
             },
+            5 => { // diewithmaster
+                try options.append(.{ .name = "diewithmaster", .value = "true" });
+            },
             else => unreachable,
         }
     }
     return try options.toOwnedSlice();
 }
 
-pub fn main() !void {
+pub fn main() !u8 {
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
 
@@ -222,22 +226,22 @@ pub fn main() !void {
     const stderr = std.io.getStdErr();
     const config = parseCommandLineArguments(allocator) catch |err| {
         switch (err) {
-            error.Help => return,
+            error.Help => return 0,
             error.PositionalArgument => {
                 _ = try stderr.write("ERROR: positional arguments are not supported\n");
-                posix.exit(1);
+                return 1;
             },
             error.InvalidOption => {
                 _ = try stderr.write("ERROR: an invalid option was provided\n");
-                posix.exit(1);
+                return 1;
             },
             error.MissingArgument => {
                 _ = try stderr.write("ERROR: a required option argument was not provided\n");
-                posix.exit(1);
+                return 1;
             },
             error.InvalidArgument => {
                 _ = try stderr.write("ERROR: an invalid option argument was provided\n");
-                posix.exit(1);
+                return 1;
             },
             else => unreachable,
         }
@@ -334,6 +338,11 @@ pub fn main() !void {
                     .server => @panic("Not ready yet"),
                     .connection => |*connection_fsm| {
                         if (completed_event.async_result == 0) { // connection closed
+                            if (instance.master != null and connection_fsm.peer_type == .master and instance.diewithmaster) {
+                                std.debug.print("Master disconnected, shutting down...\n", .{});
+                                event_fsm.deinit();
+                                break :event_loop;
+                            }
                             if (connection_fsm.peer_type != .slave or event_fsm.global_data.slaves.remove(event_fsm)) {
                                 event_fsm.deinit();
                             }
@@ -815,4 +824,5 @@ pub fn main() !void {
             },
         }
     }
+    return 0;
 }
