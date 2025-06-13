@@ -4,12 +4,19 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const util = @import("util.zig");
 const cmd = @import("command.zig");
+const eq = @import("event_queue.zig");
+const resp = @import("resp.zig");
+
+pub const EventQueue = eq.EventQueue(FSM);
+pub const Event = eq.Event(FSM);
 
 pub const CLIENT_BUFFER_SIZE = 1024;
 
 pub const Server = struct {
-    socket: posix.socket_t,
     state: union(enum) { waiting, creating_connection, shutting_down },
+    listener: std.net.Server,
+    socket: posix.socket_t,
+    signalfd: posix.fd_t,
 };
 
 pub const Connection = struct {
@@ -76,26 +83,121 @@ pub const FSM = struct {
 
     const Self = @This();
 
-    pub fn newServer(allocator: std.mem.Allocator, server_socket: posix.socket_t, global_data: *GlobalData) !*Self {
+    pub fn newServer(allocator: std.mem.Allocator, address: []const u8, port: u16) !*Self {
         const server_fsm = try allocator.create(FSM);
+        const ip_address = try std.net.Address.resolveIp(address, port);
+        const listener = try ip_address.listen(.{
+            .reuse_address = true,
+        });
+
+        // INFO: signalfd set up to catch signals (SIGINT & SIGTERM)
+        var sigset = posix.empty_sigset;
+        linux.sigaddset(&sigset, posix.SIG.TERM);
+        linux.sigaddset(&sigset, posix.SIG.INT);
+        posix.sigprocmask(posix.SIG.BLOCK, &sigset, null);
+        const sfd = try posix.signalfd(-1, &sigset, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
+
+        const global_data = try allocator.create(GlobalData);
+        global_data.* = GlobalData.init(allocator);
+
         server_fsm.* = FSM{ .global_data = global_data, .type = .{
-            .server = Server{
-                .socket = server_socket,
-                .state = .waiting,
-            },
+            .server = Server{ .state = .waiting, .listener = listener, .socket = listener.stream.handle, .signalfd = sfd },
         }, .allocator = allocator };
         return server_fsm;
     }
 
-    pub fn newConnection(allocator: std.mem.Allocator, peer_socket: posix.socket_t, peer_type: @FieldType(Connection, "peer_type"), global_data: *GlobalData) !*Self {
-        const connection_fsm = try allocator.create(FSM);
-        connection_fsm.* = FSM{ .global_data = global_data, .type = .{ .connection = try Connection.init(allocator, peer_socket, peer_type) }, .allocator = allocator };
+    pub fn newConnection(self: *FSM, peer_socket: posix.socket_t, peer_type: @FieldType(Connection, "peer_type")) !*Self {
+        const connection_fsm = try self.allocator.create(FSM);
+        connection_fsm.* = FSM{ .global_data = self.global_data, .type = .{ .connection = try Connection.init(self.allocator, peer_socket, peer_type) }, .allocator = self.allocator };
         return connection_fsm;
+    }
+
+    pub fn waitForCommand(self: *FSM, event_queue: *EventQueue, new_state: struct { new_state: @TypeOf(self.type.connection.state) = .waiting_for_commands }) !void {
+        if (self.type != .connection)
+            return error.InvalidFSM;
+        const connection_fsm = &self.type.connection;
+        util.resizeBuffer(&connection_fsm.buffer, CLIENT_BUFFER_SIZE);
+        @memset(connection_fsm.buffer, 0);
+        connection_fsm.state = new_state.new_state;
+        const new_command_event = Event{
+            .type = .{ .recv = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
+            .user_data = self,
+        };
+
+        try event_queue.addAsyncEvent(new_command_event);
+    }
+
+    pub fn respondWith(self: *FSM, response: []const u8, event_queue: *EventQueue, new_state: struct { new_state: @TypeOf(self.type.connection.state) = .sending_response }) !void {
+        if (self.type != .connection)
+            return error.InvalidFSM;
+        const connection_fsm = &self.type.connection;
+        util.resizeBuffer(&connection_fsm.buffer, CLIENT_BUFFER_SIZE);
+        connection_fsm.buffer = try std.fmt.bufPrint(connection_fsm.buffer, "{s}", .{response});
+        connection_fsm.state = new_state.new_state;
+        const response_sent_event = Event{
+            .type = .{ .send = .{ .fd = connection_fsm.fd, .buffer = connection_fsm.buffer } },
+            .user_data = self,
+        };
+        try event_queue.addAsyncEvent(response_sent_event);
+    }
+
+    pub fn notify(self: *FSM, event_queue: *EventQueue, n_new_commands: usize) !void {
+        std.debug.assert(self.type == .connection);
+        if (n_new_commands > 0) {
+            try event_queue.addAsyncEvent(Event{
+                .type = .{ .notify = .{ .fd = self.type.connection.new_commands_notification_fd, .n = n_new_commands } },
+                .user_data = self,
+            });
+        }
+    }
+
+    pub fn executeCommands(self: *FSM, event_queue: *EventQueue) !void {
+        std.debug.assert(self.type == .connection);
+        const connection_fsm = &self.type.connection;
+        const wakeup_event = Event{
+            .type = .{ .read = .{ .fd = connection_fsm.new_commands_notification_fd, .buffer = std.mem.asBytes(&connection_fsm.notification_val) } },
+            .user_data = self,
+        };
+        connection_fsm.state = .executing_commands;
+        try event_queue.addAsyncEvent(wakeup_event);
+    }
+
+    pub fn requestOffset(self: *FSM, event_queue: *EventQueue) !void {
+        std.debug.assert(self.type == .connection);
+        std.debug.assert(self.type.connection.peer_type == .slave);
+        var request_buffer = [_]u8{0} ** 256;
+        var temp_allocator = std.heap.FixedBufferAllocator.init(&request_buffer);
+        const slave_fsm = &self.type.connection;
+        const ack_request = resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("GETACK"), resp.BulkString("*") });
+        util.resizeBuffer(&slave_fsm.buffer, CLIENT_BUFFER_SIZE);
+        slave_fsm.buffer = try std.fmt.bufPrint(slave_fsm.buffer, "{s}", .{try ack_request.encode(temp_allocator.allocator())});
+        const getack_event = Event{ .type = .{ .send = .{ .buffer = slave_fsm.buffer, .fd = slave_fsm.fd } }, .user_data = self };
+        slave_fsm.state = .sending_getack;
+        try event_queue.addAsyncEvent(getack_event);
+    }
+
+    pub fn propagateCommand(self: *FSM, event_queue: *EventQueue, command: cmd.Command) !void {
+        std.debug.assert(self.type == .connection);
+        std.debug.assert(self.type.connection.peer_type == .slave);
+        const slave_connection = &self.type.connection;
+        slave_connection.state = .propagating_command;
+        util.resizeBuffer(&slave_connection.buffer, CLIENT_BUFFER_SIZE);
+        slave_connection.buffer = try std.fmt.bufPrint(slave_connection.buffer, "{s}", .{command.bytes});
+        const propagation_event = Event{
+            .type = .{ .send = .{ .fd = slave_connection.fd, .buffer = slave_connection.buffer } },
+            .user_data = self,
+        };
+        try event_queue.addAsyncEvent(propagation_event);
     }
 
     pub fn deinit(self: *Self) void {
         switch (self.type) {
-            .server => {},
+            .server => |*fsm| {
+                self.global_data.deinit();
+                fsm.listener.deinit();
+                posix.close(fsm.signalfd);
+                self.allocator.destroy(self.global_data);
+            },
             .connection => |*fsm| {
                 fsm.deinit(self.allocator);
             },

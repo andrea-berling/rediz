@@ -3,6 +3,7 @@ const posix = std.posix;
 const resp = @import("resp.zig");
 const rdb = @import("rdb.zig");
 const Command = @import("command.zig").Command;
+const cfg = @import("config.zig");
 
 const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
@@ -39,8 +40,6 @@ pub const Datum = struct {
     expire_at_ms: ?i64 = null,
 };
 
-pub const ConfigOption = struct { name: []const u8, value: []const u8 };
-
 pub const Instance = struct {
     arena_allocator: *std.heap.ArenaAllocator,
     data: std.StringHashMap(Datum),
@@ -55,7 +54,7 @@ pub const Instance = struct {
         return try self.arena_allocator.allocator().dupe(u8, bytes);
     }
 
-    pub fn init(allocator: std.mem.Allocator, init_config: ?[]ConfigOption) !Instance {
+    pub fn init(allocator: std.mem.Allocator, init_config: ?std.StringArrayHashMap([]const u8)) !Instance {
         var instance: Instance = undefined;
         instance.arena_allocator = try allocator.create(std.heap.ArenaAllocator);
         instance.arena_allocator.* = std.heap.ArenaAllocator.init(allocator);
@@ -66,7 +65,7 @@ pub const Instance = struct {
         instance.rng = std.Random.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
         instance.diewithmaster = false;
 
-        const config_defaults = [_]ConfigOption{.{ .name = "dbfilename", .value = "dump.rdb" }};
+        const config_defaults = [_]struct { name: []const u8, value: []const u8 }{.{ .name = "dbfilename", .value = "dump.rdb" }};
 
         for (config_defaults) |config_pair| {
             try instance.config.put(
@@ -75,15 +74,16 @@ pub const Instance = struct {
             );
         }
 
-        if (init_config) |pairs| {
-            for (pairs) |config_pair| {
-                if (std.mem.eql(u8, config_pair.name, "diewithmaster")) {
+        if (init_config) |config| {
+            var entry_it = config.iterator();
+            while (entry_it.next()) |entry| {
+                if (std.mem.eql(u8, entry.value_ptr.*, "diewithmaster")) {
                     instance.diewithmaster = true;
                     continue;
                 }
                 try instance.config.put(
-                    try instance.dupe(config_pair.name),
-                    try instance.dupe(config_pair.value),
+                    try instance.dupe(entry.key_ptr.*),
+                    try instance.dupe(entry.value_ptr.*),
                 );
             }
         }
