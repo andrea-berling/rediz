@@ -48,7 +48,7 @@ pub fn parseCommandLineArguments(allocator: std.mem.Allocator) !std.StringArrayH
 
     while (args_it.next()) |arg| {
         var n_dashes: u8 = 0;
-        var optname = arg[0..];
+        var optname = arg;
         if (arg[n_dashes] != '-') {
             _ = try stderr.write(help_message.items);
             return error.PositionalArgument;
@@ -98,7 +98,7 @@ pub fn parseCommandLineArguments(allocator: std.mem.Allocator) !std.StringArrayH
                     _ = try stderr.write(help_message.items);
                     return error.InvalidArgument;
                 }
-                try options.put(optname, next_arg[0..next_arg.len]);
+                try options.put(optname, next_arg);
             },
             2 => {
                 const next_arg = args_it.next() orelse {
@@ -109,19 +109,19 @@ pub fn parseCommandLineArguments(allocator: std.mem.Allocator) !std.StringArrayH
                     _ = try stderr.write(help_message.items);
                     return error.InvalidArgument;
                 }
-                try options.put(optname, next_arg[0..next_arg.len]);
+                try options.put(optname, next_arg);
             }, // dbfilename
             3 => {
                 const next_arg = args_it.next() orelse {
                     _ = try stderr.write(help_message.items);
                     return error.MissingArgument;
                 };
-                _ = std.fmt.parseInt(u16, next_arg[0..], 10) catch {
+                _ = std.fmt.parseInt(u16, next_arg, 10) catch {
                     _ = try stderr.write(help_message.items);
                     return error.InvalidArgument;
                 };
 
-                try options.put("listening-port", next_arg[0..next_arg.len]);
+                try options.put("listening-port", next_arg);
             }, // port
             4 => { // replicaof
                 const next_arg = args_it.next() orelse {
@@ -133,7 +133,7 @@ pub fn parseCommandLineArguments(allocator: std.mem.Allocator) !std.StringArrayH
                     return error.InvalidArgument;
                 }
 
-                try options.put("master", next_arg[0..next_arg.len]);
+                try options.put("master", next_arg);
             },
             5 => { // diewithmaster
                 try options.put("diewithmater", "true");

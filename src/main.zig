@@ -57,7 +57,7 @@ pub fn main() !u8 {
 
     const address = "127.0.0.1";
     const port = try std.fmt.parseInt(u16, config.get("listening-port") orelse "6379", 10);
-    const server_fsm = try fsm.FSM.newServer(allocator, address[0..address.len], port);
+    const server_fsm = try fsm.FSM.newServer(allocator, address, port);
 
     std.debug.print("Listening on {s}:{d}...\n", .{ address, port });
 

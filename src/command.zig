@@ -48,7 +48,7 @@ pub const Command = struct {
 
         for (0..value.array.len) |i| {
             switch (value.array[i]) {
-                .null => array[i] = "-1"[0..],
+                .null => array[i] = "-1",
                 .bulk_string => |string| array[i] = (command.bytes.ptr + (string.ptr - bytes.ptr))[0..string.len],
                 else => return Error.InvalidInput,
             }
