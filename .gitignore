@@ -17,3 +17,4 @@ bin/
 *.swp
 *~
 redis-tester
+**.rdb

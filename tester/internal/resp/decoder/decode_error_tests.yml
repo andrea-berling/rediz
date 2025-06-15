@@ -1,0 +1,111 @@
+# Invalid RESP
+
+- input: ""
+  error: |
+    Received: "" (no content received)
+               ^ error
+    Error: Expected start of a new RESP2 value (either +, -, :, $ or *)
+
+- input: "K"
+  error: |
+    Received: "K"
+               ^ error
+    Error: "K" is not a valid start of a RESP2 value (expected +, -, :, $ or *)
+
+# Simple Strings
+
+- input: "+OK"
+  error: |
+    Received: "+OK"
+                  ^ error
+    Error: Expected \r\n at the end of a simple string
+
+- input: "+OK\r"
+  error: |
+    Received: "+OK\r"
+                    ^ error
+    Error: Expected \r\n at the end of a simple string
+
+- input: "+OK\n"
+  error: |
+    Received: "+OK\n"
+                    ^ error
+    Error: Expected \r\n at the end of a simple string
+
+# Bulk Strings
+
+- input: "$3"
+  error: |
+    Received: "$3"
+                 ^ error
+    Error: Expected \r\n after bulk string length
+
+- input: "$3\r"
+  error: |
+    Received: "$3\r"
+                   ^ error
+    Error: Expected \r\n after bulk string length
+
+- input: "$abc\r\n"
+  error: |
+    Received: "$abc\r\n"
+                ^ error
+    Error: Invalid bulk string length: "abc", expected a number
+
+- input: "$-5\r\nhello\r\n"
+  error: |
+    Received: "$-5\r\nhello\r\n"
+                ^ error
+    Error: Invalid bulk string length: -5, expected a positive integer
+
+- input: "$3\r\n"
+  error: |
+    Received: "$3\r\n"
+                     ^ error
+    Error: Expected 3 bytes of data in bulk string, got 0
+
+- input: "$2\r\nabc\r\n"
+  error: |
+    Received: "$2\r\nabc\r\n"
+                       ^ error
+    Error: Expected \r\n after 2 bytes of data in bulk string
+
+- input: "$3\r\nabc"
+  error: |
+    Received: "$3\r\nabc"
+                        ^ error
+    Error: Expected \r\n after 3 bytes of data in bulk string
+
+# Integers
+
+- input: ":17"
+  error: |
+    Received: ":17"
+                  ^ error
+    Error: Expected \r\n at the end of an integer
+
+- input: ":17\r"
+  error: |
+    Received: ":17\r"
+                    ^ error
+    Error: Expected \r\n at the end of an integer
+
+- input: ":17\n"
+  error: |
+    Received: ":17\n"
+                    ^ error
+    Error: Expected \r\n at the end of an integer
+
+- input: ":foo\r\n"
+  error: |
+    Received: ":foo\r\n"
+                ^ error
+    Error: Invalid integer: "foo", expected a number
+
+# Arrays
+
+# - input: "*abc"
+#   error: |
+#     Received: "*abc"
+#                    ^ error
+#     Error: Expected \r\n after array length

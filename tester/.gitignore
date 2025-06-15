@@ -1,0 +1,8 @@
+dist
+
+# Tests generate this
+**.rdb
+
+vendor/
+.history/
+.idea/
