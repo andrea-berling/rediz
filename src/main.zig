@@ -16,6 +16,7 @@ const IO_URING_ENTRIES = 100;
 
 pub const std_options: std.Options = .{
     // Define logFn to override the std implementation
+    .log_level = .info,
     .logFn = logger,
 };
 
