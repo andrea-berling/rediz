@@ -43,6 +43,7 @@ pub const Command = struct {
         var command: Command = undefined;
         command.allocator = allocator;
         command.bytes = try allocator.dupe(u8, bytes[0..parsed_bytes]);
+        errdefer allocator.free(command.bytes);
 
         var array = try temp_allocator.allocator().alloc([]const u8, value.array.len);
 
