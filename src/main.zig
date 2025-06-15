@@ -14,6 +14,40 @@ const stdout = std.io.getStdOut().writer();
 
 const IO_URING_ENTRIES = 100;
 
+pub const std_options: std.Options = .{
+    // Define logFn to override the std implementation
+    .logFn = logger,
+};
+
+pub fn logger(
+    comptime level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const timestamp_ms = std.time.milliTimestamp();
+
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @bitCast(@divFloor(timestamp_ms, 1000)) };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const month = month_day.month.numeric();
+    const day = month_day.day_index + 1;
+
+    const scope_prefix = "(" ++ @tagName(scope) ++ "): ";
+
+    const prefix = "[" ++ comptime level.asText() ++ "] " ++ scope_prefix;
+
+    // Print the message to stderr, silently ignoring any errors
+    std.debug.lockStdErr();
+    defer std.debug.unlockStdErr();
+    const stderr = std.io.getStdErr().writer();
+    nosuspend stderr.print("[{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z] ", .{ year_day.year, month, day, day_seconds.getHoursIntoDay(), day_seconds.getMinutesIntoHour(), day_seconds.getSecondsIntoMinute(), @as(u64, @bitCast(@mod(timestamp_ms, 1000))) }) catch return;
+    nosuspend stderr.print("{d} ", .{linux.getpid()}) catch return;
+    nosuspend stderr.print(prefix ++ format ++ "\n", args) catch return;
+}
+
 pub fn main() !u8 {
 
     // INFO: Allocator set up
@@ -50,16 +84,13 @@ pub fn main() !u8 {
         }
     };
 
-    try stdout.print("Logs from your program will appear here!\n", .{});
-    std.debug.print("My PID is {}\n", .{linux.getpid()});
-
     // INFO: Server FSM setup
 
     const address = "127.0.0.1";
     const port = try std.fmt.parseInt(u16, config.get("listening-port") orelse "6379", 10);
     const server_fsm = try fsm.FSM.newServer(allocator, address, port);
 
-    std.debug.print("Listening on {s}:{d}...\n", .{ address, port });
+    std.log.scoped(.init).info("Listening on {s}:{d}...", .{ address, port });
 
     // INFO: Event queue init
     var event_queue = try fsm.EventQueue.init(allocator, IO_URING_ENTRIES);
@@ -86,16 +117,17 @@ pub fn main() !u8 {
         try master_server_fsm.?.waitForCommand(&event_queue, .{});
     }
 
+    const event_loop_logger = std.log.scoped(.event_loop);
     event_loop: while (true) {
-        try stdout.print("Waiting for something to come through...\n", .{});
+        event_loop_logger.debug("Waiting for something to come through...", .{});
         const completed_event = try event_queue.next();
         const event_fsm: *fsm.FSM = completed_event.awaited_event.user_data;
-        try stdout.print("New event: {any}\n", .{completed_event});
+        event_loop_logger.debug("New event: {any}", .{completed_event});
         switch (completed_event.awaited_event.type) {
             .accept => {
                 std.debug.assert(event_fsm.type == .server);
                 const connection_socket: posix.socket_t = completed_event.async_result;
-                try stdout.print("accepted new connection\n", .{});
+                event_loop_logger.info("Accepted new connection", .{});
                 const new_connection_fsm = try event_fsm.newConnection(connection_socket, .generic_client);
                 try new_connection_fsm.waitForCommand(&event_queue, .{});
 
@@ -108,7 +140,7 @@ pub fn main() !u8 {
 
                 if (completed_event.async_result == 0) { // connection closed
                     if (instance.master != null and connection_fsm.peer_type == .master and instance.diewithmaster) {
-                        std.debug.print("Master disconnected, shutting down...\n", .{});
+                        event_loop_logger.info("Peer closed connection", .{});
                         event_fsm.deinit();
                         break :event_loop;
                     }
@@ -120,7 +152,7 @@ pub fn main() !u8 {
                 }
 
                 if (completed_event.async_result < 0) { // error
-                    std.debug.print("Error: {} {d}\n", .{ linux.E.init(@intCast(@as(u32, @bitCast(completed_event.async_result)))), completed_event.async_result });
+                    event_loop_logger.err("Error: {} {d}", .{ linux.E.init(@intCast(@as(u32, @bitCast(completed_event.async_result)))), completed_event.async_result });
                     if (connection_fsm.peer_type != .slave or event_fsm.global_data.slaves.remove(event_fsm)) {
                         event_fsm.deinit();
                     }
@@ -133,7 +165,7 @@ pub fn main() !u8 {
                     defer temp_allocator.deinit();
 
                     const response, _ = resp.Value.parse(connection_fsm.buffer, temp_allocator.allocator()) catch {
-                        std.debug.print("Got some invalid bytes on the wire: {?x}\n", .{connection_fsm.buffer});
+                        event_loop_logger.debug("Got some invalid bytes on the wire: {?x}", .{connection_fsm.buffer});
                         try event_fsm.respondWith(try resp.SimpleError("Invalid bytes on the wire").encode(temp_allocator.allocator()), &event_queue, .{});
                         continue :event_loop;
                     };
@@ -186,8 +218,8 @@ pub fn main() !u8 {
 
                 while (buffer_size - n > 0) {
                     const command, const parsed_bytes = Command.parse(connection_fsm.buffer[n..], allocator) catch |err| {
-                        std.debug.print("Error while parsing command: {}\n", .{err});
-                        std.debug.print("Bytes on the wire: {x} (return value: {d})\n", .{ connection_fsm.buffer, completed_event.async_result });
+                        event_loop_logger.err("Error while parsing command: {}", .{err});
+                        event_loop_logger.debug("Bytes on the wire: {x} (return value: {d})", .{ connection_fsm.buffer, completed_event.async_result });
 
                         try event_fsm.notify(&event_queue, n_new_commands);
                         try event_fsm.respondWith(try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator()), &event_queue, .{});
@@ -233,7 +265,7 @@ pub fn main() !u8 {
                 const connection_fsm = &event_fsm.type.connection;
 
                 if (connection_fsm.state != .executing_commands and connection_fsm.state != .executing_transaction) {
-                    std.debug.print("Maybe I'm replying, come back later\n", .{});
+                    event_loop_logger.debug("Maybe I'm replying, come back later", .{});
                     try event_fsm.notify(&event_queue, 1);
                     continue :event_loop;
                 }
@@ -456,7 +488,7 @@ pub fn main() !u8 {
             .pollin => |timerfd| {
                 switch (event_fsm.type) {
                     .server => {
-                        std.debug.print("Gracefully shutting down...\n", .{});
+                        event_loop_logger.info("Gracefully shutting down...", .{});
                         var slaves_it = event_fsm.global_data.slaves.keyIterator();
                         while (slaves_it.next()) |slave_fsm| {
                             slave_fsm.*.deinit();

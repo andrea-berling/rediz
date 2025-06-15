@@ -7,6 +7,8 @@ const cfg = @import("config.zig");
 
 const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
+const logger = std.log.scoped(.database);
+
 pub const StreamEntryID = packed struct(u64) {
     pub const TIMESTAMP_ANY: u48 = ~@as(u48, 0);
     pub const SEQUENCE_NUMBER_ANY: u48 = 0xffff;
@@ -95,7 +97,7 @@ pub const Instance = struct {
         }
 
         if (instance.config.get("dbfilename")) |dbfilename| {
-            std.debug.print("Initializing from RDB file {s}...\n", .{dbfilename});
+            logger.info("Initializing from RDB file {s}...", .{dbfilename});
             if (rdb_directory.openFile(dbfilename, .{})) |file| {
                 var temp_allocator = std.heap.ArenaAllocator.init(instance.arena_allocator.allocator());
                 defer temp_allocator.deinit();
@@ -104,7 +106,7 @@ pub const Instance = struct {
                 for (data) |pair| {
                     if (pair.value.expire_at_ms) |expire_at_ms| {
                         if (expire_at_ms <= std.time.milliTimestamp()) {
-                            std.debug.print("Key {s} already expired at {d}, not adding it\n", .{ pair.key, expire_at_ms });
+                            logger.debug("Key {s} already expired at {d}, not adding it", .{ pair.key, expire_at_ms });
                             continue;
                         }
                     }
@@ -116,8 +118,7 @@ pub const Instance = struct {
                 if (err != error.FileNotFound) {
                     @panic("Error opening dbfilename");
                 }
-                // TODO: Change this for actual logs
-                std.debug.print("File {s} not found\n", .{dbfilename});
+                logger.warn("File {s} not found", .{dbfilename});
             }
         }
 
@@ -193,7 +194,7 @@ pub const Instance = struct {
             parsed_bytes += command_bytes;
         }
 
-        std.debug.print("Handshake and sync with {s}:{d} was succesful!\n", .{ address, port });
+        logger.info("Handshake and sync with {s}:{d} was succesful!", .{ address, port });
         return .{ tcp_stream.handle, replid };
     }
 
@@ -435,11 +436,11 @@ pub const Instance = struct {
                     .capabilities => |capabilities| {
                         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
                         defer temp_allocator.deinit();
-                        std.debug.print("Slave advertised the following capabilities: {s}\n", .{try std.mem.join(temp_allocator.allocator(), ",", capabilities)});
+                        logger.debug("Slave advertised the following capabilities: {s}", .{try std.mem.join(temp_allocator.allocator(), ",", capabilities)});
                         return resp.Ok;
                     },
                     .listening_port => |listening_port| {
-                        std.debug.print("Slave advertised this listening port: {d}\n", .{listening_port});
+                        logger.debug("Slave advertised this listening port: {d}", .{listening_port});
                         return resp.Ok;
                     },
                 }
