@@ -67,6 +67,8 @@ pub const Instance = struct {
         instance.rng = std.Random.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
         instance.diewithmaster = false;
 
+        errdefer instance.destroy(allocator);
+
         const config_defaults = [_]struct { name: []const u8, value: []const u8 }{.{ .name = "dbfilename", .value = "dump.rdb" }};
 
         for (config_defaults) |config_pair| {
@@ -125,12 +127,14 @@ pub const Instance = struct {
         if (instance.config.get("master")) |master| {
             var it = std.mem.splitScalar(u8, master, ' ');
             var address = it.next().?;
-            // TODO: DNS
             if (std.mem.eql(u8, address, "localhost")) {
                 address = "127.0.0.1";
             }
             const port = try std.fmt.parseInt(u16, it.next().?, 10);
-            instance.master, instance.replid = try instance.handshake_and_sync(address, port);
+            instance.master, instance.replid = instance.handshake_and_sync(address, port) catch |err| {
+                logger.err("Handshake failed: {!}", .{err});
+                return error.HandshakeWithMasterFailed;
+            };
         } else {
             instance.replid = try std.fmt.allocPrint(instance.arena_allocator.allocator(), "{x}{x}", .{ instance.rng.random().int(u128), instance.rng.random().int(u32) });
         }
@@ -141,20 +145,34 @@ pub const Instance = struct {
     fn handshake_and_sync(self: *Instance, address: []const u8, port: u16) !struct { posix.socket_t, []u8 } {
         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
         defer temp_allocator.deinit();
-        // TODO: catch and return proper error back up to main
-        var tcp_stream = try std.net.tcpConnectToHost(temp_allocator.allocator(), address, port);
+        var tcp_stream = std.net.tcpConnectToHost(temp_allocator.allocator(), address, port) catch |err| {
+            logger.err("Error connecting to {s}:{d}: {!}", .{ address, port, err });
+            return err;
+        };
         _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{resp.BulkString("PING")}).encode(temp_allocator.allocator()));
         const buffer = try temp_allocator.allocator().alloc(u8, 1024);
         var n = try tcp_stream.read(buffer);
-        var response, _ = try resp.Value.parse(buffer, temp_allocator.allocator());
+        var response, _ = resp.Value.parse(buffer, temp_allocator.allocator()) catch |err| {
+            logger.err("Handshake 1: Invalid response from master", .{});
+            logger.debug("Data returned by master: {x}", .{buffer[0..n]});
+            return err;
+        };
         std.debug.assert(response == .simple_string and std.ascii.eqlIgnoreCase(response.simple_string, "PONG"));
         _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("listening-port"), resp.BulkString(self.config.get("listening-port").?) }).encode(temp_allocator.allocator()));
         n = try tcp_stream.read(buffer);
-        response, _ = try resp.Value.parse(buffer, temp_allocator.allocator());
+        response, _ = resp.Value.parse(buffer, temp_allocator.allocator()) catch |err| {
+            logger.err("Handshake 2: Invalid response from master", .{});
+            logger.debug("Data returned by master: {x}", .{buffer[0..n]});
+            return err;
+        };
         std.debug.assert(response == .simple_string and std.ascii.eqlIgnoreCase(response.simple_string, "OK"));
         _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{ resp.BulkString("REPLCONF"), resp.BulkString("capa"), resp.BulkString("psync2") }).encode(temp_allocator.allocator()));
         n = try tcp_stream.read(buffer);
-        response, _ = try resp.Value.parse(buffer, temp_allocator.allocator());
+        response, _ = resp.Value.parse(buffer, temp_allocator.allocator()) catch |err| {
+            logger.err("Handshake 3: Invalid response from master", .{});
+            logger.debug("Data returned by master: {x}", .{buffer[0..n]});
+            return err;
+        };
         std.debug.assert(response == .simple_string and std.ascii.eqlIgnoreCase(response.simple_string, "OK"));
         _ = try tcp_stream.write(try resp.Array(&[_]resp.Value{ resp.BulkString("PSYNC"), resp.BulkString("?"), resp.BulkString("-1") }).encode(temp_allocator.allocator()));
 
@@ -182,8 +200,16 @@ pub const Instance = struct {
         const fullsync, const fullsync_parsed_bytes = try resp.Value.parse(buffer, temp_allocator.allocator()); // FULLSYNC
         var fullsync_it = std.mem.splitScalar(u8, fullsync.simple_string, ' ');
         _ = fullsync_it.next();
-        const replid = try self.dupe(fullsync_it.next().?);
-        const db_parsed_bytes = try rdb.parseDump(buffer[fullsync_parsed_bytes..]);
+        const replid = try self.dupe(fullsync_it.next() orelse {
+            logger.err("Handshake 4: Invalid response from master", .{});
+            logger.debug("Data returned by master: {x}", .{buffer[0..fullsync_parsed_bytes]});
+            return error.InvalidResponseFromMaster;
+        });
+        const db_parsed_bytes = rdb.parseDump(buffer[fullsync_parsed_bytes..]) catch |err| {
+            logger.err("Handshake 5: Received invalid dump from master", .{});
+            logger.debug("Data returned by master: {x}", .{buffer[fullsync_parsed_bytes..]});
+            return err;
+        };
         var parsed_bytes = fullsync_parsed_bytes + db_parsed_bytes;
         while (n > parsed_bytes) {
             const command, const command_bytes = try Command.parse(buffer[parsed_bytes..], temp_allocator.allocator());

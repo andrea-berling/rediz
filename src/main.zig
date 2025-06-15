@@ -106,7 +106,11 @@ pub fn main() !u8 {
     try event_queue.addAsyncEvent(termination_event);
 
     // INFO: DB init
-    var instance = try db.Instance.init(allocator, config);
+    var instance = db.Instance.init(allocator, config) catch |err| {
+        std.log.scoped(.init).err("Datastore initialization failed: {!}", .{err});
+        config.deinit();
+        return err;
+    };
     defer instance.destroy(allocator);
     config.deinit();
 
