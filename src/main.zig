@@ -232,9 +232,9 @@ pub fn main() !u8 {
                     };
 
                     if (command.type == .exec) {
+                        @constCast(&command).deinit();
                         if (connection_fsm.state != .executing_transaction) {
                             try event_fsm.respondWith(try resp.SimpleError("EXEC without MULTI").encode(temp_allocator.allocator()), &event_queue, .{});
-
                             continue :event_loop;
                         }
 
@@ -243,6 +243,7 @@ pub fn main() !u8 {
                     }
 
                     if (command.type == .discard) {
+                        @constCast(&command).deinit();
                         if (connection_fsm.state != .executing_transaction) {
                             try event_fsm.respondWith(try resp.SimpleError("DISCARD without MULTI").encode(temp_allocator.allocator()), &event_queue, .{});
                             continue :event_loop;

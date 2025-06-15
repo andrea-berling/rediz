@@ -68,6 +68,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
         posix.close(self.fd);
+        self.flushCommandsQueue();
         util.resizeBuffer(&self.buffer, CLIENT_BUFFER_SIZE);
         allocator.free(self.buffer);
     }
