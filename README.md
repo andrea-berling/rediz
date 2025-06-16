@@ -1,6 +1,6 @@
 # Rediz
 
-This is my take on the ["Build your own Redis" Challenge](https://app.codecrafters.io/courses/redis/overview) by [CodeCrafters](https://codecrafters.io). It's a Redis re-implementation written in Zig supporting a subset of the features and commands of Redis. It's mostly for didactic purposes, and is therefore not even close to feature complete or fast (it is memory leaks free though :)). This is my first Zig project, and it was a very nice way to learn the language as well as what goes into creating a key-value store like Redis (e.g. FSMs, asynchronous event loop, RDB files, etc.) . If you want to give it a spin, you can find some instructions below.
+This is my take on the ["Build your own Redis" Challenge](https://app.codecrafters.io/courses/redis/overview) by [CodeCrafters](https://codecrafters.io). It's a Redis re-implementation written in Zig supporting a subset of the features and commands of Redis. It's mostly for didactic purposes, and is therefore not even close to feature complete or fast (it is memory leaks free though 🙂). This is my first Zig project, and it was a very nice way to learn the language as well as what goes into creating a key-value store like Redis (e.g. FSMs, asynchronous event loop, RDB files, etc.) . If you want to give it a spin, you can find some instructions below.
 
 > [!NOTE]
 > Due to the OS-level APIs used in this project, it is only compatible with Linux 5.1+
