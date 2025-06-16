@@ -353,7 +353,8 @@ pub fn main() !u8 {
                                     if (command.type == .xread and command.type.xread.block_timeout_ms != null and std.meta.eql(reply, resp.Null)) {
                                         var timerfd: ?posix.fd_t = null;
                                         if (command.type.xread.block_timeout_ms) |timeout_ms| {
-                                            timerfd = try util.setupTimer(timeout_ms);
+                                            if (timeout_ms > 0)
+                                                timerfd = try util.setupTimer(timeout_ms);
                                         }
                                         var blocked_stream_read = try allocator.create(fsm.BlockedStreamRead);
                                         blocked_stream_read.* = fsm.BlockedStreamRead.init(allocator, event_fsm, timerfd);
