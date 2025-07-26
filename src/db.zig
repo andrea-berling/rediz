@@ -280,7 +280,7 @@ pub const Instance = struct {
 
                 const stream_datum = try self.data.getOrPut(try self.dupe(stream_add_command.stream_key));
                 if (!stream_datum.found_existing) {
-                    stream_datum.value_ptr.*.value.stream = Stream.init(self.arena_allocator.allocator());
+                    stream_datum.value_ptr.*.value = .{ .stream = Stream.init(self.arena_allocator.allocator()) };
                 }
 
                 var stream = &stream_datum.value_ptr.value.stream;
