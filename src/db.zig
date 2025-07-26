@@ -35,7 +35,7 @@ pub const StreamEntryID = packed struct(u64) {
 
 const Stream = std.AutoArrayHashMap(StreamEntryID, std.StringHashMap([]u8));
 
-pub const Value = union(enum) { string: []u8, stream: Stream };
+pub const Value = union(enum) { string: []u8, stream: Stream, list: std.ArrayList([]u8) };
 
 pub const Datum = struct {
     value: Value,
@@ -480,6 +480,9 @@ pub const Instance = struct {
                         .stream => {
                             return resp.SimpleString("stream");
                         },
+                        .list => {
+                            return resp.SimpleString("list");
+                        },
                     }
                 } else return resp.SimpleString("none");
             },
@@ -501,6 +504,17 @@ pub const Instance = struct {
                     try self.data.put(try self.dupe(key), datum);
                     return resp.Integer(1);
                 }
+            },
+            .rpush => |rpush_command| {
+                const list_entry = try self.data.getOrPut(try self.dupe(rpush_command.key));
+
+                if (!list_entry.found_existing) {
+                    list_entry.value_ptr.*.value = .{ .list = std.ArrayList([]u8).init(self.arena_allocator.allocator()) };
+                }
+                for (rpush_command.values) |value| {
+                    try list_entry.value_ptr.*.value.list.append(try self.dupe(value));
+                }
+                return resp.Integer(@bitCast(list_entry.value_ptr.*.value.list.items.len));
             },
             else => {
                 return error.InvalidCommand;

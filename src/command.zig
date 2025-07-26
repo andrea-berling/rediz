@@ -6,7 +6,7 @@ pub const Error = error{ InvalidArgument, InvalidCommand, InvalidInput, InvalidS
 
 pub const Command = struct {
     bytes: []u8,
-    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard },
+    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, rpush: RPushCommand },
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -16,7 +16,7 @@ pub const Command = struct {
         const fields_info = comptime type_info.@"union".fields;
         const other_keywords = [_][]const u8{ "px", "pxat", "ex", "exat", "streams", "replication", "block" };
         var keywords: [fields_info.len + other_keywords.len][]const u8 = undefined;
-        @setEvalBranchQuota(2000);
+        @setEvalBranchQuota(4000);
         inline for (fields_info, 0..) |field, i| {
             keywords[i] = field.name;
         }
@@ -268,6 +268,11 @@ pub const Command = struct {
             k2idx("discard") => {
                 break :blk .discard;
             },
+            k2idx("rpush") => {
+                if (array.len < 3)
+                    return Error.NotEnoughArguments;
+                break :blk .{ .rpush = .{ .key = array[1], .values = try allocator.dupe([]const u8, array[2..]) } };
+            },
             else => {
                 return Error.UnsupportedCommand;
             },
@@ -279,7 +284,7 @@ pub const Command = struct {
     pub fn shouldPropagate(self: *const Self) bool {
         switch (self.*.type) {
             .ping, .echo, .get, .keys, .xrange, .xread, .config, .info, .replconf, .psync, .wait, .type => return false,
-            .set, .xadd, .incr, .multi, .discard, .exec => return true,
+            .set, .xadd, .incr, .multi, .discard, .exec, .rpush => return true,
         }
     }
 
@@ -369,6 +374,13 @@ pub const Command = struct {
                 try response.append(resp.BulkString("TYPE"));
                 try response.append(resp.BulkString(key));
             },
+            .rpush => |rpush_command| {
+                try response.append(resp.BulkString("RPUSH"));
+                try response.append(resp.BulkString(rpush_command.key));
+                for (rpush_command.values) |value| {
+                    try response.append(resp.BulkString(value));
+                }
+            },
             else => {
                 return error.InvalidCommand;
             },
@@ -389,6 +401,9 @@ pub const Command = struct {
                 if (replica_config_command == .capabilities) {
                     self.allocator.free(replica_config_command.capabilities);
                 }
+            },
+            .rpush => |rpush_command| {
+                self.allocator.free(rpush_command.values);
             },
         }
         self.allocator.free(self.bytes);
@@ -453,6 +468,8 @@ pub const WaitCommand = struct {
     num_replicas: usize,
     timeout_ms: usize,
 };
+
+pub const RPushCommand = struct { key: []const u8, values: []const []const u8 };
 
 fn parseStreamEntryId(string: []const u8) !db.StreamEntryID {
     var stream_entry_id = db.StreamEntryID{};
