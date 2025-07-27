@@ -520,9 +520,6 @@ pub const Instance = struct {
             },
             .lrange => |lrange_command| {
                 const empty_array = resp.Array(&[_]resp.Value{});
-                if (lrange_command.start > lrange_command.end) {
-                    return empty_array;
-                }
                 const datum = self.data.get(lrange_command.key) orelse return empty_array;
 
                 if (datum.value != .list) {
