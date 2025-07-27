@@ -6,7 +6,7 @@ pub const Error = error{ InvalidArgument, InvalidCommand, InvalidInput, InvalidS
 
 pub const Command = struct {
     bytes: []u8,
-    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, rpush: RPushCommand, lrange: struct { key: []const u8, start: i64, end: i64 } },
+    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, list_push: PushCommand, lrange: struct { key: []const u8, start: i64, end: i64 } },
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -14,7 +14,7 @@ pub const Command = struct {
     fn keywordToIndex(string: []const u8) isize {
         const type_info = @typeInfo(@FieldType(@This(), "type"));
         const fields_info = comptime type_info.@"union".fields;
-        const other_keywords = [_][]const u8{ "px", "pxat", "ex", "exat", "streams", "replication", "block" };
+        const other_keywords = [_][]const u8{ "px", "pxat", "ex", "exat", "streams", "replication", "block", "rpush", "lpush" };
         var keywords: [fields_info.len + other_keywords.len][]const u8 = undefined;
         @setEvalBranchQuota(4000);
         inline for (fields_info, 0..) |field, i| {
@@ -268,10 +268,10 @@ pub const Command = struct {
             k2idx("discard") => {
                 break :blk .discard;
             },
-            k2idx("rpush") => {
+            k2idx("rpush"), k2idx("lpush") => {
                 if (array.len < 3)
                     return Error.NotEnoughArguments;
-                break :blk .{ .rpush = .{ .key = array[1], .values = try allocator.dupe([]const u8, array[2..]) } };
+                break :blk .{ .list_push = .{ .key = array[1], .values = try allocator.dupe([]const u8, array[2..]), .type = if (k2idx(array[0]) == k2idx("rpush")) .append else .prepend } };
             },
             k2idx("lrange") => {
                 if (array.len < 4)
@@ -291,7 +291,7 @@ pub const Command = struct {
     pub fn shouldPropagate(self: *const Self) bool {
         switch (self.*.type) {
             .ping, .echo, .get, .keys, .xrange, .xread, .config, .info, .replconf, .psync, .wait, .type, .lrange => return false,
-            .set, .xadd, .incr, .multi, .discard, .exec, .rpush => return true,
+            .set, .xadd, .incr, .multi, .discard, .exec, .list_push => return true,
         }
     }
 
@@ -381,10 +381,12 @@ pub const Command = struct {
                 try response.append(resp.BulkString("TYPE"));
                 try response.append(resp.BulkString(key));
             },
-            .rpush => |rpush_command| {
-                try response.append(resp.BulkString("RPUSH"));
-                try response.append(resp.BulkString(rpush_command.key));
-                for (rpush_command.values) |value| {
+            .list_push => |push_command| {
+                if (push_command.type == .append) {
+                    try response.append(resp.BulkString("RPUSH"));
+                } else try response.append(resp.BulkString("LPUSH"));
+                try response.append(resp.BulkString(push_command.key));
+                for (push_command.values) |value| {
                     try response.append(resp.BulkString(value));
                 }
             },
@@ -415,8 +417,8 @@ pub const Command = struct {
                     self.allocator.free(replica_config_command.capabilities);
                 }
             },
-            .rpush => |rpush_command| {
-                self.allocator.free(rpush_command.values);
+            .list_push => |push_command| {
+                self.allocator.free(push_command.values);
             },
         }
         self.allocator.free(self.bytes);
@@ -482,7 +484,7 @@ pub const WaitCommand = struct {
     timeout_ms: usize,
 };
 
-pub const RPushCommand = struct { key: []const u8, values: []const []const u8 };
+pub const PushCommand = struct { type: union(enum) { append, prepend }, key: []const u8, values: []const []const u8 };
 
 fn parseStreamEntryId(string: []const u8) !db.StreamEntryID {
     var stream_entry_id = db.StreamEntryID{};

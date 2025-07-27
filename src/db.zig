@@ -505,16 +505,18 @@ pub const Instance = struct {
                     return resp.Integer(1);
                 }
             },
-            .rpush => |rpush_command| {
-                const list_entry = try self.data.getOrPut(try self.dupe(rpush_command.key));
+            .list_push => |push_command| {
+                const list_entry = try self.data.getOrPut(try self.dupe(push_command.key));
 
                 if (!list_entry.found_existing) {
                     list_entry.value_ptr.*.value = .{ .list = std.DoublyLinkedList([]u8){} };
                 }
-                for (rpush_command.values) |value| {
+                for (push_command.values) |value| {
                     const new_node = try self.arena_allocator.allocator().create(std.DoublyLinkedList([]u8).Node);
                     new_node.data = try self.dupe(value);
-                    list_entry.value_ptr.*.value.list.append(new_node);
+                    if (push_command.type == .append) {
+                        list_entry.value_ptr.*.value.list.append(new_node);
+                    } else list_entry.value_ptr.*.value.list.prepend(new_node);
                 }
                 return resp.Integer(@intCast(list_entry.value_ptr.*.value.list.len));
             },
