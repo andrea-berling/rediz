@@ -6,7 +6,7 @@ pub const Error = error{ InvalidArgument, InvalidCommand, InvalidInput, InvalidS
 
 pub const Command = struct {
     bytes: []u8,
-    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, list_push: PushCommand, lrange: struct { key: []const u8, start: i64, end: i64 }, llen: []const u8 },
+    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, list_push: PushCommand, lrange: struct { key: []const u8, start: i64, end: i64 }, llen: []const u8, lpop: struct { key: []const u8, n: ?usize } },
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -285,6 +285,16 @@ pub const Command = struct {
                     return Error.WrongNumberOfArguments;
                 break :blk .{ .llen = array[1] };
             },
+            k2idx("lpop") => {
+                if (array.len < 2)
+                    return Error.NotEnoughArguments;
+                if (array.len > 4)
+                    return Error.WrongNumberOfArguments;
+                const n_elements = if (array.len > 2) n: {
+                    break :n std.fmt.parseInt(usize, array[2], 10) catch return error.InvalidArgument;
+                } else null;
+                break :blk .{ .lpop = .{ .key = array[1], .n = n_elements } };
+            },
             else => {
                 return Error.UnsupportedCommand;
             },
@@ -296,7 +306,7 @@ pub const Command = struct {
     pub fn shouldPropagate(self: *const Self) bool {
         switch (self.*.type) {
             .ping, .echo, .get, .keys, .xrange, .xread, .config, .info, .replconf, .psync, .wait, .type, .lrange, .llen => return false,
-            .set, .xadd, .incr, .multi, .discard, .exec, .list_push => return true,
+            .set, .xadd, .incr, .multi, .discard, .exec, .list_push, .lpop => return true,
         }
     }
 
@@ -398,12 +408,19 @@ pub const Command = struct {
             .lrange => |lrange_command| {
                 try response.append(resp.BulkString("LRANGE"));
                 try response.append(resp.BulkString(lrange_command.key));
-                try response.append(resp.Integer(lrange_command.start));
-                try response.append(resp.Integer(lrange_command.end));
+                try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{lrange_command.start})));
+                try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{lrange_command.end})));
             },
             .llen => |list| {
                 try response.append(resp.BulkString("LLEN"));
                 try response.append(resp.BulkString(list));
+            },
+            .lpop => |lpop_command| {
+                try response.append(resp.BulkString("LPOP"));
+                try response.append(resp.BulkString(lpop_command.key));
+                if (lpop_command.n) |n| {
+                    try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{n})));
+                }
             },
             else => {
                 return error.InvalidCommand;
@@ -414,7 +431,7 @@ pub const Command = struct {
 
     pub fn deinit(self: *Command) void {
         switch (self.*.type) {
-            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr, .multi, .exec, .discard, .lrange, .llen => {},
+            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr, .multi, .exec, .discard, .lrange, .llen, .lpop => {},
             .xadd => |stream_add_command| {
                 self.allocator.free(stream_add_command.key_value_pairs);
             },
