@@ -563,6 +563,13 @@ pub const Instance = struct {
 
                 return resp.Array(ret);
             },
+            .llen => |list| {
+                const datum = self.data.get(list) orelse return resp.Integer(0);
+
+                if (datum.value != .list) return error.InvalidArgument;
+
+                return resp.Integer(@intCast(datum.value.list.len));
+            },
             else => {
                 return error.InvalidCommand;
             },
