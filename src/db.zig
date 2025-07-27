@@ -35,7 +35,7 @@ pub const StreamEntryID = packed struct(u64) {
 
 const Stream = std.AutoArrayHashMap(StreamEntryID, std.StringHashMap([]u8));
 
-pub const Value = union(enum) { string: []u8, stream: Stream, list: std.ArrayList([]u8) };
+pub const Value = union(enum) { string: []u8, stream: Stream, list: std.DoublyLinkedList([]u8) };
 
 pub const Datum = struct {
     value: Value,
@@ -131,7 +131,7 @@ pub const Instance = struct {
                 address = "127.0.0.1";
             }
             const port = try std.fmt.parseInt(u16, it.next().?, 10);
-            instance.master, instance.replid = instance.handshake_and_sync(address, port) catch |err| {
+            instance.master, instance.replid = instance.handshakeAndSync(address, port) catch |err| {
                 logger.err("Handshake failed: {!}", .{err});
                 return error.HandshakeWithMasterFailed;
             };
@@ -142,7 +142,7 @@ pub const Instance = struct {
         return instance;
     }
 
-    fn handshake_and_sync(self: *Instance, address: []const u8, port: u16) !struct { posix.socket_t, []u8 } {
+    fn handshakeAndSync(self: *Instance, address: []const u8, port: u16) !struct { posix.socket_t, []u8 } {
         var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
         defer temp_allocator.deinit();
         var tcp_stream = std.net.tcpConnectToHost(temp_allocator.allocator(), address, port) catch |err| {
@@ -509,12 +509,60 @@ pub const Instance = struct {
                 const list_entry = try self.data.getOrPut(try self.dupe(rpush_command.key));
 
                 if (!list_entry.found_existing) {
-                    list_entry.value_ptr.*.value = .{ .list = std.ArrayList([]u8).init(self.arena_allocator.allocator()) };
+                    list_entry.value_ptr.*.value = .{ .list = std.DoublyLinkedList([]u8){} };
                 }
                 for (rpush_command.values) |value| {
-                    try list_entry.value_ptr.*.value.list.append(try self.dupe(value));
+                    const new_node = try self.arena_allocator.allocator().create(std.DoublyLinkedList([]u8).Node);
+                    new_node.data = try self.dupe(value);
+                    list_entry.value_ptr.*.value.list.append(new_node);
                 }
-                return resp.Integer(@bitCast(list_entry.value_ptr.*.value.list.items.len));
+                return resp.Integer(@intCast(list_entry.value_ptr.*.value.list.len));
+            },
+            .lrange => |lrange_command| {
+                const empty_array = resp.Array(&[_]resp.Value{});
+                if (lrange_command.start > lrange_command.end) {
+                    return empty_array;
+                }
+                const datum = self.data.get(lrange_command.key) orelse return empty_array;
+
+                if (datum.value != .list) {
+                    return error.InvalidCommand;
+                }
+
+                const l = datum.value.list.len;
+
+                const normalized_start = if (lrange_command.start < 0) @max(0, @as(i64, @intCast(l)) + lrange_command.start) else lrange_command.start;
+                const normalized_end = if (lrange_command.end < 0) @max(0, @as(i64, @intCast(l)) + lrange_command.end) else lrange_command.end;
+
+                if (normalized_start >= l) return empty_array; // More robust start check
+
+                const inclusive_end = @min(@as(i64, @intCast(l - 1)), normalized_end);
+
+                if (normalized_start > inclusive_end) return empty_array;
+
+                const n_elements: usize = @intCast(inclusive_end - normalized_start + 1);
+
+                if (n_elements == 0) {
+                    return empty_array;
+                }
+
+                var ret = try allocator.alloc(resp.Value, n_elements);
+
+                var skip = normalized_start;
+
+                var current_node = datum.value.list.first.?;
+
+                while (skip > 0) : (skip -= 1) {
+                    current_node = current_node.next orelse return empty_array;
+                }
+
+                var i: usize = 0;
+                while (i < n_elements) : (i += 1) {
+                    ret[i] = resp.BulkString(current_node.data);
+                    current_node = current_node.next orelse break;
+                }
+
+                return resp.Array(ret);
             },
             else => {
                 return error.InvalidCommand;
