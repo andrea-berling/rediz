@@ -18,6 +18,7 @@ Rediz supports the following features:
  - Streams (`XADD`, `XRANGE`, `XREAD`) and blocking reads for streams
  - The `INCR` command
  - Transactions (via the `MULTI`, `EXEC`, and `DISCARD` commands)
+ - Lists (`LPUSH`, `RPUSH`, `LPOP`, `BLPOP`, `LLEN`, and `LRANGE`)
 
 # Getting started
 
@@ -272,6 +273,59 @@ QUEUED
 3) OK
 127.0.0.1:6379>
 
+```
+
+## Lists
+
+Terminal 2:
+```bash
+$ redis-cli
+127.0.0.1:6379> RPUSH mylist A
+(integer) 1
+127.0.0.1:6379> RPUSH mylist B C
+(integer) 3
+127.0.0.1:6379> LPUSH mylist D
+(integer) 4
+127.0.0.1:6379> LPUSH mylist E F
+(integer) 6
+127.0.0.1:6379> LRANGE mylist 0 -1
+1) "F"
+2) "E"
+3) "D"
+4) "A"
+5) "B"
+6) "C"
+127.0.0.1:6379> LRANGE mylist 0 2
+1) "F"
+2) "E"
+3) "D"
+127.0.0.1:6379> LRANGE mylist -2 -1
+1) "B"
+2) "C"
+127.0.0.1:6379> LLEN mylist
+(integer) 6
+127.0.0.1:6379> LPOP mylist
+"F"
+127.0.0.1:6379> LPOP mylist 2
+1) "E"
+2) "D"
+127.0.0.1:6379> LLEN mylist
+(integer) 3
+127.0.0.1:6379> BLPOP mylist 1
+1) "mylist"
+2) "A"
+127.0.0.1:6379> exit
+$ time redis-cli BLPOP mylist 1
+1) "mylist"
+2) "B"
+redis-cli BLPOP mylist 1  0.00s user 0.00s system 65% cpu 0.005 total
+$ time redis-cli BLPOP mylist 1
+1) "mylist"
+2) "C"
+redis-cli BLPOP mylist 1  0.00s user 0.00s system 68% cpu 0.004 total
+$ time redis-cli BLPOP mylist 1
+(nil)
+redis-cli BLPOP mylist 1  0.00s user 0.00s system 0% cpu 1.005 total
 ```
 
 ## Logging level
