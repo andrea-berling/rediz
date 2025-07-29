@@ -35,8 +35,9 @@ pub fn Event(comptime T: type) type {
             notify: struct { fd: posix.fd_t, n: u64 = 1 },
             accept: posix.socket_t,
             pollin: posix.socket_t,
+            cancel: usize,
         },
-        user_data: *T,
+        user_data: T,
     };
 }
 
@@ -49,6 +50,7 @@ pub fn CompletedEvent(comptime T: type) type {
     return struct {
         async_result: i32,
         awaited_event: Event(T),
+        event_id: usize,
 
         pub fn format(value: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
             _ = fmt;
@@ -74,6 +76,10 @@ pub fn CompletedEvent(comptime T: type) type {
                 },
                 .pollin => |fd| {
                     try writer.writeAll("pollin on fd ");
+                    try std.fmt.formatInt(fd, 10, .lower, options, writer);
+                },
+                .cancel => |fd| {
+                    try writer.writeAll("cancel event ");
                     try std.fmt.formatInt(fd, 10, .lower, options, writer);
                 },
             }
@@ -106,9 +112,9 @@ pub fn EventQueue(comptime T: type) type {
         params: *linux.io_uring_params,
         sqring: SQRing,
         cqring: CQRing,
-        pending_events: std.AutoHashMap(*const Event(T), void),
         // Goddamn write to eventfd needing a buffer
         notification_values: [10]u64,
+        pending_events: usize,
 
         const Self = @This();
 
@@ -140,10 +146,11 @@ pub fn EventQueue(comptime T: type) type {
                 .cqes = @as([*]linux.io_uring_cqe, @alignCast(@ptrCast(&cqring_ptr.ptr[params.cq_off.cqes])))[0..params.cq_entries],
             };
 
-            return .{ .allocator = allocator, .io_uring_fd = io_uring_fd, .params = params, .sqring = sqring, .cqring = cqring, .pending_events = std.AutoHashMap(*const Event(T), void).init(allocator), .notification_values = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 } };
+            return .{ .allocator = allocator, .io_uring_fd = io_uring_fd, .params = params, .sqring = sqring, .cqring = cqring, .notification_values = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, .pending_events = 0 };
         }
 
-        pub fn addAsyncEvent(self: *Self, event: Event(T)) !void {
+        /// Returns an identifier that can be used for cancellation later on
+        pub fn addAsyncEvent(self: *Self, event: Event(T)) !usize {
             const tail = self.sqring.tail.*;
             const index = tail & (self.sqring.ring_mask.*);
             const sqe = &self.sqring.sqes[index];
@@ -166,14 +173,20 @@ pub fn EventQueue(comptime T: type) type {
                 .pollin => |fd| {
                     sqe.prep_poll_add(fd, posix.POLL.IN);
                 },
+                .cancel => |user_data| {
+                    sqe.prep_cancel(user_data, 0);
+                },
             }
             const new_event = try self.allocator.create(Event(T));
             new_event.* = event;
             sqe.user_data = @intFromPtr(new_event);
-            try self.pending_events.put(new_event, undefined);
             self.sqring.array[index] = @intCast(index);
             @atomicStore(c_uint, self.sqring.tail, tail + 1, std.builtin.AtomicOrder.release);
             _ = try ioUringEnter(self.io_uring_fd, 1, 0, 0, null);
+
+            self.pending_events += 1;
+
+            return @intFromPtr(new_event);
         }
 
         pub fn cancelAllPendingOps(self: *Self) !void {
@@ -198,51 +211,29 @@ pub fn EventQueue(comptime T: type) type {
             const completed_event = CompletedEvent(T){
                 .async_result = cqe.res,
                 .awaited_event = input_event.*,
+                .event_id = cqe.user_data,
             };
-            _ = self.pending_events.remove(input_event);
             self.allocator.destroy(input_event);
             @atomicStore(c_uint, self.cqring.head, head + 1, std.builtin.AtomicOrder.release);
 
+            self.pending_events -= 1;
             return completed_event;
         }
 
-        pub fn destroy(self: *Self, opts: struct { user_data_destroyer: ?fn (*T) void = null }) !void {
+        pub fn destroy(self: *Self) !void {
+            // TODO: collect all canceled operations and deinit the events
             try self.cancelAllPendingOps();
 
-            var temp_allocator = std.heap.ArenaAllocator.init(self.allocator);
-            defer temp_allocator.deinit();
-
-            var pending_events_it = self.pending_events.keyIterator();
-            var already_destroyed_user_data = std.AutoHashMap(*const T, void).init(temp_allocator.allocator());
-
-            while (pending_events_it.next()) |pending_event| {
-                if (opts.user_data_destroyer) |destroyer| {
-                    if (!already_destroyed_user_data.contains(pending_event.*.user_data)) {
-                        destroyer(pending_event.*.user_data);
-                        try already_destroyed_user_data.put(pending_event.*.user_data, {});
-                    }
-                }
-                self.allocator.destroy(pending_event.*);
-            }
-            self.pending_events.deinit();
+            // var pending_events_it = self.pending_events.keyIterator();
+            //
+            // while (pending_events_it.next()) |pending_event| {
+            //     if (@hasDecl(T, "deinit")) {
+            //         pending_event.*.user_data.deinit();
+            //     }
+            //     self.allocator.destroy(pending_event.*);
+            // }
             self.allocator.destroy(self.params);
             posix.close(self.io_uring_fd);
-        }
-
-        pub fn removePendingEvents(self: *Self, user_data: *const T) !void {
-            var event_it = self.pending_events.keyIterator();
-            var temp_allocator = std.heap.ArenaAllocator.init(self.allocator);
-            defer temp_allocator.deinit();
-            var events_to_remove = std.ArrayList(*const Event(T)).init(temp_allocator.allocator());
-            while (event_it.next()) |event| {
-                if (event.*.user_data == user_data) {
-                    try events_to_remove.append(event.*);
-                }
-            }
-
-            for (events_to_remove.items) |event| {
-                _ = self.pending_events.remove(event);
-            }
         }
     };
 }

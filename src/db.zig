@@ -48,6 +48,7 @@ pub const Instance = struct {
     config: std.StringHashMap([]u8),
     master: ?posix.socket_t = null,
     replid: []const u8,
+    /// Number of commands bytes processed so far
     repl_offset: usize,
     rng: std.Random.DefaultPrng,
     diewithmaster: bool,
@@ -229,7 +230,7 @@ pub const Instance = struct {
         allocator.destroy(self.arena_allocator);
     }
 
-    /// Arrays returned are dynamicall allocated and should be freed by the
+    /// Arrays returned are dynamically allocated and should be freed by the
     /// called, strings should not, as they point to the given command
     pub fn executeCommand(self: *Instance, allocator: std.mem.Allocator, command: *const Command) !resp.Value {
         switch (command.type) {
@@ -597,6 +598,18 @@ pub const Instance = struct {
                 return error.InvalidCommand;
             },
         }
+    }
+
+    pub fn pop(self: *Instance, allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
+        const datum = self.data.getEntry(key) orelse return null;
+        if (datum.value_ptr.*.value != .list) return error.InvalidArgument;
+
+        if (datum.value_ptr.*.value.list.len == 0) return null;
+
+        const value = datum.value_ptr.*.value.list.popFirst().?;
+        defer self.arena_allocator.allocator().destroy(value);
+        defer self.arena_allocator.allocator().free(value.data);
+        return try allocator.dupe(u8, value.data);
     }
 
     pub fn dumpToBuffer(_: *Instance, buffer: []u8) !usize {

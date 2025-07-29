@@ -6,7 +6,7 @@ pub const Error = error{ InvalidArgument, InvalidCommand, InvalidInput, InvalidS
 
 pub const Command = struct {
     bytes: []u8,
-    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, list_push: PushCommand, lrange: struct { key: []const u8, start: i64, end: i64 }, llen: []const u8, lpop: struct { key: []const u8, n: ?usize } },
+    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, list_push: PushCommand, lrange: struct { key: []const u8, start: i64, end: i64 }, llen: []const u8, lpop: struct { key: []const u8, n: ?usize }, blpop: struct { key: []const u8, timeout_s: f64 } },
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -295,6 +295,12 @@ pub const Command = struct {
                 } else null;
                 break :blk .{ .lpop = .{ .key = array[1], .n = n_elements } };
             },
+            k2idx("blpop") => {
+                if (array.len < 3)
+                    return Error.NotEnoughArguments;
+                const timeout_s = std.fmt.parseFloat(f64, array[2]) catch return error.InvalidArgument;
+                break :blk .{ .blpop = .{ .key = array[1], .timeout_s = timeout_s } };
+            },
             else => {
                 return Error.UnsupportedCommand;
             },
@@ -306,7 +312,7 @@ pub const Command = struct {
     pub fn shouldPropagate(self: *const Self) bool {
         switch (self.*.type) {
             .ping, .echo, .get, .keys, .xrange, .xread, .config, .info, .replconf, .psync, .wait, .type, .lrange, .llen => return false,
-            .set, .xadd, .incr, .multi, .discard, .exec, .list_push, .lpop => return true,
+            .set, .xadd, .incr, .multi, .discard, .exec, .list_push, .lpop, .blpop => return true,
         }
     }
 
@@ -422,6 +428,14 @@ pub const Command = struct {
                     try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{n})));
                 }
             },
+            .blpop => |blpop_command| {
+                try response.append(resp.BulkString("BLPOP"));
+                try response.append(resp.BulkString(blpop_command.key));
+                try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{e}", .{blpop_command.timeout_s})));
+                if (blpop_command.timeout_ms) |n| {
+                    try response.append(resp.BulkString(try std.fmt.allocPrint(allocator, "{d}", .{n})));
+                }
+            },
             else => {
                 return error.InvalidCommand;
             },
@@ -431,7 +445,7 @@ pub const Command = struct {
 
     pub fn deinit(self: *Command) void {
         switch (self.*.type) {
-            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr, .multi, .exec, .discard, .lrange, .llen, .lpop => {},
+            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr, .multi, .exec, .discard, .lrange, .llen, .lpop, .blpop => {},
             .xadd => |stream_add_command| {
                 self.allocator.free(stream_add_command.key_value_pairs);
             },
