@@ -136,7 +136,7 @@ pub fn parseCommandLineArguments(allocator: std.mem.Allocator) !std.StringArrayH
                 try options.put("master", next_arg);
             },
             5 => { // diewithmaster
-                try options.put("diewithmater", "true");
+                try options.put("diewithmaster", "true");
             },
             else => unreachable,
         }

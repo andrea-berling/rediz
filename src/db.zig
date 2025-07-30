@@ -82,7 +82,7 @@ pub const Instance = struct {
         if (init_config) |config| {
             var entry_it = config.iterator();
             while (entry_it.next()) |entry| {
-                if (std.mem.eql(u8, entry.value_ptr.*, "diewithmaster")) {
+                if (std.mem.eql(u8, entry.key_ptr.*, "diewithmaster")) {
                     instance.diewithmaster = true;
                     continue;
                 }

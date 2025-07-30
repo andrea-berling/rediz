@@ -172,8 +172,6 @@ pub const FSM = struct {
     /// New commands to execute are available, and this FSM should now go and
     /// execute them
     pub fn notify(fsm: RcFSM, event_queue: *EventQueue, n_new_commands: usize) !void {
-        defer fsm.release();
-        errdefer fsm.release();
         std.debug.assert(fsm.get().type == .connection);
         if (n_new_commands > 0) {
             try fsm.get().pending_event_identifiers.put(try event_queue.addAsyncEvent(Event{
@@ -198,8 +196,6 @@ pub const FSM = struct {
     }
 
     pub fn propagateCommand(fsm: RcFSM, event_queue: *EventQueue, command: cmd.Command) !void {
-        defer fsm.release();
-        errdefer fsm.release();
         std.debug.assert(fsm.get().type == .connection);
         std.debug.assert(fsm.get().type.connection.peer_type == .slave);
         const slave_connection = fsm.get().type.connection;
@@ -216,12 +212,9 @@ pub const FSM = struct {
     /// Update the replica offset of this slave and possibly unblock clients if
     /// the new slave offset update increases the number of up-to-date slaves
     /// they are waiting on and reaches the desired threshold
-    pub fn updateSlaveOffset(fsm: RcFSM, new_offset: usize, event_queue: *EventQueue) !void {
-        defer fsm.release();
-        errdefer fsm.release();
-
-        std.debug.assert(fsm.get().type == .connection);
-        const slave_connection = fsm.get().type.connection;
+    pub fn updateSlaveOffset(self: *FSM, new_offset: usize, event_queue: *EventQueue) !void {
+        std.debug.assert(self.type == .connection);
+        const slave_connection = self.type.connection;
         const old_offset = slave_connection.peer_type.slave.repl_offset;
         // Only update the offset if the message is still relevant
         // (i.e. if the received offset is larger than the last
@@ -230,8 +223,8 @@ pub const FSM = struct {
             slave_connection.peer_type.slave.repl_offset = new_offset;
         }
 
-        var new_pending_waits = std.PriorityQueue(*PendingWait, void, PendingWait.order).init(fsm.get().allocator, undefined);
-        while (fsm.get().global_data.pending_waits.removeOrNull()) |pending_wait| {
+        var new_pending_waits = std.PriorityQueue(*PendingWait, void, PendingWait.order).init(self.allocator, undefined);
+        while (self.global_data.pending_waits.removeOrNull()) |pending_wait| {
             // Only pending waits who have a threshold offset that
             // wasn't met previously by the slave and that is now
             // met after the offset update should be counted
@@ -241,9 +234,9 @@ pub const FSM = struct {
                     const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
                     var response_buffer = [_]u8{0} ** 256;
                     var temp_allocator = std.heap.FixedBufferAllocator.init(&response_buffer);
-                    try StateTransitions.respondWith(pending_wait.client_connection_fsm.clone(), try reply.encode(temp_allocator.allocator()), event_queue, .{});
+                    try StateTransitions.respondWith(pending_wait.client_connection_fsm, try reply.encode(temp_allocator.allocator()), event_queue, .{});
                     pending_wait.deinit();
-                    fsm.get().allocator.destroy(pending_wait);
+                    self.allocator.destroy(pending_wait);
                 } else {
                     try new_pending_waits.add(pending_wait);
                 }
@@ -252,8 +245,8 @@ pub const FSM = struct {
             }
         }
 
-        fsm.get().global_data.pending_waits.deinit();
-        fsm.get().global_data.pending_waits = new_pending_waits;
+        self.global_data.pending_waits.deinit();
+        self.global_data.pending_waits = new_pending_waits;
     }
 
     /// Send the new data to all peers that were blocked waiting on new data on this stream
@@ -279,7 +272,7 @@ pub const FSM = struct {
                 tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
                 try response.append(resp.Array(&[_]resp.Value{resp.Array(tmp_array)}));
 
-                try StateTransitions.respondWith(blocked_stream_read.client_connection_fsm.clone(), try resp.Array(&[_]resp.Value{resp.Array(try response.toOwnedSlice())}).encode(temp_allocator.allocator()), event_queue, .{});
+                try StateTransitions.respondWith(blocked_stream_read.client_connection_fsm, try resp.Array(&[_]resp.Value{resp.Array(try response.toOwnedSlice())}).encode(temp_allocator.allocator()), event_queue, .{});
             }
 
             // Cleanup of the full HashMap entries associated with this stream
@@ -312,7 +305,7 @@ pub const FSM = struct {
                 defer self.allocator.destroy(blocked_blpop.data);
                 defer blocked_blpop.data.deinit();
 
-                try StateTransitions.respondWith(blocked_blpop.data.client_connection_fsm.clone(), try resp.Array(try response.toOwnedSlice()).encode(temp_allocator.allocator()), event_queue, .{});
+                try StateTransitions.respondWith(blocked_blpop.data.client_connection_fsm, try resp.Array(try response.toOwnedSlice()).encode(temp_allocator.allocator()), event_queue, .{});
             }
 
             // Cleanup of the HashMap entry for this list if it has gone empty
@@ -330,7 +323,9 @@ pub const FSM = struct {
         const connection_fsm = self.type.connection;
 
         while (pending_wait_it.next()) |pw| {
-            if (timerfd == pw.timerfd and connection_fsm.state == .blocked and connection_fsm.state.blocked == pw) {
+            // TODO: not the best: what if there is both a valid and an invalid pw that match the FSM?
+            // To revisit: probably best to add some ancilliary data to the .pollin event
+            if (timerfd == pw.timerfd and connection_fsm.state == .blocked and connection_fsm.state.blocked == pw and pw.timeout <= std.time.milliTimestamp()) {
                 return .{ .kind = .PENDING_WAIT, .valid = true };
             }
             if (pw.client_connection_fsm.get() == self and (connection_fsm.state != .blocked or connection_fsm.state.blocked != pw)) { // late alarm
@@ -438,6 +433,136 @@ pub const FSM = struct {
         }
     }
 
+    pub fn unblockStreamReadClient(self: *FSM, event_queue: *EventQueue) !void {
+        std.debug.assert(self.type == .connection);
+        const connection_fsm = self.type.connection;
+        std.debug.assert(connection_fsm.state == .waiting_for_new_data_on_stream);
+
+        var temp_allocator = std.heap.ArenaAllocator.init(self.allocator);
+        defer temp_allocator.deinit();
+
+        const blocked_xread = connection_fsm.state.waiting_for_new_data_on_stream;
+        defer self.allocator.destroy(blocked_xread);
+        defer blocked_xread.deinit();
+        for (blocked_xread.streams.items) |stream| {
+            if (self.global_data.blocked_xreads.getKey(stream)) |stream_key| {
+                var blocked_reads = self.global_data.blocked_xreads.get(stream_key).?;
+                _ = blocked_reads.swapRemove(blocked_xread);
+                if (blocked_reads.count() == 0) {
+                    blocked_reads.deinit();
+                    self.allocator.destroy(blocked_reads);
+                    self.allocator.free(stream_key);
+                }
+            }
+        }
+        try StateTransitions.respondWith(blocked_xread.client_connection_fsm, try resp.Null.encode(temp_allocator.allocator()), event_queue, .{});
+    }
+
+    pub fn unblockWaitingClient(self: *Self, timerfd: posix.fd_t, event_queue: *EventQueue) !void {
+        std.debug.assert(self.type == .connection);
+        const connection_fsm = self.type.connection;
+
+        // Is it a pending wait?
+        var pending_wait_it = self.global_data.pending_waits.iterator();
+
+        var maybe_index: ?usize = null;
+        var i: usize = 0;
+
+        var temp_allocator = std.heap.ArenaAllocator.init(self.allocator);
+        defer temp_allocator.deinit();
+
+        var indicesToRemove = std.ArrayList(usize).init(temp_allocator.allocator());
+        while (pending_wait_it.next()) |pw| : (i += 1) {
+            if (timerfd == pw.timerfd and connection_fsm.state == .blocked and connection_fsm.state.blocked == pw) {
+                maybe_index = i;
+            }
+
+            if (pw.client_connection_fsm.get() == self and (connection_fsm.state != .blocked or connection_fsm.state.blocked != pw)) { // late alarm
+                try indicesToRemove.append(i);
+            }
+        }
+
+        // Cleanup of stale events, while we're at it
+        for (indicesToRemove.items) |index| {
+            const pending_wait = self.global_data.pending_waits.removeIndex(index);
+            pending_wait.deinit();
+            self.allocator.destroy(pending_wait);
+        }
+
+        if (maybe_index) |index| {
+            const pending_wait = self.global_data.pending_waits.removeIndex(index);
+
+            const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
+            try StateTransitions.respondWith(pending_wait.client_connection_fsm, try reply.encode(temp_allocator.allocator()), event_queue, .{});
+            pending_wait.deinit();
+            self.allocator.destroy(pending_wait);
+        }
+    }
+
+    pub fn cleanupLateWaitTimeout(self: *Self, timerfd: posix.fd_t) !void {
+        std.debug.assert(self.type == .connection);
+
+        // Is it a pending wait?
+        var pending_wait_it = self.global_data.pending_waits.iterator();
+
+        var maybe_index: ?usize = null;
+
+        var temp_allocator = std.heap.ArenaAllocator.init(self.allocator);
+        defer temp_allocator.deinit();
+
+        var i: usize = 0;
+        while (pending_wait_it.next()) |pw| : (i += 1) {
+            if (pw.client_connection_fsm.get() == self and pw.timerfd == timerfd and pw.timeout <= std.time.milliTimestamp()) {
+                maybe_index = i;
+                break;
+            }
+        }
+
+        if (maybe_index) |index| {
+            const pending_wait = self.global_data.pending_waits.removeIndex(index);
+            pending_wait.deinit();
+            self.allocator.destroy(pending_wait);
+        }
+    }
+
+    pub fn unblockBlpopClient(self: *Self, timerfd: posix.fd_t, event_queue: *EventQueue) !void {
+        std.debug.assert(self.type == .connection);
+        const connection_fsm = self.type.connection;
+        std.debug.assert(connection_fsm.state == .waiting_for_new_data_on_list);
+
+        const blocked_blpop = connection_fsm.state.waiting_for_new_data_on_list;
+        defer self.allocator.destroy(blocked_blpop);
+
+        var temp_allocator = std.heap.ArenaAllocator.init(self.allocator);
+        defer temp_allocator.deinit();
+
+        try StateTransitions.respondWith(blocked_blpop.client_connection_fsm, try resp.Null.encode(temp_allocator.allocator()), event_queue, .{});
+
+        if (self.global_data.blocked_blpops.getKey(blocked_blpop.key)) |list_key| {
+            var blocked_blpops = self.global_data.blocked_blpops.get(list_key).?;
+            var current_node = blocked_blpops.first;
+            var nodes_to_remove = std.ArrayList(*std.DoublyLinkedList(*BlockedBlpop).Node).init(temp_allocator.allocator());
+            while (current_node) |node| {
+                if (node.data.client_connection_fsm.get() == self and node.data.timerfd != null and node.data.timerfd == timerfd) {
+                    try nodes_to_remove.append(node);
+                    break;
+                }
+                current_node = node.next;
+            }
+
+            for (try nodes_to_remove.toOwnedSlice()) |node| {
+                blocked_blpops.remove(node);
+                node.data.deinit();
+                self.allocator.destroy(node);
+            }
+
+            if (blocked_blpops.len == 0) {
+                _ = self.global_data.blocked_blpops.remove(list_key);
+                self.allocator.free(list_key);
+            }
+        }
+    }
+
     pub fn deinit(self: Self) void {
         switch (self.type) {
             .server => |fsm| {
@@ -491,6 +616,7 @@ pub const PendingWait = struct {
     }
 
     pub fn deinit(self: *PendingWait) void {
+        posix.close(self.timerfd);
         self.client_connection_fsm.release();
     }
 };
@@ -506,7 +632,7 @@ pub const BlockedStreamRead = struct {
     pub fn init(allocator: Allocator, client_connection_fsm: RcFSM, timerfd: ?posix.fd_t) Self {
         std.debug.assert(client_connection_fsm.get().type == .connection);
         return Self{
-            .client_connection_fsm = client_connection_fsm,
+            .client_connection_fsm = client_connection_fsm.clone(),
             .streams = std.ArrayList([]const u8).init(allocator),
             .timerfd = timerfd,
             .allocator = allocator,
@@ -537,7 +663,7 @@ pub const BlockedBlpop = struct {
     /// The key argument will be duped in this function
     pub fn init(allocator: Allocator, client_connection_fsm: RcFSM, key: []const u8, timerfd: ?posix.fd_t) !Self {
         std.debug.assert(client_connection_fsm.get().type == .connection);
-        return Self{ .client_connection_fsm = client_connection_fsm, .timerfd = timerfd, .allocator = allocator, .key = try allocator.dupe(u8, key) };
+        return Self{ .client_connection_fsm = client_connection_fsm.clone(), .timerfd = timerfd, .allocator = allocator, .key = try allocator.dupe(u8, key) };
     }
 
     pub fn deinit(self: *Self) void {
@@ -553,9 +679,6 @@ pub fn compareRcFSMs(fsm1: RcFSM, fsm2: RcFSM) bool {
 
 pub const StateTransitions = struct {
     pub fn waitForCommand(fsm: RcFSM, event_queue: *EventQueue, new_state: struct { new_state: @FieldType(Connection, "state") = .waiting_for_commands }) !void {
-        defer fsm.release();
-        errdefer fsm.release();
-
         const pointee = fsm.get();
 
         if (pointee.type != .connection)
@@ -575,9 +698,6 @@ pub const StateTransitions = struct {
     /// The connection has been broken, do the necessary tombstoning and event
     /// cancellation
     pub fn shutdown(fsm: RcFSM, event_queue: *EventQueue) !void {
-        defer fsm.release();
-        errdefer fsm.release();
-
         var pending_events_it = fsm.get().pending_event_identifiers.keyIterator();
 
         while (pending_events_it.next()) |event_id| {
@@ -590,9 +710,6 @@ pub const StateTransitions = struct {
     /// Send a message to the other end of this connection, and transition to
     /// the new given state
     pub fn respondWith(fsm: RcFSM, response: []const u8, event_queue: *EventQueue, new_state: struct { new_state: @FieldType(Connection, "state") = .sending_response }) !void {
-        defer fsm.release();
-        errdefer fsm.release();
-
         if (fsm.get().type != .connection)
             return error.InvalidFSM;
         const connection_fsm = fsm.get().type.connection;
@@ -610,8 +727,6 @@ pub const StateTransitions = struct {
     /// transition this FSM to being blocked, as well as adding a timeout event
     /// to the event queue
     pub fn setWaiting(fsm: RcFSM, timeout_timestamp: i64, threshold_offset: usize, expected_n_replicas: usize, actual_n_replicas: usize, timeout_fd: posix.fd_t, event_queue: *EventQueue) !void {
-        defer fsm.release();
-        errdefer fsm.release();
         std.debug.assert(fsm.get().type == .connection);
 
         const pending_wait = try fsm.allocator.create(PendingWait);
@@ -634,11 +749,9 @@ pub const StateTransitions = struct {
     /// Set the current FSM to being blocked waiting on new data being
     /// available for the given list
     pub fn setWaitingOnListPush(fsm: RcFSM, list_key: []const u8, timeout_fd: ?posix.fd_t, event_queue: *EventQueue) !void {
-        defer fsm.release();
-        errdefer fsm.release();
         std.debug.assert(fsm.get().type == .connection);
         const blocked_blpop = try fsm.get().allocator.create(BlockedBlpop);
-        blocked_blpop.* = try BlockedBlpop.init(fsm.get().allocator, fsm.clone(), list_key, timeout_fd);
+        blocked_blpop.* = try BlockedBlpop.init(fsm.get().allocator, fsm, list_key, timeout_fd);
 
         const blocked_blpops_queue = try fsm.get().global_data.blocked_blpops.getOrPut(list_key);
 
@@ -663,10 +776,8 @@ pub const StateTransitions = struct {
     /// Set the current FSM to being blocked waiting on new data being
     /// available for the given stream
     pub fn setWaitingOnStreamUpdate(fsm: RcFSM, stream_read_requests: []const cmd.StreamReadRequest, timeout_fd: ?posix.fd_t, event_queue: *EventQueue) !void {
-        defer fsm.release();
-        errdefer fsm.release();
         var blocked_stream_read = try fsm.get().allocator.create(BlockedStreamRead);
-        blocked_stream_read.* = BlockedStreamRead.init(fsm.get().allocator, fsm.clone(), timeout_fd);
+        blocked_stream_read.* = BlockedStreamRead.init(fsm.get().allocator, fsm, timeout_fd);
         for (stream_read_requests) |request| {
             try blocked_stream_read.addStream(request.stream_key);
         }
@@ -691,8 +802,6 @@ pub const StateTransitions = struct {
     }
 
     pub fn executeCommands(fsm: RcFSM, event_queue: *EventQueue) !void {
-        defer fsm.release();
-        errdefer fsm.release();
         std.debug.assert(fsm.get().type == .connection);
         const connection_fsm = fsm.get().type.connection;
         const wakeup_event = Event{
@@ -701,120 +810,6 @@ pub const StateTransitions = struct {
         };
         connection_fsm.state = .executing_commands;
         try fsm.get().pending_event_identifiers.put(try event_queue.addAsyncEvent(wakeup_event), undefined);
-    }
-
-    pub fn unblockWaitingClient(fsm: RcFSM, timerfd: posix.fd_t, event_queue: *EventQueue) !void {
-        defer fsm.release();
-        errdefer fsm.release();
-        std.debug.assert(fsm.get().type == .connection);
-        const connection_fsm = fsm.get().type.connection;
-
-        // Is it a pending wait?
-        var pending_wait_it = fsm.get().global_data.pending_waits.iterator();
-
-        var maybe_index: ?usize = null;
-        var i: usize = 0;
-
-        var temp_allocator = std.heap.ArenaAllocator.init(fsm.allocator);
-        defer temp_allocator.deinit();
-
-        var indicesToRemove = std.ArrayList(usize).init(temp_allocator.allocator());
-        while (pending_wait_it.next()) |pw| : (i += 1) {
-            if (timerfd == pw.timerfd and connection_fsm.state == .blocked and connection_fsm.state.blocked == pw) {
-                maybe_index = i;
-            }
-
-            if (pw.client_connection_fsm.get() == fsm.get() and (connection_fsm.state != .blocked or connection_fsm.state.blocked != pw)) { // late alarm
-                try indicesToRemove.append(i);
-            }
-        }
-
-        // Cleanup of stale events, while we're at it
-        for (indicesToRemove.items) |index| {
-            const pending_wait = fsm.get().global_data.pending_waits.removeIndex(index);
-            posix.close(pending_wait.timerfd);
-            pending_wait.deinit();
-            fsm.allocator.destroy(pending_wait);
-        }
-
-        if (maybe_index) |index| {
-            const pending_wait = fsm.get().global_data.pending_waits.removeIndex(index);
-
-            const reply = resp.Integer(@bitCast(pending_wait.actual_n_replicas));
-            try StateTransitions.respondWith(fsm.clone(), try reply.encode(temp_allocator.allocator()), event_queue, .{});
-            pending_wait.deinit();
-            fsm.allocator.destroy(pending_wait);
-            posix.close(timerfd);
-        }
-    }
-
-    pub fn unblockStreamReadClient(fsm: RcFSM, event_queue: *EventQueue) !void {
-        defer fsm.release();
-        errdefer fsm.release();
-
-        std.debug.assert(fsm.get().type == .connection);
-        const connection_fsm = fsm.get().type.connection;
-        std.debug.assert(connection_fsm.state == .waiting_for_new_data_on_stream);
-
-        var temp_allocator = std.heap.ArenaAllocator.init(fsm.allocator);
-        defer temp_allocator.deinit();
-
-        const blocked_xread = connection_fsm.state.waiting_for_new_data_on_stream;
-        defer fsm.allocator.destroy(blocked_xread);
-        defer blocked_xread.deinit();
-        for (blocked_xread.streams.items) |stream| {
-            if (fsm.get().global_data.blocked_xreads.getKey(stream)) |stream_key| {
-                var blocked_reads = fsm.get().global_data.blocked_xreads.get(stream_key).?;
-                _ = blocked_reads.swapRemove(blocked_xread);
-                if (blocked_reads.count() == 0) {
-                    blocked_reads.deinit();
-                    fsm.allocator.destroy(blocked_reads);
-                    fsm.allocator.free(stream_key);
-                }
-            }
-        }
-        try StateTransitions.respondWith(blocked_xread.client_connection_fsm.clone(), try resp.Null.encode(temp_allocator.allocator()), event_queue, .{});
-    }
-
-    pub fn unblockBlpopClient(fsm: RcFSM, timerfd: posix.fd_t, event_queue: *EventQueue) !void {
-        defer fsm.release();
-        errdefer fsm.release();
-
-        std.debug.assert(fsm.get().type == .connection);
-        const connection_fsm = fsm.get().type.connection;
-        std.debug.assert(connection_fsm.state == .waiting_for_new_data_on_list);
-
-        const blocked_blpop = connection_fsm.state.waiting_for_new_data_on_list;
-        defer fsm.allocator.destroy(blocked_blpop);
-
-        var temp_allocator = std.heap.ArenaAllocator.init(fsm.allocator);
-        defer temp_allocator.deinit();
-
-        try StateTransitions.respondWith(blocked_blpop.client_connection_fsm.clone(), try resp.Null.encode(temp_allocator.allocator()), event_queue, .{});
-
-        if (fsm.get().global_data.blocked_blpops.getKey(blocked_blpop.key)) |list_key| {
-            var blocked_blpops = fsm.get().global_data.blocked_blpops.get(list_key).?;
-            var current_node = blocked_blpops.first;
-            var nodes_to_remove = std.ArrayList(*std.DoublyLinkedList(*BlockedBlpop).Node).init(temp_allocator.allocator());
-            while (current_node) |node| {
-                if (node.data.client_connection_fsm.get() == fsm.get() and node.data.timerfd != null and node.data.timerfd == timerfd) {
-                    try nodes_to_remove.append(node);
-                    break;
-                }
-                current_node = node.next;
-            }
-
-            for (try nodes_to_remove.toOwnedSlice()) |node| {
-                blocked_blpops.remove(node);
-                node.data.deinit();
-                fsm.allocator.destroy(node);
-            }
-
-            if (blocked_blpops.len == 0) {
-                _ = fsm.get().global_data.blocked_blpops.remove(list_key);
-                fsm.allocator.free(list_key);
-            }
-        }
     }
 };
 

@@ -118,9 +118,11 @@ pub fn main() !u8 {
     defer instance.destroy(main_allocator);
     config.deinit();
 
+    var master_server_fsm: ?RcFSM = null;
+
     if (instance.master) |master_fd| {
-        const master_server_fsm = try RcFSM.init(server_fsm.get().allocator, try fsm.FSM.newConnection(server_fsm.get().allocator, master_fd, .master, server_fsm.get().global_data));
-        try st.waitForCommand(master_server_fsm, &event_queue, .{});
+        master_server_fsm = try RcFSM.init(server_fsm.get().allocator, try fsm.FSM.newConnection(server_fsm.get().allocator, master_fd, .master, server_fsm.get().global_data));
+        try st.waitForCommand(master_server_fsm.?, &event_queue, .{});
     }
 
     const event_loop_logger = std.log.scoped(.event_loop);
@@ -135,7 +137,7 @@ pub fn main() !u8 {
         if (shutting_down and event_queue.pending_events == 0) {
             break;
         }
-        if (!event_fsm.get().alive) { // e.g. a late timeout on a FSM for a
+        if (!event_fsm.get().alive or shutting_down) { // e.g. a late timeout on a FSM for a
             // peer that has already disconnected. The reference count will be
             // decreased at the end of the loop
             continue :event_loop;
@@ -148,6 +150,7 @@ pub fn main() !u8 {
                 const connection_socket: posix.socket_t = completed_event.async_result;
                 event_loop_logger.info("Accepted new connection", .{});
                 const new_connection_fsm = try RcFSM.init(event_fsm.get().allocator, try fsm.FSM.newConnection(event_fsm.get().allocator, connection_socket, .generic_client, event_fsm.get().global_data));
+                defer new_connection_fsm.release();
                 try st.waitForCommand(new_connection_fsm, &event_queue, .{});
 
                 // Re-queing the accept event
@@ -160,17 +163,18 @@ pub fn main() !u8 {
 
                 if (completed_event.async_result == 0) { // connection closed
                     if (instance.master != null and connection_fsm.peer_type == .master and instance.diewithmaster) {
-                        event_loop_logger.info("Peer closed connection", .{});
-                        event_fsm.release();
-                        break :event_loop;
+                        event_loop_logger.info("Master closed connection, gracefully shutting down", .{});
+                        try st.shutdown(server_fsm, &event_queue);
+                        master_server_fsm.?.release();
+                        shutting_down = true;
                     }
-                    try st.shutdown(event_fsm.clone(), &event_queue);
+                    try st.shutdown(event_fsm, &event_queue);
                     continue :event_loop;
                 }
 
                 if (completed_event.async_result < 0) { // error
                     event_loop_logger.err("Error: {} {d}", .{ linux.E.init(@intCast(@as(u32, @bitCast(completed_event.async_result)))), completed_event.async_result });
-                    try st.shutdown(event_fsm.clone(), &event_queue);
+                    try st.shutdown(event_fsm, &event_queue);
                     continue :event_loop;
                 }
 
@@ -181,7 +185,7 @@ pub fn main() !u8 {
 
                     const response, _ = resp.Value.parse(connection_fsm.buffer, temp_allocator.allocator()) catch {
                         event_loop_logger.debug("Got some invalid bytes on the wire: {?x}", .{connection_fsm.buffer});
-                        try st.respondWith(event_fsm.clone(), try resp.SimpleError("Invalid bytes on the wire").encode(temp_allocator.allocator()), &event_queue, .{});
+                        try st.respondWith(event_fsm, try resp.SimpleError("Invalid bytes on the wire").encode(temp_allocator.allocator()), &event_queue, .{});
                         continue :event_loop;
                     };
 
@@ -190,7 +194,7 @@ pub fn main() !u8 {
                     // Response should be of the form: REPLCONF ACK <offset>
                     const new_offset = try std.fmt.parseInt(usize, response.array[2].bulk_string, 10);
 
-                    try fsm.FSM.updateSlaveOffset(event_fsm.clone(), new_offset, &event_queue);
+                    try event_fsm.get().updateSlaveOffset(new_offset, &event_queue);
 
                     connection_fsm.state = .in_sync;
                     continue :event_loop;
@@ -210,8 +214,8 @@ pub fn main() !u8 {
                         event_loop_logger.err("Error while parsing command: {}", .{err});
                         event_loop_logger.debug("Bytes on the wire: {x} (return value: {d})", .{ connection_fsm.buffer, completed_event.async_result });
 
-                        try fsm.FSM.notify(event_fsm.clone(), &event_queue, n_new_commands);
-                        try st.respondWith(event_fsm.clone(), try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator()), &event_queue, .{});
+                        try fsm.FSM.notify(event_fsm, &event_queue, n_new_commands);
+                        try st.respondWith(event_fsm, try resp.SimpleError(try cmd.errorToString(err)).encode(temp_allocator.allocator()), &event_queue, .{});
                         continue :event_loop;
                     };
 
@@ -219,11 +223,11 @@ pub fn main() !u8 {
                     if (command.type == .exec) {
                         @constCast(&command).deinit();
                         if (connection_fsm.state != .executing_transaction) {
-                            try st.respondWith(event_fsm.clone(), try resp.SimpleError("EXEC without MULTI").encode(temp_allocator.allocator()), &event_queue, .{});
+                            try st.respondWith(event_fsm, try resp.SimpleError("EXEC without MULTI").encode(temp_allocator.allocator()), &event_queue, .{});
                             continue :event_loop;
                         }
 
-                        try fsm.FSM.notify(event_fsm.clone(), &event_queue, 1);
+                        try fsm.FSM.notify(event_fsm, &event_queue, 1);
                         continue :event_loop;
                     }
 
@@ -231,11 +235,11 @@ pub fn main() !u8 {
                     if (command.type == .discard) {
                         @constCast(&command).deinit();
                         if (connection_fsm.state != .executing_transaction) {
-                            try st.respondWith(event_fsm.clone(), try resp.SimpleError("DISCARD without MULTI").encode(temp_allocator.allocator()), &event_queue, .{});
+                            try st.respondWith(event_fsm, try resp.SimpleError("DISCARD without MULTI").encode(temp_allocator.allocator()), &event_queue, .{});
                             continue :event_loop;
                         }
                         connection_fsm.flushCommandsQueue();
-                        try st.respondWith(event_fsm.clone(), try resp.Ok.encode(temp_allocator.allocator()), &event_queue, .{});
+                        try st.respondWith(event_fsm, try resp.Ok.encode(temp_allocator.allocator()), &event_queue, .{});
                         continue :event_loop;
                     }
 
@@ -247,9 +251,9 @@ pub fn main() !u8 {
                 std.debug.assert(n_new_commands > 0);
                 if (connection_fsm.state != .executing_transaction) {
                     connection_fsm.state = .executing_commands;
-                    try fsm.FSM.notify(event_fsm.clone(), &event_queue, n_new_commands);
+                    try fsm.FSM.notify(event_fsm, &event_queue, n_new_commands);
                 } else {
-                    try st.respondWith(event_fsm.clone(), try resp.SimpleString("QUEUED").encode(temp_allocator.allocator()), &event_queue, .{ .new_state = .executing_transaction });
+                    try st.respondWith(event_fsm, try resp.SimpleString("QUEUED").encode(temp_allocator.allocator()), &event_queue, .{ .new_state = .executing_transaction });
                 }
             },
             .read => {
@@ -258,7 +262,7 @@ pub fn main() !u8 {
 
                 if (connection_fsm.state != .executing_commands and connection_fsm.state != .executing_transaction) {
                     event_loop_logger.debug("Maybe I'm replying, come back later", .{});
-                    try fsm.FSM.notify(event_fsm.clone(), &event_queue, 1);
+                    try fsm.FSM.notify(event_fsm, &event_queue, 1);
                     continue :event_loop;
                 }
 
@@ -272,7 +276,7 @@ pub fn main() !u8 {
                             switch (command.type) {
                                 .wait => |wait_command| {
                                     if (wait_command.num_replicas == 0) { // No need to block
-                                        try st.respondWith(event_fsm.clone(), try resp.Integer(event_fsm.get().global_data.slaves.count()).encode(temp_allocator.allocator()), &event_queue, .{});
+                                        try st.respondWith(event_fsm, try resp.Integer(event_fsm.get().global_data.slaves.count()).encode(temp_allocator.allocator()), &event_queue, .{});
                                         continue :event_loop;
                                     }
 
@@ -294,17 +298,17 @@ pub fn main() !u8 {
                                     }
 
                                     if (count >= num_replicas_threshold) {
-                                        try st.respondWith(event_fsm.clone(), try resp.Integer(@bitCast(count)).encode(temp_allocator.allocator()), &event_queue, .{});
+                                        try st.respondWith(event_fsm, try resp.Integer(@bitCast(count)).encode(temp_allocator.allocator()), &event_queue, .{});
                                         continue :event_loop;
                                     }
 
                                     // We didn't exit early, we must ask the slaves for their offset and block
                                     slaves_it = event_fsm.get().global_data.slaves.iterator();
                                     while (slaves_it.next()) |slave| {
-                                        try fsm.FSM.requestOffset(slave.value_ptr.clone(), &event_queue);
+                                        try fsm.FSM.requestOffset(slave.value_ptr.*, &event_queue);
                                     }
 
-                                    try st.setWaiting(event_fsm.clone(), timeout_timestamp, instance.repl_offset, num_replicas_threshold, count, timeout_fd, &event_queue);
+                                    try st.setWaiting(event_fsm, timeout_timestamp, instance.repl_offset, num_replicas_threshold, count, timeout_fd, &event_queue);
                                 },
                                 .psync => {
                                     connection_fsm.peer_type = .{ .slave = .{ .repl_offset = 0 } };
@@ -312,10 +316,10 @@ pub fn main() !u8 {
                                     var dump = [_]u8{0} ** fsm.CLIENT_BUFFER_SIZE;
                                     const dump_size = try instance.dumpToBuffer(&dump);
                                     // Why 0 for the repl_offset? Codecrafters really
-                                    try st.respondWith(event_fsm.clone(), try std.fmt.allocPrint(temp_allocator.allocator(), "+FULLRESYNC {[replid]s} {[repl_offset]d}\r\n${[dump_size]d}\r\n{[dump]s}", .{ .replid = instance.replid, .repl_offset = 0, .dump_size = dump_size, .dump = dump[0..dump_size] }), &event_queue, .{ .new_state = .sending_dump });
+                                    try st.respondWith(event_fsm, try std.fmt.allocPrint(temp_allocator.allocator(), "+FULLRESYNC {[replid]s} {[repl_offset]d}\r\n${[dump_size]d}\r\n{[dump]s}", .{ .replid = instance.replid, .repl_offset = 0, .dump_size = dump_size, .dump = dump[0..dump_size] }), &event_queue, .{ .new_state = .sending_dump });
                                 },
                                 .multi => {
-                                    try st.respondWith(event_fsm.clone(), try resp.Ok.encode(temp_allocator.allocator()), &event_queue, .{ .new_state = .executing_transaction });
+                                    try st.respondWith(event_fsm, try resp.Ok.encode(temp_allocator.allocator()), &event_queue, .{ .new_state = .executing_transaction });
                                     continue :event_loop;
                                 },
                                 else => {
@@ -325,7 +329,7 @@ pub fn main() !u8 {
                                     if (command.type == .blpop) {
                                         const blpop_command = command.type.blpop;
                                         const maybe_element = instance.pop(temp_allocator.allocator(), blpop_command.key) catch {
-                                            try st.respondWith(event_fsm.clone(), try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), &event_queue, .{});
+                                            try st.respondWith(event_fsm, try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), &event_queue, .{});
                                             continue :event_loop;
                                         };
 
@@ -333,7 +337,7 @@ pub fn main() !u8 {
                                         if (maybe_element) |element| {
                                             var reply = resp.Array(&[_]resp.Value{ resp.BulkString(blpop_command.key), resp.BulkString(element) });
 
-                                            try st.respondWith(event_fsm.clone(), try reply.encode(temp_allocator.allocator()), &event_queue, .{});
+                                            try st.respondWith(event_fsm, try reply.encode(temp_allocator.allocator()), &event_queue, .{});
                                             continue :event_loop;
                                         }
 
@@ -341,12 +345,12 @@ pub fn main() !u8 {
                                         var timerfd: ?posix.fd_t = null;
                                         if (blpop_command.timeout_s > 0)
                                             timerfd = try util.setupTimer(@as(usize, @intFromFloat(blpop_command.timeout_s * 1000)));
-                                        try st.setWaitingOnListPush(event_fsm.clone(), blpop_command.key, timerfd, &event_queue);
+                                        try st.setWaitingOnListPush(event_fsm, blpop_command.key, timerfd, &event_queue);
                                         continue :event_loop;
                                     }
 
                                     const reply = instance.executeCommand(temp_allocator.allocator(), command) catch {
-                                        try st.respondWith(event_fsm.clone(), try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), &event_queue, .{});
+                                        try st.respondWith(event_fsm, try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), &event_queue, .{});
                                         continue :event_loop;
                                     };
 
@@ -357,7 +361,7 @@ pub fn main() !u8 {
                                                 timerfd = try util.setupTimer(timeout_ms);
                                         }
 
-                                        try st.setWaitingOnStreamUpdate(event_fsm.clone(), command.type.xread.requests, timerfd, &event_queue);
+                                        try st.setWaitingOnStreamUpdate(event_fsm, command.type.xread.requests, timerfd, &event_queue);
                                         continue :event_loop;
                                     }
 
@@ -374,35 +378,35 @@ pub fn main() !u8 {
                                     if (command.shouldPropagate() and instance.master == null) {
                                         var slaves_it = event_fsm.get().global_data.slaves.iterator();
                                         while (slaves_it.next()) |slave_fsm_entry| {
-                                            try fsm.FSM.propagateCommand(slave_fsm_entry.value_ptr.clone(), &event_queue, command.*);
+                                            try fsm.FSM.propagateCommand(slave_fsm_entry.value_ptr.*, &event_queue, command.*);
                                         }
                                     }
 
                                     if (connection_fsm.peer_type == .master and (command.type != .replconf or command.type.replconf != .getack)) {
                                         if (connection_fsm.commands_to_execute.len == 0) {
-                                            try st.waitForCommand(event_fsm.clone(), &event_queue, .{});
+                                            try st.waitForCommand(event_fsm, &event_queue, .{});
                                         } else {
-                                            try st.executeCommands(event_fsm.clone(), &event_queue);
+                                            try st.executeCommands(event_fsm, &event_queue);
                                         }
                                         continue :event_loop;
                                     }
 
-                                    try st.respondWith(event_fsm.clone(), try reply.encode(temp_allocator.allocator()), &event_queue, .{});
+                                    try st.respondWith(event_fsm, try reply.encode(temp_allocator.allocator()), &event_queue, .{});
                                 },
                             }
-                        } else try st.waitForCommand(event_fsm.clone(), &event_queue, .{});
+                        } else try st.waitForCommand(event_fsm, &event_queue, .{});
                     },
                     .executing_transaction => {
                         var replies = std.ArrayList(resp.Value).init(temp_allocator.allocator());
                         while (connection_fsm.popCommand()) |*command| {
                             defer @constCast(command).deinit();
                             const reply = instance.executeCommand(temp_allocator.allocator(), command) catch {
-                                try st.respondWith(event_fsm.clone(), try resp.SimpleError("Some error occurred during transaction execution").encode(temp_allocator.allocator()), &event_queue, .{});
+                                try st.respondWith(event_fsm, try resp.SimpleError("Some error occurred during transaction execution").encode(temp_allocator.allocator()), &event_queue, .{});
                                 continue :event_loop;
                             };
                             try replies.append(reply);
                         }
-                        try st.respondWith(event_fsm.clone(), try resp.Array(try replies.toOwnedSlice()).encode(temp_allocator.allocator()), &event_queue, .{});
+                        try st.respondWith(event_fsm, try resp.Array(try replies.toOwnedSlice()).encode(temp_allocator.allocator()), &event_queue, .{});
                     },
                     else => unreachable,
                 }
@@ -427,14 +431,14 @@ pub fn main() !u8 {
                             .sending_response => {
                                 if (connection_fsm.commands_to_execute.len > 0) {
                                     // There are commands to execute, go work on those
-                                    try st.executeCommands(event_fsm.clone(), &event_queue);
-                                } else try st.waitForCommand(event_fsm.clone(), &event_queue, .{});
+                                    try st.executeCommands(event_fsm, &event_queue);
+                                } else try st.waitForCommand(event_fsm, &event_queue, .{});
                             },
                             .sending_dump, .propagating_command => {
                                 connection_fsm.state = .in_sync;
                             },
                             .executing_transaction => {
-                                try st.waitForCommand(event_fsm.clone(), &event_queue, .{ .new_state = .executing_transaction });
+                                try st.waitForCommand(event_fsm, &event_queue, .{ .new_state = .executing_transaction });
                             },
                             else => @panic("Invalid state transition"),
                         }
@@ -446,7 +450,7 @@ pub fn main() !u8 {
 
                 const state = event_fsm.get().type.connection.state;
 
-                try st.executeCommands(event_fsm.clone(), &event_queue);
+                try st.executeCommands(event_fsm, &event_queue);
                 if (state == .executing_transaction)
                     event_fsm.get().type.connection.state = .executing_transaction;
             },
@@ -454,13 +458,19 @@ pub fn main() !u8 {
                 switch (event_fsm.get().type) {
                     .server => {
                         event_loop_logger.info("Gracefully shutting down...", .{});
-                        var slaves_it = event_fsm.get().global_data.slaves.iterator();
-                        while (slaves_it.next()) |slave_fsm_entry| {
-                            try st.shutdown(slave_fsm_entry.value_ptr.clone(), &event_queue);
+                        if (master_server_fsm) |master_fsm| {
+                            try st.shutdown(master_fsm, &event_queue);
+                            master_fsm.release();
+                        } else {
+                            var slaves_it = event_fsm.get().global_data.slaves.iterator();
+                            while (slaves_it.next()) |slave_fsm_entry| {
+                                try st.shutdown(slave_fsm_entry.value_ptr.*, &event_queue);
+                                slave_fsm_entry.value_ptr.release();
+                            }
                         }
 
                         shutting_down = true;
-                        try st.shutdown(event_fsm.clone(), &event_queue);
+                        try st.shutdown(event_fsm, &event_queue);
                     },
                     .connection => { // Blocked XREAD, BLPOP, or WAIT timeout
                         const timeout = event_fsm.get().classifyTimeout(timerfd) orelse {
@@ -474,18 +484,22 @@ pub fn main() !u8 {
 
                         switch (timeout.kind) {
                             .PENDING_WAIT => {
-                                try st.unblockWaitingClient(event_fsm.clone(), timerfd, &event_queue);
+                                if (timeout.valid) {
+                                    try event_fsm.get().unblockWaitingClient(timerfd, &event_queue);
+                                } else {
+                                    try event_fsm.get().cleanupLateWaitTimeout(timerfd);
+                                }
                             },
                             .BLOCKED_XREAD => {
                                 if (timeout.valid) {
-                                    try st.unblockStreamReadClient(event_fsm.clone(), &event_queue);
+                                    try event_fsm.get().unblockStreamReadClient(&event_queue);
                                 } else {
                                     try event_fsm.get().cleanupLateStreamReadTimeout(timerfd);
                                 }
                             },
                             .BLOCKED_BLPOP => {
                                 if (timeout.valid) {
-                                    try st.unblockBlpopClient(event_fsm.clone(), timerfd, &event_queue);
+                                    try event_fsm.get().unblockBlpopClient(timerfd, &event_queue);
                                 } else {
                                     try event_fsm.get().cleanupLateBlpopTimeout(timerfd);
                                 }

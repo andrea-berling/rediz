@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const logger = std.log.scoped(.rc);
+const trace_ref_counts = false;
 
 /// This is the internal, heap-allocated object.
 /// It's not meant to be used directly by consumers of Rc.
@@ -27,7 +28,10 @@ pub fn Rc(comptime T: type) type {
                 .ref_count = 1,
                 .data = data,
             };
-            logger.debug("Reference count for {*} set to 1", .{box});
+            if (trace_ref_counts) {
+                logger.debug("Reference count for {*} set to 1", .{box});
+                std.debug.dumpCurrentStackTrace(null);
+            }
             return Self{ .ptr = box, .allocator = allocator };
         }
 
@@ -35,7 +39,10 @@ pub fn Rc(comptime T: type) type {
         /// This increases the reference count by 1.
         pub fn clone(self: Self) Self {
             self.ptr.ref_count += 1;
-            logger.debug("Reference count for {*} increased by 1 (current value: {})", .{ self.ptr, self.ptr.ref_count });
+            if (trace_ref_counts) {
+                logger.debug("Reference count for {*} increased by 1 (current value: {})", .{ self.ptr, self.ptr.ref_count });
+                std.debug.dumpCurrentStackTrace(null);
+            }
             return self;
         }
 
@@ -43,7 +50,10 @@ pub fn Rc(comptime T: type) type {
         /// it deinitializes the inner data and frees the memory.
         pub fn release(self: Self) void {
             self.ptr.ref_count -= 1;
-            logger.debug("Reference count for {*} decreased by 1 (current value: {})", .{ self.ptr, self.ptr.ref_count });
+            if (trace_ref_counts) {
+                logger.debug("Reference count for {*} decreased by 1 (current value: {})", .{ self.ptr, self.ptr.ref_count });
+                std.debug.dumpCurrentStackTrace(null);
+            }
             if (self.ptr.ref_count == 0) {
                 // If the inner type T has a deinit function, call it.
                 if (@hasDecl(T, "deinit")) {

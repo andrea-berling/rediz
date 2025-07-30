@@ -78,9 +78,9 @@ pub fn CompletedEvent(comptime T: type) type {
                     try writer.writeAll("pollin on fd ");
                     try std.fmt.formatInt(fd, 10, .lower, options, writer);
                 },
-                .cancel => |fd| {
+                .cancel => |user_data| {
                     try writer.writeAll("cancel event ");
-                    try std.fmt.formatInt(fd, 10, .lower, options, writer);
+                    try std.fmt.formatInt(user_data, 10, .lower, options, writer);
                 },
             }
             try writer.writeAll(" with result ");
@@ -197,6 +197,7 @@ pub fn EventQueue(comptime T: type) type {
             self.sqring.array[index] = @intCast(index);
             @atomicStore(c_uint, self.sqring.tail, tail + 1, std.builtin.AtomicOrder.release);
             _ = try ioUringEnter(self.io_uring_fd, 1, 1, linux.IORING_ENTER_GETEVENTS, null);
+            self.pending_events = 0;
         }
 
         pub fn next(self: *Self) !CompletedEvent(T) {
@@ -221,17 +222,6 @@ pub fn EventQueue(comptime T: type) type {
         }
 
         pub fn destroy(self: *Self) !void {
-            // TODO: collect all canceled operations and deinit the events
-            try self.cancelAllPendingOps();
-
-            // var pending_events_it = self.pending_events.keyIterator();
-            //
-            // while (pending_events_it.next()) |pending_event| {
-            //     if (@hasDecl(T, "deinit")) {
-            //         pending_event.*.user_data.deinit();
-            //     }
-            //     self.allocator.destroy(pending_event.*);
-            // }
             self.allocator.destroy(self.params);
             posix.close(self.io_uring_fd);
         }
