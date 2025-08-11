@@ -838,7 +838,7 @@ pub const StateTransitions = struct {
         defer temp_allocator.deinit();
 
         try StateTransitions.respondWith(fsm, try resp.Array(&[_]resp.Value{
-            resp.BulkString("SUBSCRIBE"),
+            resp.BulkString("subscribe"),
             resp.BulkString(chan),
             resp.Integer(@intCast(n)),
         }).encode(temp_allocator.allocator()), event_queue, .{ .new_state = fsm.get().type.connection.state });
