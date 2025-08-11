@@ -422,6 +422,12 @@ pub fn main() !u8 {
                                     try st.addSubscription(event_fsm, chan, &event_queue);
                                     continue :event_loop;
                                 },
+                                .ping => {
+                                    try st.respondWith(event_fsm, try resp.Array(&[_]resp.Value{
+                                        resp.SimpleString("PONG"),
+                                        resp.BulkString(""),
+                                    }).encode(temp_allocator.allocator()), &event_queue, .{ .new_state = connection_fsm.state });
+                                },
                                 else => {
                                     try st.respondWith(event_fsm, try resp.SimpleError(try std.fmt.allocPrint(temp_allocator.allocator(), "Can't execute '{s}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", .{command.name()})).encode(temp_allocator.allocator()), &event_queue, .{ .new_state = connection_fsm.state });
                                     continue :event_loop;
