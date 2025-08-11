@@ -200,7 +200,7 @@ pub fn main() !u8 {
                     continue :event_loop;
                 }
 
-                std.debug.assert(connection_fsm.state == .waiting_for_commands or connection_fsm.state == .executing_transaction);
+                std.debug.assert(connection_fsm.state == .waiting_for_commands or connection_fsm.state == .executing_transaction or connection_fsm.state == .subscribed_to);
 
                 var n: usize = 0;
                 const buffer_size = @as(usize, @intCast(completed_event.async_result));
@@ -250,7 +250,9 @@ pub fn main() !u8 {
 
                 std.debug.assert(n_new_commands > 0);
                 if (connection_fsm.state != .executing_transaction) {
-                    connection_fsm.state = .executing_commands;
+                    if (connection_fsm.state != .subscribed_to) {
+                        connection_fsm.state = .executing_commands;
+                    }
                     try fsm.FSM.notify(event_fsm, &event_queue, n_new_commands);
                 } else {
                     try st.respondWith(event_fsm, try resp.SimpleString("QUEUED").encode(temp_allocator.allocator()), &event_queue, .{ .new_state = .executing_transaction });
@@ -260,7 +262,7 @@ pub fn main() !u8 {
                 std.debug.assert(event_fsm.get().type == .connection);
                 const connection_fsm = event_fsm.get().type.connection;
 
-                if (connection_fsm.state != .executing_commands and connection_fsm.state != .executing_transaction) {
+                if (connection_fsm.state != .executing_commands and connection_fsm.state != .executing_transaction and connection_fsm.state != .subscribed_to) {
                     event_loop_logger.debug("Maybe I'm replying, come back later", .{});
                     try fsm.FSM.notify(event_fsm, &event_queue, 1);
                     continue :event_loop;
@@ -320,6 +322,10 @@ pub fn main() !u8 {
                                 },
                                 .multi => {
                                     try st.respondWith(event_fsm, try resp.Ok.encode(temp_allocator.allocator()), &event_queue, .{ .new_state = .executing_transaction });
+                                    continue :event_loop;
+                                },
+                                .subscribe => |chan| {
+                                    try st.addSubscription(event_fsm, chan, &event_queue);
                                     continue :event_loop;
                                 },
                                 else => {
@@ -408,6 +414,21 @@ pub fn main() !u8 {
                         }
                         try st.respondWith(event_fsm, try resp.Array(try replies.toOwnedSlice()).encode(temp_allocator.allocator()), &event_queue, .{});
                     },
+                    .subscribed_to => {
+                        if (connection_fsm.popCommand()) |*command| {
+                            defer @constCast(command).deinit();
+                            switch (command.type) {
+                                .subscribe => |chan| {
+                                    try st.addSubscription(event_fsm, chan, &event_queue);
+                                    continue :event_loop;
+                                },
+                                else => {
+                                    try st.respondWith(event_fsm, try resp.SimpleError(try std.fmt.allocPrint(temp_allocator.allocator(), "ERR Can't execute '{s}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", .{command.name()})).encode(temp_allocator.allocator()), &event_queue, .{ .new_state = connection_fsm.state });
+                                    continue :event_loop;
+                                },
+                            }
+                        }
+                    },
                     else => unreachable,
                 }
             },
@@ -437,8 +458,8 @@ pub fn main() !u8 {
                             .sending_dump, .propagating_command => {
                                 connection_fsm.state = .in_sync;
                             },
-                            .executing_transaction => {
-                                try st.waitForCommand(event_fsm, &event_queue, .{ .new_state = .executing_transaction });
+                            .executing_transaction, .subscribed_to => {
+                                try st.waitForCommand(event_fsm, &event_queue, .{ .new_state = connection_fsm.state });
                             },
                             else => @panic("Invalid state transition"),
                         }
@@ -451,8 +472,9 @@ pub fn main() !u8 {
                 const state = event_fsm.get().type.connection.state;
 
                 try st.executeCommands(event_fsm, &event_queue);
-                if (state == .executing_transaction)
-                    event_fsm.get().type.connection.state = .executing_transaction;
+                if (state == .executing_transaction or state == .subscribed_to) {
+                    event_fsm.get().type.connection.state = state;
+                }
             },
             .pollin => |timerfd| {
                 switch (event_fsm.get().type) {

@@ -71,6 +71,8 @@ pub const Connection = struct {
         /// collecting all the new commands received into a list to be executed
         /// later
         executing_transaction,
+        /// The client has subscribed to a list of channels
+        subscribed_to: std.StringArrayHashMap(void),
     } = .waiting_for_commands,
     allocator: Allocator,
 
@@ -103,13 +105,30 @@ pub const Connection = struct {
         }
     }
 
-    pub inline fn hasCommands(self: *Self) bool {
+    pub fn hasCommands(self: *Self) bool {
         return self.commands_to_execute.len > 0;
+    }
+
+    pub fn subscribeTo(self: *Self, chan: []const u8) !usize {
+        if (self.state != .subscribed_to) {
+            self.state = .{ .subscribed_to = std.StringArrayHashMap(void).init(self.allocator) };
+        }
+        if (!self.state.subscribed_to.contains(chan)) {
+            try self.state.subscribed_to.put(try self.allocator.dupe(u8, chan), {});
+        }
+
+        return self.state.subscribed_to.count();
     }
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
         posix.close(self.fd);
         self.flushCommandsQueue();
+        if (self.state == .subscribed_to) {
+            while (self.state.subscribed_to.pop()) |entry| {
+                self.allocator.free(entry.key);
+            }
+            self.state.subscribed_to.deinit();
+        }
         util.resizeBuffer(&self.buffer, CLIENT_BUFFER_SIZE);
         allocator.free(self.buffer);
     }
@@ -810,6 +829,19 @@ pub const StateTransitions = struct {
         };
         connection_fsm.state = .executing_commands;
         try fsm.get().pending_event_identifiers.put(try event_queue.addAsyncEvent(wakeup_event), undefined);
+    }
+
+    pub fn addSubscription(fsm: RcFSM, chan: []const u8, event_queue: *EventQueue) !void {
+        const n = try fsm.get().type.connection.subscribeTo(chan);
+
+        var temp_allocator = std.heap.ArenaAllocator.init(fsm.allocator);
+        defer temp_allocator.deinit();
+
+        try StateTransitions.respondWith(fsm, try resp.Array(&[_]resp.Value{
+            resp.BulkString("SUBSCRIBE"),
+            resp.BulkString(chan),
+            resp.Integer(@intCast(n)),
+        }).encode(temp_allocator.allocator()), event_queue, .{ .new_state = fsm.get().type.connection.state });
     }
 };
 
