@@ -424,7 +424,7 @@ pub fn main() !u8 {
                                 },
                                 .ping => {
                                     try st.respondWith(event_fsm, try resp.Array(&[_]resp.Value{
-                                        resp.SimpleString("PONG"),
+                                        resp.SimpleString("pong"),
                                         resp.BulkString(""),
                                     }).encode(temp_allocator.allocator()), &event_queue, .{ .new_state = connection_fsm.state });
                                 },
