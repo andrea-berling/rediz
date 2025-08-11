@@ -423,7 +423,7 @@ pub fn main() !u8 {
                                     continue :event_loop;
                                 },
                                 else => {
-                                    try st.respondWith(event_fsm, try resp.SimpleError(try std.fmt.allocPrint(temp_allocator.allocator(), "ERR Can't execute '{s}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", .{command.name()})).encode(temp_allocator.allocator()), &event_queue, .{ .new_state = connection_fsm.state });
+                                    try st.respondWith(event_fsm, try resp.SimpleError(try std.fmt.allocPrint(temp_allocator.allocator(), "Can't execute '{s}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", .{command.name()})).encode(temp_allocator.allocator()), &event_queue, .{ .new_state = connection_fsm.state });
                                     continue :event_loop;
                                 },
                             }
