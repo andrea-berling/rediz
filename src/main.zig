@@ -328,6 +328,24 @@ pub fn main() !u8 {
                                     try st.addSubscription(event_fsm, chan, &event_queue);
                                     continue :event_loop;
                                 },
+                                .publish => |publish_command| {
+                                    const maybe_subscribers = event_fsm.get().global_data.subscriptions.get(publish_command.chan);
+                                    if (maybe_subscribers) |subscribers| {
+                                        var subscribers_it = subscribers.valueIterator();
+                                        var n: i64 = 0;
+                                        while (subscribers_it.next()) |subscriber| {
+                                            try st.respondWith(subscriber.*, try resp.Array(&[_]resp.Value{
+                                                resp.BulkString("message"),
+                                                resp.BulkString(publish_command.chan),
+                                                resp.BulkString(publish_command.message),
+                                            }).encode(temp_allocator.allocator()), &event_queue, .{ .new_state = subscriber.get().type.connection.state });
+                                            n += 1;
+                                        }
+                                        try st.respondWith(event_fsm, try resp.Integer(n).encode(temp_allocator.allocator()), &event_queue, .{});
+                                    } else {
+                                        try st.respondWith(event_fsm, try resp.Integer(0).encode(temp_allocator.allocator()), &event_queue, .{});
+                                    }
+                                },
                                 else => {
                                     if (connection_fsm.peer_type == .master or (command.shouldPropagate() and instance.master == null))
                                         instance.repl_offset += command.bytes.len;

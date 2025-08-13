@@ -6,7 +6,7 @@ pub const Error = error{ InvalidArgument, InvalidCommand, InvalidInput, InvalidS
 
 pub const Command = struct {
     bytes: []u8,
-    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, list_push: PushCommand, lrange: struct { key: []const u8, start: i64, end: i64 }, llen: []const u8, lpop: struct { key: []const u8, n: ?usize }, blpop: struct { key: []const u8, timeout_s: f64 }, subscribe: []const u8 },
+    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, list_push: PushCommand, lrange: struct { key: []const u8, start: i64, end: i64 }, llen: []const u8, lpop: struct { key: []const u8, n: ?usize }, blpop: struct { key: []const u8, timeout_s: f64 }, subscribe: []const u8, publish: struct { chan: []const u8, message: []const u8 } },
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -306,6 +306,14 @@ pub const Command = struct {
                     return Error.NotEnoughArguments;
                 break :blk .{ .subscribe = array[1] };
             },
+            k2idx("publish") => {
+                if (array.len != 3)
+                    return Error.WrongNumberOfArguments;
+                break :blk .{ .publish = .{
+                    .chan = array[1],
+                    .message = array[2],
+                } };
+            },
             else => {
                 return Error.UnsupportedCommand;
             },
@@ -317,7 +325,7 @@ pub const Command = struct {
     pub fn shouldPropagate(self: *const Self) bool {
         switch (self.*.type) {
             .ping, .echo, .get, .keys, .xrange, .xread, .config, .info, .replconf, .psync, .wait, .type, .lrange, .llen, .subscribe => return false,
-            .set, .xadd, .incr, .multi, .discard, .exec, .list_push, .lpop, .blpop => return true,
+            .set, .xadd, .incr, .multi, .discard, .exec, .list_push, .lpop, .blpop, .publish => return true,
         }
     }
 
@@ -445,6 +453,11 @@ pub const Command = struct {
                 try response.append(resp.BulkString("SUBSCRIBE"));
                 try response.append(resp.BulkString(chan));
             },
+            .publish => |publish_command| {
+                try response.append(resp.BulkString("PUBLISH"));
+                try response.append(resp.BulkString(publish_command.chan));
+                try response.append(resp.BulkString(publish_command.message));
+            },
             else => {
                 return error.InvalidCommand;
             },
@@ -458,7 +471,7 @@ pub const Command = struct {
 
     pub fn deinit(self: *Command) void {
         switch (self.*.type) {
-            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr, .multi, .exec, .discard, .lrange, .llen, .lpop, .blpop, .subscribe => {},
+            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr, .multi, .exec, .discard, .lrange, .llen, .lpop, .blpop, .subscribe, .publish => {},
             .xadd => |stream_add_command| {
                 self.allocator.free(stream_add_command.key_value_pairs);
             },

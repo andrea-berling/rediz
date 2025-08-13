@@ -582,7 +582,7 @@ pub const FSM = struct {
         }
     }
 
-    pub fn deinit(self: Self) void {
+    pub fn deinit(self: *Self) void {
         switch (self.type) {
             .server => |fsm| {
                 self.global_data.deinit();
@@ -605,12 +605,13 @@ pub const GlobalData = struct {
     pending_waits: std.PriorityQueue(*PendingWait, void, PendingWait.order),
     blocked_xreads: std.StringHashMap(*std.AutoArrayHashMap(*BlockedStreamRead, void)),
     blocked_blpops: std.StringHashMap(std.DoublyLinkedList(*BlockedBlpop)),
+    subscriptions: std.StringHashMap(std.AutoHashMap(*FSM, RcFSM)),
     allocator: Allocator,
 
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
-        return Self{ .pending_waits = std.PriorityQueue(*PendingWait, void, PendingWait.order).init(allocator, undefined), .blocked_xreads = std.StringHashMap(*std.AutoArrayHashMap(*BlockedStreamRead, void)).init(allocator), .blocked_blpops = std.StringHashMap(std.DoublyLinkedList(*BlockedBlpop)).init(allocator), .slaves = std.AutoHashMap(*FSM, RcFSM).init(allocator), .allocator = allocator };
+        return Self{ .pending_waits = std.PriorityQueue(*PendingWait, void, PendingWait.order).init(allocator, undefined), .blocked_xreads = std.StringHashMap(*std.AutoArrayHashMap(*BlockedStreamRead, void)).init(allocator), .blocked_blpops = std.StringHashMap(std.DoublyLinkedList(*BlockedBlpop)).init(allocator), .slaves = std.AutoHashMap(*FSM, RcFSM).init(allocator), .subscriptions = std.StringHashMap(std.AutoHashMap(*FSM, RcFSM)).init(allocator), .allocator = allocator };
     }
 
     pub fn deinit(self: *Self) void {
@@ -618,6 +619,7 @@ pub const GlobalData = struct {
         self.pending_waits.deinit();
         self.blocked_xreads.deinit();
         self.blocked_blpops.deinit();
+        self.subscriptions.deinit();
     }
 };
 
@@ -721,6 +723,21 @@ pub const StateTransitions = struct {
 
         while (pending_events_it.next()) |event_id| {
             try fsm.get().pending_event_identifiers.put(try event_queue.addAsyncEvent(Event{ .type = .{ .cancel = event_id.* }, .user_data = fsm.clone() }), undefined);
+        }
+
+        if (fsm.get().type == .connection and fsm.get().type.connection.state == .subscribed_to) {
+            const connection_fsm = fsm.get().type.connection;
+            var subscriptions = &fsm.get().global_data.subscriptions;
+            for (connection_fsm.state.subscribed_to.keys()) |chan| {
+                var subscription = subscriptions.getEntry(chan).?;
+                var rcfsm = subscription.value_ptr.fetchRemove(fsm.get()).?;
+                rcfsm.value.release();
+                if (subscription.value_ptr.count() == 0) {
+                    subscription.value_ptr.deinit();
+                    fsm.get().allocator.free(subscription.key_ptr.*);
+                    _ = subscriptions.remove(chan);
+                }
+            }
         }
 
         fsm.get().alive = false;
@@ -836,6 +853,18 @@ pub const StateTransitions = struct {
 
         var temp_allocator = std.heap.ArenaAllocator.init(fsm.allocator);
         defer temp_allocator.deinit();
+
+        var subscriptions = &fsm.get().global_data.subscriptions;
+
+        if (!subscriptions.contains(chan)) {
+            try subscriptions.put(try fsm.get().allocator.dupe(u8, chan), std.AutoHashMap(*FSM, RcFSM).init(fsm.get().allocator));
+        }
+
+        var subscriptions_for_chan = subscriptions.getEntry(chan).?;
+
+        if (!subscriptions_for_chan.value_ptr.contains(fsm.get())) {
+            try subscriptions_for_chan.value_ptr.put(fsm.get(), fsm.clone());
+        }
 
         try StateTransitions.respondWith(fsm, try resp.Array(&[_]resp.Value{
             resp.BulkString("subscribe"),
