@@ -120,6 +120,27 @@ pub const Connection = struct {
         return self.state.subscribed_to.count();
     }
 
+    pub fn unsubscribe(self: *Self, chan: []const u8) !usize {
+        std.debug.assert(self.state == .subscribed_to);
+
+        var n = self.state.subscribed_to.count();
+
+        if (self.state.subscribed_to.contains(chan)) {
+            const chan_kv = self.state.subscribed_to.fetchSwapRemove(chan).?;
+            n -= 1;
+            self.allocator.free(chan_kv.key);
+            if (n == 0) {
+                self.state.subscribed_to.deinit();
+                // Changing the state here is necessary to prevent trying to
+                // clean up a de-initialized .subscribed_to HashMap in
+                // Connection.deinit
+                self.state = .waiting_for_commands;
+            }
+        }
+
+        return n;
+    }
+
     pub fn deinit(self: *Self, allocator: Allocator) void {
         posix.close(self.fd);
         self.flushCommandsQueue();
@@ -582,6 +603,24 @@ pub const FSM = struct {
         }
     }
 
+    pub fn unsubscribe(self: *FSM, chan: []const u8) !usize {
+        std.debug.assert(self.type == .connection);
+
+        var subscriptions = &self.global_data.subscriptions;
+        const subscription = subscriptions.getEntry(chan).?;
+        const rcfsm_kv = subscription.value_ptr.fetchRemove(self).?;
+        rcfsm_kv.value.release();
+        if (subscription.value_ptr.count() == 0) {
+            var subscription_kv = subscriptions.fetchRemove(chan).?;
+            subscription_kv.value.deinit();
+            self.allocator.free(subscription_kv.key);
+        }
+
+        const n = try self.type.connection.unsubscribe(chan);
+
+        return n;
+    }
+
     pub fn deinit(self: *Self) void {
         switch (self.type) {
             .server => |fsm| {
@@ -726,17 +765,19 @@ pub const StateTransitions = struct {
         }
 
         if (fsm.get().type == .connection and fsm.get().type.connection.state == .subscribed_to) {
-            const connection_fsm = fsm.get().type.connection;
-            var subscriptions = &fsm.get().global_data.subscriptions;
-            for (connection_fsm.state.subscribed_to.keys()) |chan| {
-                var subscription = subscriptions.getEntry(chan).?;
-                var rcfsm = subscription.value_ptr.fetchRemove(fsm.get()).?;
-                rcfsm.value.release();
-                if (subscription.value_ptr.count() == 0) {
-                    subscription.value_ptr.deinit();
-                    fsm.get().allocator.free(subscription.key_ptr.*);
-                    _ = subscriptions.remove(chan);
-                }
+            var temp_allocator = std.heap.ArenaAllocator.init(fsm.allocator);
+            defer temp_allocator.deinit();
+
+            // We copy the keys here because the process of unsubscribe will
+            // modify the subscibed_to HashMap
+            // Iterating over it while removing elements leads to UB
+            var to_unsub = std.ArrayList([]const u8).init(temp_allocator.allocator());
+            for (fsm.get().type.connection.state.subscribed_to.keys()) |key| {
+                try to_unsub.append(try temp_allocator.allocator().dupe(u8, key));
+            }
+
+            for (to_unsub.items) |chan| {
+                _ = try fsm.get().unsubscribe(chan);
             }
         }
 
@@ -849,6 +890,7 @@ pub const StateTransitions = struct {
     }
 
     pub fn addSubscription(fsm: RcFSM, chan: []const u8, event_queue: *EventQueue) !void {
+        std.debug.assert(fsm.get().type == .connection);
         const n = try fsm.get().type.connection.subscribeTo(chan);
 
         var temp_allocator = std.heap.ArenaAllocator.init(fsm.allocator);
@@ -871,6 +913,23 @@ pub const StateTransitions = struct {
             resp.BulkString(chan),
             resp.Integer(@intCast(n)),
         }).encode(temp_allocator.allocator()), event_queue, .{ .new_state = fsm.get().type.connection.state });
+    }
+
+    pub fn unsubscribe(fsm: RcFSM, chan: []const u8, event_queue: *EventQueue) !void {
+        std.debug.assert(fsm.get().type == .connection);
+        const n = try fsm.get().unsubscribe(chan);
+
+        var temp_allocator = std.heap.ArenaAllocator.init(fsm.allocator);
+        defer temp_allocator.deinit();
+
+        try StateTransitions.respondWith(fsm, try resp.Array(&[_]resp.Value{
+            resp.BulkString("unsubscribe"),
+            resp.BulkString(chan),
+            resp.Integer(@intCast(n)),
+        }).encode(temp_allocator.allocator()), event_queue, if (n > 0)
+            .{ .new_state = fsm.get().type.connection.state }
+        else
+            .{});
     }
 };
 
