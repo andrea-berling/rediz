@@ -19,6 +19,7 @@ Rediz supports the following features:
  - The `INCR` command
  - Transactions (via the `MULTI`, `EXEC`, and `DISCARD` commands)
  - Lists (`LPUSH`, `RPUSH`, `LPOP`, `BLPOP`, `LLEN`, and `LRANGE`)
+ - Pub/Sub (`SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`)
 
 # Getting started
 
@@ -326,6 +327,65 @@ redis-cli BLPOP mylist 1  0.00s user 0.00s system 68% cpu 0.004 total
 $ time redis-cli BLPOP mylist 1
 (nil)
 redis-cli BLPOP mylist 1  0.00s user 0.00s system 0% cpu 1.005 total
+```
+
+## Pub/Sub
+
+Terminal 1:
+```bash
+$ ./rediz
+```
+
+Terminal 2:
+```bash
+$ redis-cli
+127.0.0.1:6379> SUBSCRIBE channel1
+Reading messages... (press Ctrl-C to quit)
+1) "subscribe"
+2) "channel1"
+3) (integer) 1
+127.0.0.1:6379(subscribed mode)> SUBSCRIBE channel2
+1) "subscribe"
+2) "channel2"
+3) (integer) 2
+```
+
+Terminal 3:
+```bash
+$ redis-cli
+127.0.0.1:6379> PUBLISH channel1 "hello from channel1"
+(integer) 1
+127.0.0.1:6379> PUBLISH channel2 "hello from channel2"
+(integer) 1
+```
+
+Terminal 2:
+```bash
+1) "message"
+2) "channel1"
+3) "hello from channel1"
+1) "message"
+2) "channel2"
+3) "hello from channel2"
+127.0.0.1:6379(subscribed mode)> UNSUBSCRIBE channel1
+1) "unsubscribe"
+2) "channel1"
+3) (integer) 1
+```
+
+Terminal 3:
+```bash
+127.0.0.1:6379> PUBLISH channel1 "you should not see this"
+(integer) 0
+127.0.0.1:6379> PUBLISH channel2 "you should see this"
+(integer) 1
+```
+
+Terminal 2:
+```bash
+1) "message"
+2) "channel2"
+3) "you should see this"
 ```
 
 ## Logging level
