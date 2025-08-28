@@ -633,7 +633,6 @@ pub const Instance = struct {
                     try self.dupe(zadd_command.name),
                     zadd_command.score,
                 );
-                try entry.value_ptr.value.sorted_set.printDot();
                 return resp.Integer(ret);
             },
             .zrank => |zrank_command| {
@@ -647,14 +646,14 @@ pub const Instance = struct {
                 var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
                 defer temp_allocator.deinit();
 
-                const datum = self.data.get(zrange_command.key) orelse return resp.Null;
-                if (datum.value != .sorted_set) return resp.Null;
+                const datum = self.data.get(zrange_command.key) orelse return resp.Array(&[0]resp.Value{});
+                if (datum.value != .sorted_set) return resp.Array(&[0]resp.Value{});
 
                 const nodes = try datum.value.sorted_set.getRange(
                     zrange_command.range_start,
                     zrange_command.range_end,
                     temp_allocator.allocator(),
-                ) orelse return resp.Null;
+                );
 
                 var ret = try allocator.alloc(resp.Value, nodes.len);
                 for (nodes, 0..) |node, i| {

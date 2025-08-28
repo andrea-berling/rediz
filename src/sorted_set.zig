@@ -508,11 +508,11 @@ pub const SortedSet = struct {
     }
 
     // Range bounds start at 0
-    pub fn getRange(self: *const Self, range_start: i32, range_end: i32, allocator: std.mem.Allocator) !?[]Node {
+    pub fn getRange(self: *const Self, range_start: i32, range_end: i32, allocator: std.mem.Allocator) ![]Node {
         const start_rank = rangeBoundToRank(range_start, self.n_items) orelse return &[0]Node{};
-        const end_rank = rangeBoundToRank(range_end, self.n_items) orelse return &[0]Node{};
+        const end_rank = rangeBoundToRank(range_end, self.n_items) orelse self.n_items;
 
-        if (end_rank < start_rank) return null;
+        if (end_rank < start_rank) return &[0]Node{};
 
         var ret = try allocator.alloc(Node, end_rank - start_rank + 1);
         ret[0] = self.nodes.items[self.findNth(start_rank).?];
@@ -890,30 +890,30 @@ test "getRange edge cases" {
     defer temp_allocator.deinit();
 
     // Full range
-    var range = (try set.getRange(0, -1, temp_allocator.allocator())).?;
+    var range = try set.getRange(0, -1, temp_allocator.allocator());
     try testing.expectEqual(@as(usize, 10), range.len);
     try testing.expectEqualStrings("n0", range[0].name);
     try testing.expectEqualStrings("n9", range[9].name);
 
     // Partial range
-    range = (try set.getRange(2, 4, temp_allocator.allocator())).?;
+    range = try set.getRange(2, 4, temp_allocator.allocator());
     try testing.expectEqual(@as(usize, 3), range.len);
     try testing.expectEqualStrings("n2", range[0].name);
     try testing.expectEqualStrings("n4", range[2].name);
 
     // Negative indices
-    range = (try set.getRange(-3, -1, temp_allocator.allocator())).?;
+    range = try set.getRange(-3, -1, temp_allocator.allocator());
     try testing.expectEqual(@as(usize, 3), range.len);
     try testing.expectEqualStrings("n7", range[0].name);
     try testing.expectEqualStrings("n9", range[2].name);
 
     // Out of bounds
-    range = (try set.getRange(20, 30, temp_allocator.allocator())).?;
+    range = try set.getRange(20, 30, temp_allocator.allocator());
     try testing.expectEqual(@as(usize, 0), range.len);
 
     // Inverted range
     const inverted_range = try set.getRange(5, 1, temp_allocator.allocator());
-    try testing.expect(inverted_range == null);
+    try testing.expectEqual(@as(usize, 0), inverted_range.len);
 }
 
 test "PointersTable allocation and reuse" {
