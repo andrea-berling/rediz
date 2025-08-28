@@ -646,8 +646,8 @@ pub const Instance = struct {
                 var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
                 defer temp_allocator.deinit();
 
-                const datum = self.data.get(zrange_command.key) orelse return resp.Array(&[0]resp.Value{});
-                if (datum.value != .sorted_set) return resp.Array(&[0]resp.Value{});
+                const datum = self.data.get(zrange_command.key) orelse return resp.EmptyArray;
+                if (datum.value != .sorted_set) return resp.EmptyArray;
 
                 const nodes = try datum.value.sorted_set.getRange(
                     zrange_command.range_start,
@@ -663,7 +663,7 @@ pub const Instance = struct {
                 return resp.Array(ret);
             },
             .zcard => |key| {
-                const datum = self.data.get(key) orelse return resp.Null;
+                const datum = self.data.get(key) orelse return resp.Integer(0);
                 if (datum.value != .sorted_set) return resp.Null;
 
                 return resp.Integer(datum.value.sorted_set.n_items);

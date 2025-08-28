@@ -137,4 +137,6 @@ pub const Null: Value = .null;
 
 pub const Ok: Value = .{ .simple_string = "OK" };
 
+pub const EmptyArray: Value = .{ .array = &[0]Value{} };
+
 // TODO: tests for encoding and decoding
