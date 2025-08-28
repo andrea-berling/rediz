@@ -20,6 +20,7 @@ Rediz supports the following features:
  - Transactions (via the `MULTI`, `EXEC`, and `DISCARD` commands)
  - Lists (`LPUSH`, `RPUSH`, `LPOP`, `BLPOP`, `LLEN`, and `LRANGE`)
  - Pub/Sub (`SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`)
+ - Sorted Sets (`ZADD`, `ZCARD`, `ZRANGE`, `ZRANK`, `ZREM`, and `ZSCORE`)
 
 # Getting started
 
@@ -386,6 +387,34 @@ Terminal 2:
 1) "message"
 2) "channel2"
 3) "you should see this"
+```
+
+## Sorted Sets
+
+Terminal 2:
+```bash
+$ redis-cli
+127.0.0.1:6379> ZADD myzset 1 "one"
+(integer) 1
+127.0.0.1:6379> ZADD myzset 2 "two"
+(integer) 1
+127.0.0.1:6379> ZADD myzset 3 "three"
+(integer) 1
+127.0.0.1:6379> ZRANGE myzset 0 -1
+1) "one"
+2) "two"
+3) "three"
+127.0.0.1:6379> ZCARD myzset
+(integer) 3
+127.0.0.1:6379> ZRANK myzset "two"
+(integer) 1
+127.0.0.1:6379> ZSCORE myzset "three"
+"3"
+127.0.0.1:6379> ZREM myzset "two"
+(integer) 1
+127.0.0.1:6379> ZRANGE myzset 0 -1
+1) "one"
+2) "three"
 ```
 
 ## Logging level
