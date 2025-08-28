@@ -60,7 +60,7 @@ pub const Value = union(enum) {
     }
 
     inline fn cr_nl(bytes: []const u8) bool {
-        return bytes.len > 2 and bytes[0] == '\r' and bytes[1] == '\n';
+        return bytes.len >= 2 and bytes[0] == '\r' and bytes[1] == '\n';
     }
 
     /// If the returned value is a bulk string, simple string, or simple error,
@@ -99,6 +99,12 @@ pub const Value = union(enum) {
             },
             '$' => {
                 var i: usize = 1;
+                if (std.mem.startsWith(u8, bytes[i..], "-1")) {
+                    i += 2;
+                    if (!cr_nl(bytes[i..])) return error.InvalidRESPBulkString;
+                    i += 2;
+                    return .{ .null, i };
+                }
                 const string_length, const bytes_parsed = try parseDecimal(bytes[i..]);
                 i += bytes_parsed;
 
@@ -139,4 +145,115 @@ pub const Ok: Value = .{ .simple_string = "OK" };
 
 pub const EmptyArray: Value = .{ .array = &[0]Value{} };
 
-// TODO: tests for encoding and decoding
+const testing = std.testing;
+
+test "simple string encoding" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const value = SimpleString("OK");
+    const encoded = try value.encode(allocator);
+    try testing.expectEqualStrings("+OK\r\n", encoded);
+}
+
+test "bulk string encoding" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const value = BulkString("hello");
+    const encoded = try value.encode(allocator);
+    try testing.expectEqualStrings("$5\r\nhello\r\n", encoded);
+}
+
+test "null bulk string encoding" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const value = Null;
+    const encoded = try value.encode(allocator);
+    try testing.expectEqualStrings("$-1\r\n", encoded);
+}
+
+test "integer encoding" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const value = Integer(123);
+    const encoded = try value.encode(allocator);
+    try testing.expectEqualStrings(":123\r\n", encoded);
+}
+
+test "error encoding" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const value = SimpleError("Error message");
+    const encoded = try value.encode(allocator);
+    try testing.expectEqualStrings("-ERR Error message\r\n", encoded);
+}
+
+test "array encoding" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const values = &[_]Value{
+        BulkString("hello"),
+        BulkString("world"),
+    };
+    const value = Array(values);
+    const encoded = try value.encode(allocator);
+    try testing.expectEqualStrings("*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n", encoded);
+}
+
+test "simple string parsing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const encoded = "+OK\r\n";
+    const value, const parsed_bytes = try Value.parse(encoded, allocator);
+    try testing.expectEqualStrings("OK", value.simple_string);
+    try testing.expectEqual(@as(usize, 5), parsed_bytes);
+}
+
+test "bulk string parsing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const encoded = "$5\r\nhello\r\n";
+    const value, const parsed_bytes = try Value.parse(encoded, allocator);
+    try testing.expectEqualStrings("hello", value.bulk_string);
+    try testing.expectEqual(@as(usize, 11), parsed_bytes);
+}
+
+test "null bulk string parsing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const encoded = "$-1\r\n";
+    const value, const parsed_bytes = try Value.parse(encoded, allocator);
+    try testing.expect(value == .null);
+    try testing.expectEqual(@as(usize, 5), parsed_bytes);
+}
+
+test "array parsing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const encoded = "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n";
+    const value, const parsed_bytes = try Value.parse(encoded, allocator);
+
+    try testing.expectEqual(@as(usize, 2), value.array.len);
+    try testing.expectEqualStrings("hello", value.array[0].bulk_string);
+    try testing.expectEqualStrings("world", value.array[1].bulk_string);
+    try testing.expectEqual(@as(usize, 26), parsed_bytes);
+}
