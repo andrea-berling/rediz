@@ -6,7 +6,73 @@ pub const Error = error{ InvalidArgument, InvalidCommand, InvalidInput, InvalidS
 
 pub const Command = struct {
     bytes: []u8,
-    type: union(enum) { ping, echo: []const u8, get: []const u8, set: SetCommand, keys: []const u8, xadd: StreamAddCommand, xrange: StreamRangeCommand, xread: struct { block_timeout_ms: ?usize, requests: []const StreamReadRequest }, config: ConfigCommand, info: InfoCommand, replconf: ReplicaConfigCommand, psync: PsyncConfigCommand, wait: WaitCommand, type: []const u8, incr: []const u8, multi, exec, discard, list_push: PushCommand, lrange: struct { key: []const u8, start: i64, end: i64 }, llen: []const u8, lpop: struct { key: []const u8, n: ?usize }, blpop: struct { key: []const u8, timeout_s: f64 }, subscribe: []const u8, publish: struct { chan: []const u8, message: []const u8 }, unsubscribe: []const u8 },
+    type: union(enum) {
+        ping,
+        echo: []const u8,
+        get: []const u8,
+        set: SetCommand,
+        keys: []const u8,
+        xadd: StreamAddCommand,
+        xrange: StreamRangeCommand,
+        xread: struct {
+            block_timeout_ms: ?usize,
+            requests: []const StreamReadRequest,
+        },
+        config: ConfigCommand,
+        info: InfoCommand,
+        replconf: ReplicaConfigCommand,
+        psync: PsyncConfigCommand,
+        wait: WaitCommand,
+        type: []const u8,
+        incr: []const u8,
+        multi,
+        exec,
+        discard,
+        list_push: PushCommand,
+        lrange: struct {
+            key: []const u8,
+            start: i64,
+            end: i64,
+        },
+        llen: []const u8,
+        lpop: struct {
+            key: []const u8,
+            n: ?usize,
+        },
+        blpop: struct {
+            key: []const u8,
+            timeout_s: f64,
+        },
+        subscribe: []const u8,
+        publish: struct {
+            chan: []const u8,
+            message: []const u8,
+        },
+        unsubscribe: []const u8,
+        zadd: struct {
+            key: []const u8,
+            score: f64,
+            name: []const u8,
+        },
+        zrank: struct {
+            key: []const u8,
+            name: []const u8,
+        },
+        zrange: struct {
+            key: []const u8,
+            range_start: i32,
+            range_end: i32,
+        },
+        zcard: []const u8,
+        zscore: struct {
+            key: []const u8,
+            name: []const u8,
+        },
+        zrem: struct {
+            key: []const u8,
+            name: []const u8,
+        },
+    },
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -16,7 +82,7 @@ pub const Command = struct {
         const fields_info = comptime type_info.@"union".fields;
         const other_keywords = [_][]const u8{ "px", "pxat", "ex", "exat", "streams", "replication", "block", "rpush", "lpush" };
         var keywords: [fields_info.len + other_keywords.len][]const u8 = undefined;
-        @setEvalBranchQuota(4000);
+        @setEvalBranchQuota(10000);
         inline for (fields_info, 0..) |field, i| {
             keywords[i] = field.name;
         }
@@ -319,6 +385,68 @@ pub const Command = struct {
                     return Error.WrongNumberOfArguments;
                 break :blk .{ .unsubscribe = array[1] };
             },
+            k2idx("zadd") => {
+                if (array.len != 4)
+                    return Error.WrongNumberOfArguments;
+                const score = std.fmt.parseFloat(f64, array[2]) catch return error.InvalidArgument;
+                break :blk .{
+                    .zadd = .{
+                        .key = array[1],
+                        .score = score,
+                        .name = array[3],
+                    },
+                };
+            },
+            k2idx("zrank") => {
+                if (array.len != 3)
+                    return Error.WrongNumberOfArguments;
+                break :blk .{
+                    .zrank = .{
+                        .key = array[1],
+                        .name = array[2],
+                    },
+                };
+            },
+            k2idx("zrange") => {
+                if (array.len != 4)
+                    return Error.WrongNumberOfArguments;
+                const range_start = std.fmt.parseInt(i32, array[2], 10) catch return error.InvalidArgument;
+                const range_end = std.fmt.parseInt(i32, array[3], 10) catch return error.InvalidArgument;
+                break :blk .{
+                    .zrange = .{
+                        .key = array[1],
+                        .range_start = range_start,
+                        .range_end = range_end,
+                    },
+                };
+            },
+            k2idx("zcard") => {
+                if (array.len != 2)
+                    return Error.WrongNumberOfArguments;
+                break :blk .{
+                    .zcard = array[1],
+                };
+            },
+            k2idx("zscore") => {
+                if (array.len != 3)
+                    return Error.WrongNumberOfArguments;
+                break :blk .{
+                    .zscore = .{
+                        .key = array[1],
+                        .name = array[2],
+                    },
+                };
+            },
+            k2idx("zrem") => {
+                if (array.len != 3)
+                    return Error.WrongNumberOfArguments;
+                break :blk .{
+                    .zrem = .{
+                        .key = array[1],
+                        .name = array[2],
+                    },
+                };
+            },
             else => {
                 return Error.UnsupportedCommand;
             },
@@ -329,8 +457,40 @@ pub const Command = struct {
 
     pub fn shouldPropagate(self: *const Self) bool {
         switch (self.*.type) {
-            .ping, .echo, .get, .keys, .xrange, .xread, .config, .info, .replconf, .psync, .wait, .type, .lrange, .llen, .subscribe, .unsubscribe => return false,
-            .set, .xadd, .incr, .multi, .discard, .exec, .list_push, .lpop, .blpop, .publish => return true,
+            .ping,
+            .echo,
+            .get,
+            .keys,
+            .xrange,
+            .xread,
+            .config,
+            .info,
+            .replconf,
+            .psync,
+            .wait,
+            .type,
+            .lrange,
+            .llen,
+            .subscribe,
+            .unsubscribe,
+            .zcard,
+            .zrange,
+            .zrank,
+            .zscore,
+            => return false,
+            .set,
+            .xadd,
+            .incr,
+            .multi,
+            .discard,
+            .exec,
+            .list_push,
+            .lpop,
+            .blpop,
+            .publish,
+            .zadd,
+            .zrem,
+            => return true,
         }
     }
 
@@ -467,8 +627,42 @@ pub const Command = struct {
                 try response.append(resp.BulkString("UNSUBSCRIBE"));
                 try response.append(resp.BulkString(chan));
             },
-            else => {
-                return error.InvalidCommand;
+            .zadd => |zadd_command| {
+                try response.append(resp.BulkString("ZADD"));
+                try response.append(resp.BulkString(zadd_command.key));
+                try response.append(resp.BulkString(
+                    try std.fmt.allocPrint(temp_allocator.allocator(), "{d}", .{zadd_command.score}),
+                ));
+                try response.append(resp.BulkString(zadd_command.name));
+            },
+            .zrank => |zrank_command| {
+                try response.append(resp.BulkString("ZRANK"));
+                try response.append(resp.BulkString(zrank_command.key));
+                try response.append(resp.BulkString(zrank_command.name));
+            },
+            .zrange => |zrange_command| {
+                try response.append(resp.BulkString("ZRANGE"));
+                try response.append(resp.BulkString(zrange_command.key));
+                try response.append(resp.BulkString(
+                    try std.fmt.allocPrint(temp_allocator.allocator(), "{d}", .{zrange_command.range_start}),
+                ));
+                try response.append(resp.BulkString(
+                    try std.fmt.allocPrint(temp_allocator.allocator(), "{d}", .{zrange_command.range_end}),
+                ));
+            },
+            .zcard => |zcard_command| {
+                try response.append(resp.BulkString("ZCARD"));
+                try response.append(resp.BulkString(zcard_command.key));
+            },
+            .zscore => |zscore_command| {
+                try response.append(resp.BulkString("ZSCORE"));
+                try response.append(resp.BulkString(zscore_command.key));
+                try response.append(resp.BulkString(zscore_command.name));
+            },
+            .zrem => |zrem_command| {
+                try response.append(resp.BulkString("ZSCORE"));
+                try response.append(resp.BulkString(zrem_command.key));
+                try response.append(resp.BulkString(zrem_command.name));
             },
         }
         return try resp.Array(try response.toOwnedSlice()).encode(allocator);
@@ -480,7 +674,35 @@ pub const Command = struct {
 
     pub fn deinit(self: *Command) void {
         switch (self.*.type) {
-            .ping, .echo, .set, .get, .psync, .keys, .xrange, .config, .info, .wait, .type, .incr, .multi, .exec, .discard, .lrange, .llen, .lpop, .blpop, .subscribe, .publish, .unsubscribe => {},
+            .ping,
+            .echo,
+            .set,
+            .get,
+            .psync,
+            .keys,
+            .xrange,
+            .config,
+            .info,
+            .wait,
+            .type,
+            .incr,
+            .multi,
+            .exec,
+            .discard,
+            .lrange,
+            .llen,
+            .lpop,
+            .blpop,
+            .subscribe,
+            .publish,
+            .unsubscribe,
+            .zrem,
+            .zadd,
+            .zscore,
+            .zrank,
+            .zrange,
+            .zcard,
+            => {},
             .xadd => |stream_add_command| {
                 self.allocator.free(stream_add_command.key_value_pairs);
             },

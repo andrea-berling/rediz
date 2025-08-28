@@ -4,6 +4,7 @@ const resp = @import("resp.zig");
 const rdb = @import("rdb.zig");
 const Command = @import("command.zig").Command;
 const cfg = @import("config.zig");
+const sset = @import("sorted_set.zig");
 
 const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
@@ -35,7 +36,12 @@ pub const StreamEntryID = packed struct(u64) {
 
 const Stream = std.AutoArrayHashMap(StreamEntryID, std.StringHashMap([]u8));
 
-pub const Value = union(enum) { string: []u8, stream: Stream, list: std.DoublyLinkedList([]u8) };
+pub const Value = union(enum) {
+    string: []u8,
+    stream: Stream,
+    list: std.DoublyLinkedList([]u8),
+    sorted_set: sset.SortedSet,
+};
 
 pub const Datum = struct {
     value: Value,
@@ -417,7 +423,9 @@ pub const Instance = struct {
                                 try response.append(resp.Array(try new_response_entry.toOwnedSlice()));
                             },
                             else => {
-                                return resp.SimpleError(try std.fmt.allocPrint(temp_allocator.allocator(), "{s} does not denote a stream", .{request.stream_key}));
+                                return resp.SimpleError(
+                                    try std.fmt.allocPrint(temp_allocator.allocator(), "{s} does not denote a stream", .{request.stream_key}),
+                                );
                             },
                         }
                     } else return resp.Null;
@@ -483,6 +491,9 @@ pub const Instance = struct {
                         },
                         .list => {
                             return resp.SimpleString("list");
+                        },
+                        .sorted_set => {
+                            return resp.SimpleString("sorted set");
                         },
                     }
                 } else return resp.SimpleString("none");
@@ -594,6 +605,89 @@ pub const Instance = struct {
                     return ret;
                 }
             },
+            .zadd => |zadd_command| {
+                var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
+                defer temp_allocator.deinit();
+
+                var entry = try self.data.getOrPut(zadd_command.key);
+                if (entry.found_existing and entry.value_ptr.*.value != .sorted_set) {
+                    return resp.SimpleError(
+                        try std.fmt.allocPrint(
+                            temp_allocator.allocator(),
+                            "{s} does not denote a sorted set",
+                            .{zadd_command.key},
+                        ),
+                    );
+                }
+
+                if (!entry.found_existing) {
+                    entry.key_ptr.* = try self.dupe(zadd_command.key);
+                    entry.value_ptr.*.value = .{
+                        .sorted_set = try sset.SortedSet.init(self.arena_allocator.allocator()),
+                    };
+                }
+
+                const ret = @intFromBool(!entry.value_ptr.value.sorted_set.contains(zadd_command.name));
+
+                try entry.value_ptr.value.sorted_set.put(
+                    try self.dupe(zadd_command.name),
+                    zadd_command.score,
+                );
+                try entry.value_ptr.value.sorted_set.printDot();
+                return resp.Integer(ret);
+            },
+            .zrank => |zrank_command| {
+                const datum = self.data.get(zrank_command.key) orelse return resp.Null;
+                if (datum.value != .sorted_set) return resp.Null;
+
+                const rank = datum.value.sorted_set.getRankByName(zrank_command.name) orelse return resp.Null;
+                return resp.Integer(rank - 1);
+            },
+            .zrange => |zrange_command| {
+                var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
+                defer temp_allocator.deinit();
+
+                const datum = self.data.get(zrange_command.key) orelse return resp.Null;
+                if (datum.value != .sorted_set) return resp.Null;
+
+                const nodes = try datum.value.sorted_set.getRange(
+                    zrange_command.range_start,
+                    zrange_command.range_end,
+                    temp_allocator.allocator(),
+                ) orelse return resp.Null;
+
+                var ret = try allocator.alloc(resp.Value, nodes.len);
+                for (nodes, 0..) |node, i| {
+                    ret[i] = resp.BulkString(node.name);
+                }
+
+                return resp.Array(ret);
+            },
+            .zcard => |key| {
+                const datum = self.data.get(key) orelse return resp.Null;
+                if (datum.value != .sorted_set) return resp.Null;
+
+                return resp.Integer(datum.value.sorted_set.n_items);
+            },
+            .zscore => |zscore_command| {
+                const datum = self.data.get(zscore_command.key) orelse return resp.Null;
+                if (datum.value != .sorted_set) return resp.Null;
+
+                const score = datum.value.sorted_set.getScoreByName(zscore_command.name) orelse return resp.Null;
+                return resp.BulkString(
+                    try std.fmt.allocPrint(allocator, "{d}", .{score}),
+                );
+            },
+            .zrem => |zrem_command| {
+                var entry = self.data.getEntry(zrem_command.key) orelse return resp.Null;
+                if (entry.value_ptr.value != .sorted_set) return resp.Null;
+
+                const ret = @intFromBool(entry.value_ptr.value.sorted_set.contains(zrem_command.name));
+
+                try entry.value_ptr.value.sorted_set.remove(zrem_command.name);
+                return resp.Integer(ret);
+            },
+
             else => {
                 return error.InvalidCommand;
             },
