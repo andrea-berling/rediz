@@ -86,9 +86,16 @@ pub fn scoreToCoordinates(score: f64) struct { latitude: f64, longitude: f64 } {
     x = (x | (x >> S[4])) & B[4];
     y = (y | (y >> S[4])) & B[4];
 
+    const grid_lat: f64 = @floatFromInt(x);
+    const grid_lon: f64 = @floatFromInt(y);
+    const grid_latitude_min = MIN_LATITUDE + LATITUDE_RANGE * (grid_lat / NORMAL_RANGE);
+    const grid_latitude_max = MIN_LATITUDE + LATITUDE_RANGE * ((grid_lat + 1) / NORMAL_RANGE);
+    const grid_longitude_min = MIN_LONGITUDE + LONGITUDE_RANGE * (grid_lon / NORMAL_RANGE);
+    const grid_longitude_max = MIN_LONGITUDE + LONGITUDE_RANGE * ((grid_lon + 1) / NORMAL_RANGE);
+
     return .{
-        .latitude = (@as(f64, @floatFromInt(x))) / NORMAL_RANGE * LATITUDE_RANGE + MIN_LATITUDE,
-        .longitude = (@as(f64, @floatFromInt(y))) / NORMAL_RANGE * LONGITUDE_RANGE + MIN_LONGITUDE,
+        .latitude = (grid_latitude_min + grid_latitude_max) / 2,
+        .longitude = (grid_longitude_min + grid_longitude_max) / 2,
     };
 }
 
