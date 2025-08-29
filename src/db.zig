@@ -735,15 +735,16 @@ pub const Instance = struct {
                 return try self.executeCommand(allocator, &equivalent_command);
             },
             .geopos => |args| {
-                const datum = self.data.get(args.key) orelse return resp.NullArray;
-                if (datum.value != .sorted_set) return resp.NullArray;
-
                 var response_array = try allocator.alloc(resp.Value, args.locations.len);
+                @memset(response_array, resp.NullArray);
+
+                const datum = self.data.get(args.key) orelse return resp.Array(response_array);
+                if (datum.value != .sorted_set) return resp.Array(response_array);
 
                 for (args.locations, 0..) |location, i| {
-                    response_array[i] = (if (datum.value.sorted_set.getScoreByName(location)) |score| blk: {
+                    if (datum.value.sorted_set.getScoreByName(location)) |score| {
                         const result = geohash.scoreToCoordinates(score);
-                        break :blk resp.Array(
+                        response_array[i] = resp.Array(
                             try allocator.dupe(resp.Value, &[2]resp.Value{
                                 resp.BulkString(
                                     try std.fmt.allocPrint(allocator, "{d}", .{result.longitude}),
@@ -753,7 +754,7 @@ pub const Instance = struct {
                                 ),
                             }),
                         );
-                    } else resp.NullArray);
+                    }
                 }
 
                 return resp.Array(response_array);
