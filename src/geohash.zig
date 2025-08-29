@@ -12,7 +12,7 @@ pub const LONGITUDE_RANGE: f64 = MAX_LONGITUDE - MIN_LONGITUDE;
 pub const NORMAL_RANGE: f64 = 1 << 26;
 
 pub fn coordinatesToScore(latitude: f64, longitude: f64) !f64 {
-    const latitude_out_of_range = latitude < MIN_LONGITUDE or latitude > MAX_LATITUDE;
+    const latitude_out_of_range = latitude < MIN_LATITUDE or latitude > MAX_LATITUDE;
     const longitude_out_of_range = longitude < MIN_LONGITUDE or longitude > MAX_LONGITUDE;
 
     if (latitude_out_of_range and longitude_out_of_range) {

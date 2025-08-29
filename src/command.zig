@@ -152,8 +152,13 @@ pub const Command = struct {
 
         for (0..value.array.?.len) |i| {
             switch (value.array.?[i]) {
-                .null => array[i] = "-1",
-                .bulk_string => |string| array[i] = (command.bytes.ptr + (string.ptr - bytes.ptr))[0..string.len],
+                .bulk_string => |maybe_string| {
+                    if (maybe_string) |string| {
+                        array[i] = (command.bytes.ptr + (string.ptr - bytes.ptr))[0..string.len];
+                    } else {
+                        array[i] = "-1";
+                    }
+                },
                 else => return Error.InvalidInput,
             }
         }

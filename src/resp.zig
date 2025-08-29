@@ -2,22 +2,20 @@ const std = @import("std");
 
 pub const Value = union(enum) {
     simple_string: []const u8,
-    bulk_string: []const u8,
+    bulk_string: ?[]const u8,
     integer: i64,
     simple_error: []const u8,
     array: ?[]const Value,
-    null,
 
     pub fn encode(self: *const Value, allocator: std.mem.Allocator) ![]const u8 {
         switch (self.*) {
             .simple_string => |string| {
                 return try std.fmt.allocPrint(allocator, "+{s}\r\n", .{string});
             },
-            .bulk_string => |string| {
-                return try std.fmt.allocPrint(allocator, "${d}\r\n{s}\r\n", .{ string.len, string });
-            },
-            .null => {
-                return allocator.dupe(u8, "$-1\r\n");
+            .bulk_string => |maybe_string| {
+                if (maybe_string) |string| {
+                    return try std.fmt.allocPrint(allocator, "${d}\r\n{s}\r\n", .{ string.len, string });
+                } else return "$-1\r\n";
             },
             .integer => |i| {
                 var response = std.ArrayList(u8).init(allocator);
@@ -41,7 +39,7 @@ pub const Value = union(enum) {
                     }
                     return response.toOwnedSlice();
                 } else {
-                    return "*-1\r\n"[0..];
+                    return "*-1\r\n";
                 }
             },
         }
@@ -107,7 +105,7 @@ pub const Value = union(enum) {
                     i += 2;
                     if (!cr_nl(bytes[i..])) return error.InvalidRESPBulkString;
                     i += 2;
-                    return .{ .null, i };
+                    return .{ NullBulkString, i };
                 }
                 const string_length, const bytes_parsed = try parseDecimal(bytes[i..]);
                 i += bytes_parsed;
@@ -115,7 +113,7 @@ pub const Value = union(enum) {
                 if (!cr_nl(bytes[i..]) or !cr_nl(bytes[i + 2 + string_length ..])) return error.InvalidRESPBulkString;
 
                 if (std.mem.eql(u8, bytes[i + 2 ..][0..string_length], "-1")) {
-                    return .{ .null, i + 2 + string_length + 2 };
+                    return .{ NullBulkString, i + 2 + string_length + 2 };
                 } else return .{ Value{ .bulk_string = bytes[i + 2 ..][0..string_length] }, i + 2 + string_length + 2 };
             },
             else => return error.InvalidInput,
@@ -143,7 +141,7 @@ pub inline fn Integer(i: i64) Value {
     return Value{ .integer = i };
 }
 
-pub const Null: Value = .null;
+pub const NullBulkString: Value = .{ .bulk_string = null };
 pub const NullArray: Value = .{ .array = null };
 
 pub const Ok: Value = .{ .simple_string = "OK" };
@@ -177,7 +175,7 @@ test "null bulk string encoding" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const value = Null;
+    const value = NullBulkString;
     const encoded = try value.encode(allocator);
     try testing.expectEqualStrings("$-1\r\n", encoded);
 }

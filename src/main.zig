@@ -192,7 +192,7 @@ pub fn main() !u8 {
                     std.debug.assert(response == .array and response.array != null);
 
                     // Response should be of the form: REPLCONF ACK <offset>
-                    const new_offset = try std.fmt.parseInt(usize, response.array.?[2].bulk_string, 10);
+                    const new_offset = try std.fmt.parseInt(usize, response.array.?[2].bulk_string.?, 10);
 
                     try event_fsm.get().updateSlaveOffset(new_offset, &event_queue);
 
@@ -386,7 +386,7 @@ pub fn main() !u8 {
                                         continue :event_loop;
                                     };
 
-                                    if (command.type == .xread and command.type.xread.block_timeout_ms != null and std.meta.eql(reply, resp.Null)) {
+                                    if (command.type == .xread and command.type.xread.block_timeout_ms != null and std.meta.eql(reply, resp.NullBulkString)) {
                                         var timerfd: ?posix.fd_t = null;
                                         if (command.type.xread.block_timeout_ms) |timeout_ms| {
                                             if (timeout_ms > 0)

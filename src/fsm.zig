@@ -495,7 +495,12 @@ pub const FSM = struct {
                 }
             }
         }
-        try StateTransitions.respondWith(blocked_xread.client_connection_fsm, try resp.NullArray.encode(temp_allocator.allocator()), event_queue, .{});
+        try StateTransitions.respondWith(
+            blocked_xread.client_connection_fsm,
+            try resp.NullArray.encode(temp_allocator.allocator()),
+            event_queue,
+            .{},
+        );
     }
 
     pub fn unblockWaitingClient(self: *Self, timerfd: posix.fd_t, event_queue: *EventQueue) !void {

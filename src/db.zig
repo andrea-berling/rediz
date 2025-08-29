@@ -252,11 +252,11 @@ pub const Instance = struct {
                     if (data.expire_at_ms) |expire_at_ms| {
                         if (expire_at_ms <= std.time.milliTimestamp()) {
                             _ = self.data.remove(key);
-                            return resp.Null;
+                            return resp.NullBulkString;
                         }
                     }
                     return resp.BulkString(data.value.string);
-                } else return resp.Null;
+                } else return resp.NullBulkString;
             },
             .set => |set_command| {
                 var datum: Datum = .{ .value = .{ .string = try self.dupe(set_command.value) } };
@@ -383,10 +383,10 @@ pub const Instance = struct {
                             return resp.Array(try response.toOwnedSlice());
                         },
                         else => {
-                            return resp.Null;
+                            return resp.NullBulkString;
                         },
                     }
-                } else return resp.Null;
+                } else return resp.NullBulkString;
             },
             .xread => |stream_read_request| {
                 var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
@@ -396,7 +396,7 @@ pub const Instance = struct {
                 var available_data = false;
                 for (stream_read_request.requests) |request| {
                     if (request.start_entry_id == .new_data) {
-                        return resp.Null;
+                        return resp.NullBulkString;
                     }
                     if (self.data.get(request.stream_key)) |datum| {
                         switch (datum.value) {
@@ -435,12 +435,12 @@ pub const Instance = struct {
                                 );
                             },
                         }
-                    } else return resp.Null;
+                    } else return resp.NullBulkString;
                 }
                 if (available_data) {
                     return resp.Array(try response.toOwnedSlice());
                 } else {
-                    return resp.Null;
+                    return resp.NullBulkString;
                 }
             },
             .config => |config_command| {
@@ -451,7 +451,7 @@ pub const Instance = struct {
                                 resp.Value,
                                 &[_]resp.Value{ resp.BulkString(option), resp.BulkString(data) },
                             ));
-                        } else return resp.Null;
+                        } else return resp.NullBulkString;
                     },
                     .set => |set_command| {
                         try self.config.put(try self.dupe(set_command.option), try self.dupe(set_command.value));
@@ -646,10 +646,10 @@ pub const Instance = struct {
                 return resp.Integer(ret);
             },
             .zrank => |zrank_command| {
-                const datum = self.data.get(zrank_command.key) orelse return resp.Null;
-                if (datum.value != .sorted_set) return resp.Null;
+                const datum = self.data.get(zrank_command.key) orelse return resp.NullBulkString;
+                if (datum.value != .sorted_set) return resp.NullBulkString;
 
-                const rank = datum.value.sorted_set.getRankByName(zrank_command.name) orelse return resp.Null;
+                const rank = datum.value.sorted_set.getRankByName(zrank_command.name) orelse return resp.NullBulkString;
                 return resp.Integer(rank - 1);
             },
             .zrange => |zrange_command| {
@@ -674,22 +674,22 @@ pub const Instance = struct {
             },
             .zcard => |key| {
                 const datum = self.data.get(key) orelse return resp.Integer(0);
-                if (datum.value != .sorted_set) return resp.Null;
+                if (datum.value != .sorted_set) return resp.NullBulkString;
 
                 return resp.Integer(datum.value.sorted_set.n_items);
             },
             .zscore => |zscore_command| {
-                const datum = self.data.get(zscore_command.key) orelse return resp.Null;
-                if (datum.value != .sorted_set) return resp.Null;
+                const datum = self.data.get(zscore_command.key) orelse return resp.NullBulkString;
+                if (datum.value != .sorted_set) return resp.NullBulkString;
 
-                const score = datum.value.sorted_set.getScoreByName(zscore_command.name) orelse return resp.Null;
+                const score = datum.value.sorted_set.getScoreByName(zscore_command.name) orelse return resp.NullBulkString;
                 return resp.BulkString(
                     try std.fmt.allocPrint(allocator, "{d}", .{score}),
                 );
             },
             .zrem => |zrem_command| {
-                var entry = self.data.getEntry(zrem_command.key) orelse return resp.Null;
-                if (entry.value_ptr.value != .sorted_set) return resp.Null;
+                var entry = self.data.getEntry(zrem_command.key) orelse return resp.NullBulkString;
+                if (entry.value_ptr.value != .sorted_set) return resp.NullBulkString;
 
                 const ret = @intFromBool(entry.value_ptr.value.sorted_set.contains(zrem_command.name));
 
