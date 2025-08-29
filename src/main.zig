@@ -356,7 +356,12 @@ pub fn main() !u8 {
                                     if (command.type == .blpop) {
                                         const blpop_command = command.type.blpop;
                                         const maybe_element = instance.pop(temp_allocator.allocator(), blpop_command.key) catch {
-                                            try st.respondWith(event_fsm, try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()), &event_queue, .{});
+                                            try st.respondWith(
+                                                event_fsm,
+                                                try resp.SimpleError("Some error occurred during command execution").encode(temp_allocator.allocator()),
+                                                &event_queue,
+                                                .{},
+                                            );
                                             continue :event_loop;
                                         };
 

@@ -593,10 +593,10 @@ pub const Instance = struct {
                 return resp.Integer(@intCast(datum.value.list.len));
             },
             .lpop => |lpop_command| {
-                const datum = self.data.getEntry(lpop_command.key) orelse return resp.Null;
+                const datum = self.data.getEntry(lpop_command.key) orelse return resp.NullArray;
 
                 if (datum.value_ptr.*.value != .list) return error.InvalidArgument;
-                if (datum.value_ptr.*.value.list.len == 0) return resp.Null;
+                if (datum.value_ptr.*.value.list.len == 0) return resp.NullArray;
                 if (lpop_command.n) |n| {
                     const elements_to_pop = @min(n, datum.value_ptr.*.value.list.len);
                     var ret = try allocator.alloc(resp.Value, elements_to_pop);
