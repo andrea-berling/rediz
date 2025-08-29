@@ -5,6 +5,7 @@ const rdb = @import("rdb.zig");
 const Command = @import("command.zig").Command;
 const cfg = @import("config.zig");
 const sset = @import("sorted_set.zig");
+const geohash = @import("geohash.zig");
 
 const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
@@ -143,7 +144,11 @@ pub const Instance = struct {
                 return error.HandshakeWithMasterFailed;
             };
         } else {
-            instance.replid = try std.fmt.allocPrint(instance.arena_allocator.allocator(), "{x}{x}", .{ instance.rng.random().int(u128), instance.rng.random().int(u32) });
+            instance.replid = try std.fmt.allocPrint(
+                instance.arena_allocator.allocator(),
+                "{x}{x}",
+                .{ instance.rng.random().int(u128), instance.rng.random().int(u32) },
+            );
         }
 
         return instance;
@@ -368,7 +373,9 @@ pub const Instance = struct {
                                 }
 
                                 var tmp_array = try temp_allocator.allocator().alloc(resp.Value, 2);
-                                tmp_array[0] = resp.BulkString(try std.fmt.allocPrint(temp_allocator.allocator(), "{}", .{stream_keys[index]}));
+                                tmp_array[0] = resp.BulkString(
+                                    try std.fmt.allocPrint(temp_allocator.allocator(), "{}", .{stream_keys[index]}),
+                                );
                                 tmp_array[1] = resp.Array(try entry_elements.toOwnedSlice());
                                 try response.append(resp.Array(tmp_array));
                             }
@@ -440,7 +447,10 @@ pub const Instance = struct {
                 switch (config_command) {
                     .get => |option| {
                         if (self.config.get(option)) |data| {
-                            return resp.Array(try allocator.dupe(resp.Value, &[_]resp.Value{ resp.BulkString(option), resp.BulkString(data) }));
+                            return resp.Array(try allocator.dupe(
+                                resp.Value,
+                                &[_]resp.Value{ resp.BulkString(option), resp.BulkString(data) },
+                            ));
                         } else return resp.Null;
                     },
                     .set => |set_command| {
@@ -686,7 +696,76 @@ pub const Instance = struct {
                 try entry.value_ptr.value.sorted_set.remove(zrem_command.name);
                 return resp.Integer(ret);
             },
+            .geoadd => |args| {
+                const score = geohash.coordinatesToScore(args.latitude, args.longitude) catch |err| {
+                    switch (err) {
+                        error.InvalidLonLat => return resp.SimpleError(
+                            try std.fmt.allocPrint(
+                                allocator,
+                                "invalid longitude, latitude pair {d},{d}",
+                                .{ args.longitude, args.latitude },
+                            ),
+                        ),
+                        error.InvalidLatitude => return resp.SimpleError(
+                            try std.fmt.allocPrint(
+                                allocator,
+                                "invalid latitude {d}",
+                                .{args.latitude},
+                            ),
+                        ),
+                        error.InvalidLongitude => return resp.SimpleError(
+                            try std.fmt.allocPrint(
+                                allocator,
+                                "invalid longitude {d}",
+                                .{args.longitude},
+                            ),
+                        ),
+                        else => return err,
+                    }
+                };
+                const equivalent_command = Command{
+                    .bytes = &[0]u8{},
+                    .allocator = allocator,
+                    .type = .{ .zadd = .{
+                        .key = args.key,
+                        .name = args.name,
+                        .score = score,
+                    } },
+                };
+                return try self.executeCommand(allocator, &equivalent_command);
+            },
+            .geopos => |args| {
+                const datum = self.data.get(args.key) orelse return resp.NullArray;
+                if (datum.value != .sorted_set) return resp.NullArray;
 
+                var response_array = try allocator.alloc(resp.Value, args.locations.len);
+
+                for (args.locations, 0..) |location, i| {
+                    response_array[i] = (if (datum.value.sorted_set.getScoreByName(location)) |score| blk: {
+                        const result = geohash.scoreToCoordinates(score);
+                        break :blk resp.Array(
+                            try allocator.dupe(resp.Value, &[2]resp.Value{
+                                resp.BulkString(
+                                    try std.fmt.allocPrint(allocator, "{d}", .{result.longitude}),
+                                ),
+                                resp.BulkString(
+                                    try std.fmt.allocPrint(allocator, "{d}", .{result.latitude}),
+                                ),
+                            }),
+                        );
+                    } else resp.NullArray);
+                }
+
+                return resp.Array(response_array);
+            },
+            .geodist => |args| {
+                _ = args; // autofix
+                @panic("TODO");
+            },
+            .geosearch => |args| {
+                _ = args; // autofix
+                @panic("TODO");
+            },
             else => {
                 return error.InvalidCommand;
             },

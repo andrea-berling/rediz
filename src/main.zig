@@ -189,10 +189,10 @@ pub fn main() !u8 {
                         continue :event_loop;
                     };
 
-                    std.debug.assert(response == .array);
+                    std.debug.assert(response == .array and response.array != null);
 
                     // Response should be of the form: REPLCONF ACK <offset>
-                    const new_offset = try std.fmt.parseInt(usize, response.array[2].bulk_string, 10);
+                    const new_offset = try std.fmt.parseInt(usize, response.array.?[2].bulk_string, 10);
 
                     try event_fsm.get().updateSlaveOffset(new_offset, &event_queue);
 

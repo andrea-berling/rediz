@@ -5,10 +5,10 @@ pub const Value = union(enum) {
     bulk_string: []const u8,
     integer: i64,
     simple_error: []const u8,
-    array: []const Value,
+    array: ?[]const Value,
     null,
 
-    pub fn encode(self: *const Value, allocator: std.mem.Allocator) ![]u8 {
+    pub fn encode(self: *const Value, allocator: std.mem.Allocator) ![]const u8 {
         switch (self.*) {
             .simple_string => |string| {
                 return try std.fmt.allocPrint(allocator, "+{s}\r\n", .{string});
@@ -31,14 +31,18 @@ pub const Value = union(enum) {
             .simple_error => |msg| {
                 return try std.fmt.allocPrint(allocator, "-ERR {s}\r\n", .{msg});
             },
-            .array => |array| {
-                var response = std.ArrayList(u8).init(allocator);
-                try std.fmt.format(response.writer(), "*{d}\r\n", .{array.len});
-                for (array) |value| {
-                    const encoded_element = try value.encode(allocator);
-                    try response.appendSlice(encoded_element);
+            .array => |maybe_array| {
+                if (maybe_array) |array| {
+                    var response = std.ArrayList(u8).init(allocator);
+                    try std.fmt.format(response.writer(), "*{d}\r\n", .{array.len});
+                    for (array) |value| {
+                        const encoded_element = try value.encode(allocator);
+                        try response.appendSlice(encoded_element);
+                    }
+                    return response.toOwnedSlice();
+                } else {
+                    return "*-1\r\n"[0..];
                 }
-                return response.toOwnedSlice();
             },
         }
     }
@@ -140,6 +144,7 @@ pub inline fn Integer(i: i64) Value {
 }
 
 pub const Null: Value = .null;
+pub const NullArray: Value = .{ .array = null };
 
 pub const Ok: Value = .{ .simple_string = "OK" };
 
@@ -252,8 +257,8 @@ test "array parsing" {
     const encoded = "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n";
     const value, const parsed_bytes = try Value.parse(encoded, allocator);
 
-    try testing.expectEqual(@as(usize, 2), value.array.len);
-    try testing.expectEqualStrings("hello", value.array[0].bulk_string);
-    try testing.expectEqualStrings("world", value.array[1].bulk_string);
+    try testing.expectEqual(@as(usize, 2), value.array.?.len);
+    try testing.expectEqualStrings("hello", value.array.?[0].bulk_string);
+    try testing.expectEqualStrings("world", value.array.?[1].bulk_string);
     try testing.expectEqual(@as(usize, 26), parsed_bytes);
 }

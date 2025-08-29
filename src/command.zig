@@ -72,6 +72,30 @@ pub const Command = struct {
             key: []const u8,
             name: []const u8,
         },
+        geoadd: struct {
+            key: []const u8,
+            longitude: f64,
+            latitude: f64,
+            name: []const u8,
+        },
+        geopos: struct {
+            key: []const u8,
+            locations: []const []const u8,
+        },
+        geodist: struct {
+            key: []const u8,
+            starting_location: []const u8,
+            destination: []const u8,
+        },
+        geosearch: struct {
+            key: []const u8,
+            center_latitude: f64,
+            center_longitude: f64,
+            radius: f64,
+            radius_unit: enum {
+                meters,
+            },
+        },
     },
     allocator: std.mem.Allocator,
 
@@ -80,7 +104,20 @@ pub const Command = struct {
     fn keywordToIndex(string: []const u8) isize {
         const type_info = @typeInfo(@FieldType(@This(), "type"));
         const fields_info = comptime type_info.@"union".fields;
-        const other_keywords = [_][]const u8{ "px", "pxat", "ex", "exat", "streams", "replication", "block", "rpush", "lpush" };
+        const other_keywords = [_][]const u8{
+            "px",
+            "pxat",
+            "ex",
+            "exat",
+            "streams",
+            "replication",
+            "block",
+            "rpush",
+            "lpush",
+            "fromlonat",
+            "byradius",
+            "m",
+        };
         var keywords: [fields_info.len + other_keywords.len][]const u8 = undefined;
         @setEvalBranchQuota(10000);
         inline for (fields_info, 0..) |field, i| {
@@ -102,7 +139,7 @@ pub const Command = struct {
         defer temp_allocator.deinit();
 
         const value, const parsed_bytes = resp.Value.parse(bytes, temp_allocator.allocator()) catch return Error.InvalidInput;
-        if (value != .array) {
+        if (value != .array or value.array == null) {
             return Error.InvalidInput;
         }
 
@@ -111,10 +148,10 @@ pub const Command = struct {
         command.bytes = try allocator.dupe(u8, bytes[0..parsed_bytes]);
         errdefer allocator.free(command.bytes);
 
-        var array = try temp_allocator.allocator().alloc([]const u8, value.array.len);
+        var array = try temp_allocator.allocator().alloc([]const u8, value.array.?.len);
 
-        for (0..value.array.len) |i| {
-            switch (value.array[i]) {
+        for (0..value.array.?.len) |i| {
+            switch (value.array.?[i]) {
                 .null => array[i] = "-1",
                 .bulk_string => |string| array[i] = (command.bytes.ptr + (string.ptr - bytes.ptr))[0..string.len],
                 else => return Error.InvalidInput,
@@ -337,7 +374,13 @@ pub const Command = struct {
             k2idx("rpush"), k2idx("lpush") => {
                 if (array.len < 3)
                     return Error.NotEnoughArguments;
-                break :blk .{ .list_push = .{ .key = array[1], .values = try allocator.dupe([]const u8, array[2..]), .type = if (k2idx(array[0]) == k2idx("rpush")) .append else .prepend } };
+                break :blk .{
+                    .list_push = .{
+                        .key = array[1],
+                        .values = try allocator.dupe([]const u8, array[2..]),
+                        .type = if (k2idx(array[0]) == k2idx("rpush")) .append else .prepend,
+                    },
+                };
             },
             k2idx("lrange") => {
                 if (array.len < 4)
@@ -447,6 +490,84 @@ pub const Command = struct {
                     },
                 };
             },
+            k2idx("geoadd") => {
+                if (array.len != 5)
+                    return Error.WrongNumberOfArguments;
+
+                const longitude = std.fmt.parseFloat(f64, array[2]) catch return error.InvalidArgument;
+                const latitude = std.fmt.parseFloat(f64, array[3]) catch return error.InvalidArgument;
+                break :blk .{
+                    .geoadd = .{
+                        .key = array[1],
+                        .longitude = longitude,
+                        .latitude = latitude,
+                        .name = array[4],
+                    },
+                };
+            },
+            k2idx("geopos") => {
+                if (array.len < 3)
+                    return Error.WrongNumberOfArguments;
+
+                break :blk .{
+                    .geopos = .{
+                        .key = array[1],
+                        .locations = try allocator.dupe([]const u8, array[2..]),
+                    },
+                };
+            },
+            k2idx("geodist") => {
+                if (array.len != 4)
+                    return Error.WrongNumberOfArguments;
+
+                break :blk .{
+                    .geodist = .{
+                        .key = array[1],
+                        .starting_location = array[2],
+                        .destination = array[3],
+                    },
+                };
+            },
+            k2idx("geosearch") => {
+                if (array.len < 3)
+                    return Error.WrongNumberOfArguments;
+
+                var ret: @FieldType(@This(), "type") = .{
+                    .geosearch = .{
+                        .key = array[1],
+                        .center_latitude = undefined,
+                        .center_longitude = undefined,
+                        .radius = undefined,
+                        .radius_unit = undefined,
+                    },
+                };
+                var i: usize = 2;
+
+                while (i < array.len) {
+                    switch (k2idx(array[i])) {
+                        k2idx("fromlonlat") => {
+                            i += 1;
+                            if (array.len - i < 2) return Error.NotEnoughArguments;
+                            ret.geosearch.center_latitude = std.fmt.parseFloat(f64, array[i + 1]) catch return error.InvalidArgument;
+                            ret.geosearch.center_longitude = std.fmt.parseFloat(f64, array[i + 1]) catch return error.InvalidArgument;
+                            i += 2;
+                        },
+                        k2idx("byradius") => {
+                            i += 1;
+                            if (array.len - i < 2) return Error.NotEnoughArguments;
+                            ret.geosearch.radius = std.fmt.parseFloat(f64, array[i]) catch return error.InvalidArgument;
+
+                            ret.geosearch.radius_unit = switch (k2idx(array[i + 1])) {
+                                k2idx("m") => .meters,
+                                else => return error.InvalidArgument,
+                            };
+                        },
+                        else => return Error.InvalidArgument,
+                    }
+                }
+
+                break :blk ret;
+            },
             else => {
                 return Error.UnsupportedCommand;
             },
@@ -477,6 +598,9 @@ pub const Command = struct {
             .zrange,
             .zrank,
             .zscore,
+            .geopos,
+            .geodist,
+            .geosearch,
             => return false,
             .set,
             .xadd,
@@ -490,6 +614,7 @@ pub const Command = struct {
             .publish,
             .zadd,
             .zrem,
+            .geoadd,
             => return true,
         }
     }
@@ -664,6 +789,42 @@ pub const Command = struct {
                 try response.append(resp.BulkString(zrem_command.key));
                 try response.append(resp.BulkString(zrem_command.name));
             },
+            .geoadd => |command| {
+                try response.append(resp.BulkString("GEOADD"));
+                try response.append(resp.BulkString(command.key));
+                try response.append(resp.BulkString(
+                    try std.fmt.allocPrint(temp_allocator.allocator(), "{d}", .{command.longitude}),
+                ));
+                try response.append(resp.BulkString(
+                    try std.fmt.allocPrint(temp_allocator.allocator(), "{d}", .{command.latitude}),
+                ));
+                try response.append(resp.BulkString(command.name));
+            },
+            .geopos => |command| {
+                try response.append(resp.BulkString("GEOPOS"));
+                try response.append(resp.BulkString(command.key));
+                try response.append(resp.BulkString(command.name));
+            },
+            .geodist => |command| {
+                try response.append(resp.BulkString("GEODIST"));
+                try response.append(resp.BulkString(command.key));
+                try response.append(resp.BulkString(command.starting_location));
+                try response.append(resp.BulkString(command.destination));
+            },
+            .geosearch => |command| {
+                try response.append(resp.BulkString("GEOSEARCH"));
+                try response.append(resp.BulkString(command.key));
+                try response.append(resp.BulkString("FROMLONLAT"));
+                try response.append(resp.BulkString(command.center_longitude));
+                try response.append(resp.BulkString(command.center_latitude));
+                try response.append(resp.BulkString("BYRADIUS"));
+                try response.append(resp.BulkString(command.radius));
+                try response.append(resp.BulkString(
+                    switch (command.radius_unit) {
+                        .meters => "m",
+                    },
+                ));
+            },
         }
         return try resp.Array(try response.toOwnedSlice()).encode(allocator);
     }
@@ -702,6 +863,9 @@ pub const Command = struct {
             .zrank,
             .zrange,
             .zcard,
+            .geoadd,
+            .geodist,
+            .geosearch,
             => {},
             .xadd => |stream_add_command| {
                 self.allocator.free(stream_add_command.key_value_pairs);
@@ -716,6 +880,9 @@ pub const Command = struct {
             },
             .list_push => |push_command| {
                 self.allocator.free(push_command.values);
+            },
+            .geopos => |args| {
+                self.allocator.free(args.locations);
             },
         }
         self.allocator.free(self.bytes);
