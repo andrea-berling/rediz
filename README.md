@@ -21,6 +21,7 @@ Rediz supports the following features:
  - Lists (`LPUSH`, `RPUSH`, `LPOP`, `BLPOP`, `LLEN`, and `LRANGE`)
  - Pub/Sub (`SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`)
  - Sorted Sets (`ZADD`, `ZCARD`, `ZRANGE`, `ZRANK`, `ZREM`, and `ZSCORE`)
+ - Geospatial support (`GEOADD`, `GEODIST`, `GEOPOS`, and `GEOSEARCH`)
 
 # Getting started
 
@@ -415,6 +416,34 @@ $ redis-cli
 127.0.0.1:6379> ZRANGE myzset 0 -1
 1) "one"
 2) "three"
+```
+
+## Geospatial
+
+Rediz supports geospatial indexing and querying.
+
+Terminal 2:
+```bash
+$ redis-cli
+127.0.0.1:6379> GEOADD Sicily 13.361389 38.115556 "Palermo"
+(integer) 1
+127.0.0.1:6379> GEOADD Sicily 15.087269 37.502669 "Catania"
+(integer) 1
+127.0.0.1:6379> GEODIST Sicily Palermo Catania
+"166274.15156959466"
+127.0.0.1:6379> GEOPOS Sicily Palermo Catania "NonExisting"
+1) 1) "13.361389338970184"
+   2) "38.1155563954963"
+2) 1) "15.087267458438873"
+   2) "37.50266842333162"
+3) (nil)
+127.0.0.1:6379> GEOSEARCH Sicily FROMLONLAT 15.0 37.5 BYRADIUS 2000 m
+(empty array)
+127.0.0.1:6379> GEOSEARCH Sicily FROMLONLAT 15.0 37.5 BYRADIUS 20000 m
+1) "Catania"
+127.0.0.1:6379> GEOSEARCH Sicily FROMLONLAT 15.0 37.5 BYRADIUS 200000 m
+1) "Palermo"
+2) "Catania"
 ```
 
 ## Logging level
