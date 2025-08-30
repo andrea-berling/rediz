@@ -760,8 +760,21 @@ pub const Instance = struct {
                 return resp.Array(response_array);
             },
             .geodist => |args| {
-                _ = args; // autofix
-                @panic("TODO");
+                const datum = self.data.get(args.key) orelse return resp.NullBulkString;
+                if (datum.value != .sorted_set) return resp.NullBulkString;
+                if (datum.value.sorted_set.getScoreByName(args.starting_location)) |start_score| {
+                    const p = geohash.scoreToCoordinates(start_score);
+                    if (datum.value.sorted_set.getScoreByName(args.destination)) |destination_score| {
+                        const q = geohash.scoreToCoordinates(destination_score);
+                        return resp.BulkString(
+                            try std.fmt.allocPrint(allocator, "{d}", .{geohash.distance(p, q)}),
+                        );
+                    } else {
+                        return resp.NullBulkString;
+                    }
+                } else {
+                    return resp.NullBulkString;
+                }
             },
             .geosearch => |args| {
                 _ = args; // autofix

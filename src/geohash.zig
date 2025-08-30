@@ -11,6 +11,13 @@ pub const LATITUDE_RANGE: f64 = MAX_LATITUDE - MIN_LATITUDE;
 pub const LONGITUDE_RANGE: f64 = MAX_LONGITUDE - MIN_LONGITUDE;
 pub const NORMAL_RANGE: f64 = 1 << 26;
 
+pub const EARTH_RADIUS_METERS: f64 = 6372797.560856;
+
+pub const Point = struct {
+    latitude: f64,
+    longitude: f64,
+};
+
 pub fn coordinatesToScore(latitude: f64, longitude: f64) !f64 {
     const latitude_out_of_range = latitude < MIN_LATITUDE or latitude > MAX_LATITUDE;
     const longitude_out_of_range = longitude < MIN_LONGITUDE or longitude > MAX_LONGITUDE;
@@ -56,7 +63,7 @@ pub fn coordinatesToScore(latitude: f64, longitude: f64) !f64 {
     return @floatFromInt(x | (y << 1));
 }
 
-pub fn scoreToCoordinates(score: f64) struct { latitude: f64, longitude: f64 } {
+pub fn scoreToCoordinates(score: f64) Point {
     const combined_x_y: u64 = @intFromFloat(score);
 
     var x = combined_x_y & 0x5555555555555555;
@@ -97,6 +104,23 @@ pub fn scoreToCoordinates(score: f64) struct { latitude: f64, longitude: f64 } {
         .latitude = (grid_latitude_min + grid_latitude_max) / 2,
         .longitude = (grid_longitude_min + grid_longitude_max) / 2,
     };
+}
+
+pub fn distance(p: Point, q: Point) f64 {
+    // https://en.wikipedia.org/wiki/Haversine_formula
+    const delta_phi = std.math.degreesToRadians(q.latitude - p.latitude);
+    const delta_lambda = std.math.degreesToRadians(q.longitude - p.longitude);
+
+    const cos_delta_phi = std.math.cos(delta_phi);
+    const cos_delta_lambda = std.math.cos(delta_lambda);
+    const cos_phi1 = std.math.cos(std.math.degreesToRadians(p.latitude));
+    const cos_phi2 = std.math.cos(std.math.degreesToRadians(q.latitude));
+
+    return 2 * EARTH_RADIUS_METERS * std.math.asin(
+        std.math.sqrt(
+            (1 - cos_delta_phi + cos_phi1 * cos_phi2 * (1 - cos_delta_lambda)) / 2,
+        ),
+    );
 }
 
 const test_data: [12]struct { name: []const u8, latitude: f64, longitude: f64, score: f64 } = .{

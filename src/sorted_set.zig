@@ -210,6 +210,10 @@ pub const SortedSet = struct {
         return new_node_idx;
     }
 
+    fn getNodePointers(self: *const Self, node: *const Node) ?[]Pointer {
+        return self.pointers.get(node.pointers_off, node.height);
+    }
+
     fn freeNode(self: *Self, idx: IndexType) !void {
         if (idx == self.nodes.items.len) {
             _ = self.nodes.pop();
@@ -254,7 +258,7 @@ pub const SortedSet = struct {
         errdefer comptime unreachable;
 
         const new_node = &self.nodes.items[node_idx];
-        var new_node_pointers = self.pointers.get(new_node.pointers_off, new_node.height).?;
+        var new_node_pointers = self.getNodePointers(new_node).?;
 
         std.debug.assert(find_result == .trace);
 
@@ -268,7 +272,7 @@ pub const SortedSet = struct {
             var pointer_to_update = if (i < find_result.trace.len and find_result.trace[i].node_idx != null) blk: {
                 const node_to_update_idx = find_result.trace[i].node_idx.?;
                 const node = &self.nodes.items[node_to_update_idx];
-                var node_ptrs = self.pointers.get(node.pointers_off, node.height).?;
+                var node_ptrs = self.getNodePointers(node).?;
                 break :blk &node_ptrs[i];
             } else blk: {
                 break :blk &self.starting_pointers[i];
@@ -367,7 +371,7 @@ pub const SortedSet = struct {
 
             // Lower score first, lower lexicographic order second
             if (next_node.score < score or (next_node.score == score and std.mem.lessThan(u8, next_node.name, name))) {
-                current.node_pointers = self.pointers.get(next_node.pointers_off, next_node.height).?;
+                current.node_pointers = self.getNodePointers(next_node).?;
                 current.rank += distance_from_next;
                 current.node_idx = next_node_idx;
             } else {
@@ -383,7 +387,7 @@ pub const SortedSet = struct {
         const node_to_remove_idx = self.nodes_index.get(name) orelse return;
 
         const node_to_remove = &self.nodes.items[node_to_remove_idx];
-        const node_to_remove_ptrs = self.pointers.get(node_to_remove.pointers_off, node_to_remove.height).?;
+        const node_to_remove_ptrs = self.getNodePointers(node_to_remove).?;
 
         var temp_allocator = std.heap.ArenaAllocator.init(self.allocator);
         defer temp_allocator.deinit();
@@ -400,7 +404,7 @@ pub const SortedSet = struct {
             // Get the node pointer to update at this level
             var node_pointer_to_update = if (find_result.trace[i].node_idx) |node_to_update_idx| blk: {
                 const node_to_update = &self.nodes.items[node_to_update_idx];
-                break :blk &(self.pointers.get(node_to_update.pointers_off, node_to_update.height).?)[i];
+                break :blk &(self.getNodePointers(node_to_update).?)[i];
             } else blk: {
                 break :blk &self.starting_pointers[i];
             };
@@ -490,7 +494,7 @@ pub const SortedSet = struct {
                 .lt => {
                     current.node_idx = next_node_idx;
                     current.rank += distance_from_next;
-                    current.node_pointers = self.pointers.get(self.nodes.items[next_node_idx].pointers_off, self.nodes.items[next_node_idx].height).?;
+                    current.node_pointers = self.getNodePointers(&self.nodes.items[next_node_idx]).?;
                 },
                 .gt => {
                     current.level -= 1;
@@ -517,7 +521,7 @@ pub const SortedSet = struct {
         var ret = try allocator.alloc(Node, end_rank - start_rank + 1);
         ret[0] = self.nodes.items[self.findNth(start_rank).?];
         for (1..ret.len) |i| {
-            const prev_node_pointers = self.pointers.get(ret[i - 1].pointers_off, ret[i - 1].height).?;
+            const prev_node_pointers = self.getNodePointers(&ret[i - 1]).?;
             ret[i] = self.nodes.items[prev_node_pointers[0].next];
         }
 
@@ -557,7 +561,7 @@ pub const SortedSet = struct {
         var node_idx: u32 = self.starting_pointers[0].next;
         while (node_idx != Self.NIL) {
             const n = self.nodes.items[node_idx];
-            const node_pointers = self.pointers.get(n.pointers_off, n.height).?;
+            const node_pointers = self.getNodePointers(&n).?;
             try w.print("  n{d} [label=<\n", .{node_idx});
             try emitTowerLabel(w, null, &n, max_h);
             try w.print(">];\n", .{});
@@ -591,7 +595,7 @@ pub const SortedSet = struct {
         var i: usize = 0;
         while (node_idx != Self.NIL) : (i += 1) {
             const n = self.nodes.items[node_idx];
-            const nexts = self.pointers.get(n.pointers_off, n.height).?;
+            const nexts = self.getNodePointers(&n).?;
             var l: usize = 0;
             while (l < n.height) : (l += 1) {
                 const nxt = nexts[l];
