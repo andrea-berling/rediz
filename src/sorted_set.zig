@@ -528,7 +528,54 @@ pub const SortedSet = struct {
         return ret;
     }
 
-    // getByRange
+    /// Find the index of the first node with a score larger than or equal to
+    /// this score
+    fn findNext(self: *const Self, score: f64) ?IndexType {
+        var current: struct {
+            node_idx: ?IndexType,
+            node_pointers: []const Pointer,
+            level: usize,
+        } = .{
+            .node_idx = null,
+            .node_pointers = self.starting_pointers[0..MAX_HEIGHT_PER_NODE],
+            .level = self.max_level,
+        };
+
+        while (true) {
+            const next_node_idx = current.node_pointers[current.level].next;
+            if (next_node_idx == NIL) return null;
+            const next_node = &self.nodes.items[next_node_idx];
+
+            switch (std.math.order(score, next_node.score)) {
+                .eq => {
+                    return next_node_idx;
+                },
+                .lt => {
+                    if (current.level == 0) return next_node_idx;
+                    current.level -= 1;
+                },
+                .gt => {
+                    current.node_idx = next_node_idx;
+                    current.node_pointers = self.getNodePointers(&self.nodes.items[next_node_idx]).?;
+                },
+            }
+        }
+    }
+
+    pub fn getByScoreRange(self: *const Self, range_start_score: f64, range_end_score: f64, allocator: std.mem.Allocator) ![]Node {
+        const start_index = self.findNext(range_start_score) orelse return &[0]Node{};
+
+        var ret = std.ArrayList(Node).init(allocator);
+        var node = &self.nodes.items[start_index];
+        while (node.score <= range_end_score) {
+            try ret.append(node.*);
+            const next_node_idx = self.getNodePointers(node).?[0].next;
+            if (next_node_idx == NIL) break;
+            node = &self.nodes.items[next_node_idx];
+        }
+
+        return ret.toOwnedSlice();
+    }
 
     // ------------------ Visualization ------------------
 

@@ -114,7 +114,7 @@ pub const Command = struct {
             "block",
             "rpush",
             "lpush",
-            "fromlonat",
+            "fromlonlat",
             "byradius",
             "m",
         };
@@ -553,8 +553,8 @@ pub const Command = struct {
                         k2idx("fromlonlat") => {
                             i += 1;
                             if (array.len - i < 2) return Error.NotEnoughArguments;
+                            ret.geosearch.center_longitude = std.fmt.parseFloat(f64, array[i]) catch return error.InvalidArgument;
                             ret.geosearch.center_latitude = std.fmt.parseFloat(f64, array[i + 1]) catch return error.InvalidArgument;
-                            ret.geosearch.center_longitude = std.fmt.parseFloat(f64, array[i + 1]) catch return error.InvalidArgument;
                             i += 2;
                         },
                         k2idx("byradius") => {
@@ -566,6 +566,8 @@ pub const Command = struct {
                                 k2idx("m") => .meters,
                                 else => return error.InvalidArgument,
                             };
+
+                            i += 2;
                         },
                         else => return Error.InvalidArgument,
                     }

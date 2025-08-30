@@ -1,11 +1,12 @@
 const std = @import("std");
 const posix = std.posix;
-const resp = @import("resp.zig");
-const rdb = @import("rdb.zig");
-const Command = @import("command.zig").Command;
+
 const cfg = @import("config.zig");
-const sset = @import("sorted_set.zig");
+const Command = @import("command.zig").Command;
 const geohash = @import("geohash.zig");
+const rdb = @import("rdb.zig");
+const resp = @import("resp.zig");
+const sset = @import("sorted_set.zig");
 
 const RDB_FILE_SIZE_LIMIT = 100 * 1024 * 1024 * 1024;
 
@@ -777,8 +778,142 @@ pub const Instance = struct {
                 }
             },
             .geosearch => |args| {
-                _ = args; // autofix
-                @panic("TODO");
+                const datum = self.data.get(args.key) orelse return resp.NullBulkString;
+                if (datum.value != .sorted_set) return resp.NullBulkString;
+                std.debug.assert(args.radius_unit == .meters);
+
+                const bounding_box = geohash.circleBoundingBox(args.radius);
+
+                const linear_center: struct { x: f64, y: f64 } = .{
+                    .x = (args.center_longitude - geohash.MIN_LONGITUDE_DEG) / geohash.LONGITUDE_RANGE_DEG * geohash.HORIZONTAL_LENGTH,
+                    .y = (args.center_latitude - geohash.MIN_LATITUDE_DEG) / geohash.LATITUDE_RANGE_DEG * geohash.VERTICAL_LENGTH,
+                };
+
+                const grid_center: struct { x: usize, y: usize } = .{
+                    .x = @intFromFloat(@divFloor(linear_center.x, bounding_box.length)),
+                    .y = @intFromFloat(@divFloor(linear_center.y, bounding_box.height)),
+                };
+
+                var temp_allocator = std.heap.ArenaAllocator.init(self.arena_allocator.allocator());
+                defer temp_allocator.deinit();
+
+                var grid_coordinates_to_check = std.ArrayList(struct { x: usize, y: usize }).init(
+                    temp_allocator.allocator(),
+                );
+
+                const grid_width = @as(usize, @intFromFloat(@divFloor(geohash.HORIZONTAL_LENGTH, bounding_box.length)));
+                const grid_height = @as(usize, @intFromFloat(@divFloor(geohash.VERTICAL_LENGTH, bounding_box.height)));
+
+                for (0..3) |unsigned_i| {
+                    const i = @as(isize, @bitCast(unsigned_i)) - 1;
+                    if ((grid_center.x == 0 and i == -1) or (grid_center.x == grid_width - 1 and i == 1)) continue;
+                    for (0..3) |unsigned_j| {
+                        const j = @as(isize, @bitCast(unsigned_j)) - 1;
+                        if ((grid_center.y == 0 and j == -1) or (grid_center.y == grid_height - 1 and j == 1)) continue;
+
+                        const cell_x = @as(isize, @intCast(grid_center.x)) + i;
+                        const cell_y = @as(isize, @intCast(grid_center.y)) + j;
+
+                        const closest_x = std.math.clamp(
+                            linear_center.x,
+                            @as(f64, @floatFromInt(cell_x)) * bounding_box.length,
+                            @as(f64, @floatFromInt(cell_x + 1)) * bounding_box.length,
+                        );
+                        const closest_y = std.math.clamp(
+                            linear_center.y,
+                            @as(f64, @floatFromInt(cell_y)) * bounding_box.height,
+                            @as(f64, @floatFromInt(cell_y + 1)) * bounding_box.height,
+                        );
+                        const dx = linear_center.x - closest_x;
+                        const dy = linear_center.y - closest_y;
+                        if (dx * dx + dy * dy <= args.radius * args.radius) {
+                            try grid_coordinates_to_check.append(.{
+                                .x = @as(usize, @bitCast(cell_x)),
+                                .y = @as(usize, @bitCast(cell_y)),
+                            });
+                        }
+                    }
+                }
+
+                const Node = struct { start: f64, end: f64 };
+                var ranges_to_search = std.SinglyLinkedList(Node){};
+
+                for (grid_coordinates_to_check.items) |coordinate| {
+                    const longitude = (@as(f64, @floatFromInt(coordinate.x)) * bounding_box.length) / geohash.HORIZONTAL_LENGTH * geohash.LONGITUDE_RANGE_DEG + geohash.MIN_LONGITUDE_DEG;
+                    const latitude = (@as(f64, @floatFromInt(coordinate.y)) * bounding_box.height) / geohash.VERTICAL_LENGTH * geohash.LATITUDE_RANGE_DEG + geohash.MIN_LATITUDE_DEG;
+                    const score = try geohash.coordinatesToScore(latitude, longitude);
+                    const shift = @as(
+                        u6,
+                        @intCast((geohash.N_DIVISIONS - bounding_box.n_divisions) * 2),
+                    );
+                    const start = @as(
+                        f64,
+                        @floatFromInt(@as(u64, @intFromFloat(score)) & (@as(u64, 0xffffffffffffffff) << shift)),
+                    );
+
+                    const end =
+                        @as(
+                            f64,
+                            @floatFromInt(
+                                @as(u64, @intFromFloat(score)) | @as(u64, @bitCast(((@as(i64, 1) << shift) - 1))),
+                            ),
+                        );
+
+                    var prev_node_ptr: ?*std.SinglyLinkedList(Node).Node = null;
+                    var node_ptr = ranges_to_search.first;
+                    while (node_ptr) |node| : (node_ptr = node.next) {
+                        if (node.data.start >= end) {
+                            break;
+                        }
+                        prev_node_ptr = node;
+                    }
+
+                    const new_node = try temp_allocator.allocator().create(std.SinglyLinkedList(Node).Node);
+                    new_node.data = .{ .start = start, .end = end };
+
+                    if (prev_node_ptr) |p| {
+                        p.insertAfter(new_node);
+                    } else {
+                        ranges_to_search.prepend(new_node);
+                    }
+                }
+
+                // Merge ranges
+                var node = ranges_to_search.first;
+                while (node) |n| : (node = n.next) {
+                    var next_node = n.next;
+                    while (next_node) |nn| : (next_node = nn.next) {
+                        if (n.data.end >= nn.data.start) {
+                            n.data.end = @max(n.data.end, nn.data.end);
+                            temp_allocator.allocator().destroy(n.removeNext().?);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                var locations = std.ArrayList(resp.Value).init(allocator);
+
+                while (ranges_to_search.popFirst()) |range| {
+                    const candidates = try datum.value.sorted_set.getByScoreRange(
+                        range.data.start,
+                        range.data.end,
+                        temp_allocator.allocator(),
+                    );
+                    for (candidates) |candidate| {
+                        const candidate_p = geohash.scoreToCoordinates(candidate.score);
+                        if (geohash.distance(candidate_p, .{
+                            .latitude = args.center_latitude,
+                            .longitude = args.center_longitude,
+                        }) <= args.radius) {
+                            try locations.append(resp.BulkString(
+                                try allocator.dupe(u8, candidate.name),
+                            ));
+                        }
+                    }
+                }
+
+                return resp.Array(try locations.toOwnedSlice());
             },
             else => {
                 return error.InvalidCommand;
